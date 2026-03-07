@@ -1,0 +1,43 @@
+{
+  "name": "@cmdctrl/aider",
+  "version": "0.1.10",
+  "description": "CmdCtrl daemon for Aider - connects your workstation to the CmdCtrl orchestration server via AgentAPI",
+  "main": "./dist/index.js",
+  "bin": {
+    "cmdctrl-aider": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/index.js",
+    "lint": "eslint src --ext .ts",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "cmdctrl",
+    "daemon",
+    "aider",
+    "ai",
+    "orchestration",
+    "agentapi"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@cmdctrl/daemon-sdk": "file:../sdk",
+    "commander": "^12.1.0",
+    "eventsource": "^3.0.2",
+    "node-pty": "^1.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/eventsource": "^1.1.15",
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

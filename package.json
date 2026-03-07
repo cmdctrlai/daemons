@@ -1,0 +1,21 @@
+{
+  "name": "cmdctrl-daemons",
+  "private": true,
+  "workspaces": [
+    "sdk",
+    "claude-code",
+    "aider",
+    "codex-cli",
+    "copilot-cli",
+    "cursor-cli",
+    "cursor-ide",
+    "gemini-cli",
+    "opencode",
+    "vscode-copilot",
+    "example"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "clean": "npm run clean --workspaces --if-present"
+  }
+}

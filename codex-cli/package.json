@@ -1,0 +1,37 @@
+{
+  "name": "@cmdctrl/codex-cli",
+  "version": "0.1.2",
+  "description": "CmdCtrl daemon for OpenAI Codex CLI agent",
+  "main": "./dist/index.js",
+  "bin": {
+    "cmdctrl-codex-cli": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "cmdctrl",
+    "daemon",
+    "codex",
+    "openai",
+    "ai",
+    "agent"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^12.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2",
+    "ts-node": "^10.9.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

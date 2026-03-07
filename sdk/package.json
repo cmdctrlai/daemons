@@ -1,0 +1,37 @@
+{
+  "name": "@cmdctrl/daemon-sdk",
+  "version": "1.0.3",
+  "description": "SDK for building CmdCtrl daemons - provides WebSocket client, message types, and utilities",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "cmdctrl",
+    "daemon",
+    "sdk",
+    "ai",
+    "agent",
+    "orchestration",
+    "websocket"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist/**/*"
+  ]
+}
