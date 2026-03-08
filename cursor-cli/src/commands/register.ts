@@ -1,5 +1,19 @@
 import * as os from 'os';
+import * as readline from 'readline';
+import { openSync } from 'fs';
+import { spawn } from 'child_process';
 import { ConfigManager, registerDevice } from '@cmdctrl/daemon-sdk';
+import { stop } from './stop';
+
+function confirm(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`${question} [y/N] `, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'y');
+    });
+  });
+}
 
 const configManager = new ConfigManager('cursor-cli');
 
@@ -13,11 +27,44 @@ export async function register(options: RegisterOptions): Promise<void> {
   const deviceName = options.name || `${os.hostname()}-cursor`;
 
   if (configManager.isRegistered()) {
-    const config = configManager.readConfig();
-    console.log(`Already registered as "${config?.deviceName}" (${config?.deviceId})`);
-    console.log(`Server: ${config?.serverUrl}`);
-    console.log(`\nTo re-register, run: cmdctrl-cursor-cli unregister`);
-    return;
+    const existing = configManager.readConfig();
+    console.log(`Already registered as "${existing?.deviceName}" (${existing?.deviceId})`);
+    console.log(`Server: ${existing?.serverUrl}`);
+
+    if (!process.stdin.isTTY) {
+      console.error('\nAlready registered. Unregister first or run interactively to re-register.');
+      process.exit(1);
+    }
+
+    const ok = await confirm('\nStop and re-register this device?');
+    if (!ok) {
+      console.log('Aborted.');
+      return;
+    }
+
+    if (configManager.isDaemonRunning()) {
+      await stop();
+    }
+
+    const credentials = configManager.readCredentials();
+    if (existing && credentials) {
+      try {
+        const response = await fetch(`${existing.serverUrl}/api/devices/${existing.deviceId}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${credentials.refreshToken}` },
+        });
+        if (response.ok || response.status === 204 || response.status === 404) {
+          console.log('Previous device registration removed from server.');
+        } else {
+          console.warn(`Warning: Failed to remove old device from server (HTTP ${response.status}).`);
+        }
+      } catch {
+        console.warn('Warning: Could not reach server to remove old device.');
+      }
+    }
+
+    configManager.clearRegistration();
+    console.log('');
   }
 
   console.log(`Registering Cursor CLI device "${deviceName}" with ${serverUrl}...\n`);
@@ -53,5 +100,18 @@ export async function register(options: RegisterOptions): Promise<void> {
 
   console.log('\n\nRegistration complete!');
   console.log(`Device ID: ${result.deviceId}`);
-  console.log(`\nRun 'cmdctrl-cursor-cli start' to connect to the server.`);
+
+  if (process.stdin.isTTY) {
+    const startNow = await confirm('\nStart daemon in background now?');
+    if (startNow) {
+      const logFile = '/tmp/cmdctrl-daemon-cursor-cli.log';
+      const logFd = openSync(logFile, 'a');
+      const child = spawn(process.execPath, [process.argv[1], 'start'], {
+        detached: true,
+        stdio: ['ignore', logFd, logFd],
+      });
+      child.unref();
+      console.log(`Daemon started. Logs: tail -f ${logFile}`);
+    }
+  }
 }
