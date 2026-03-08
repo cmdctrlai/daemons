@@ -1,6 +1,18 @@
+import * as readline from 'readline';
 import { ConfigManager } from '@cmdctrl/daemon-sdk';
+import { stop } from './stop';
 
 const configManager = new ConfigManager('opencode');
+
+function confirm(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`${question} [y/N] `, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'y');
+    });
+  });
+}
 
 export async function unregister(): Promise<void> {
   const config = configManager.readConfig();
@@ -11,9 +23,12 @@ export async function unregister(): Promise<void> {
   }
 
   if (configManager.isDaemonRunning()) {
-    console.error('Error: Daemon is currently running.');
-    console.error('Please stop the daemon first with: cmdctrl-opencode stop');
-    process.exit(1);
+    const ok = await confirm('Daemon is currently running. Stop it before unregistering?');
+    if (!ok) {
+      console.log('Aborted.');
+      return;
+    }
+    await stop();
   }
 
   console.log(`Unregistering device "${config.deviceName}" (${config.deviceId})...`);
