@@ -14,7 +14,7 @@ export interface Credentials {
   expiresAt: number; // Unix timestamp
 }
 
-const CONFIG_DIR = path.join(os.homedir(), '.cmdctrl-claude-code');
+const CONFIG_DIR = process.env.CMDCTRL_DAEMON_CONFIG_DIR || path.join(os.homedir(), '.cmdctrl-claude-code');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const CREDENTIALS_FILE = path.join(CONFIG_DIR, 'credentials');
 const PID_FILE = path.join(CONFIG_DIR, 'daemon.pid');

@@ -1,4 +1,16 @@
+import * as readline from 'readline';
 import { readConfig, readCredentials, clearRegistration, isDaemonRunning } from '../config/config';
+import { stop } from './stop';
+
+function confirm(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`${question} [y/N] `, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'y');
+    });
+  });
+}
 
 /**
  * Unregister command - deletes device from server and removes local registration data
@@ -11,11 +23,14 @@ export async function unregister(): Promise<void> {
     return;
   }
 
-  // Check if daemon is running
+  // If daemon is running, offer to stop it first
   if (isDaemonRunning()) {
-    console.error('Error: Daemon is currently running.');
-    console.error('Please stop the daemon first with: cmdctrl-claude-code stop');
-    process.exit(1);
+    const ok = await confirm('Daemon is currently running. Stop it before unregistering?');
+    if (!ok) {
+      console.log('Aborted.');
+      return;
+    }
+    await stop();
   }
 
   console.log(`Unregistering device "${config.deviceName}" (${config.deviceId})...`);
