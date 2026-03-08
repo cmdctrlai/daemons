@@ -3,16 +3,32 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
 import * as https from 'https';
+import * as readline from 'readline';
 import { execSync } from 'child_process';
 import { URL } from 'url';
 import {
   writeConfig,
   writeCredentials,
   readConfig,
+  readCredentials,
+  deleteConfig,
+  deleteCredentials,
   isRegistered,
+  isDaemonRunning,
   CmdCtrlConfig,
   Credentials
 } from '../config/config';
+import { stop } from './stop';
+
+function confirm(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`${question} [y/N] `, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'y');
+    });
+  });
+}
 
 interface RegisterOptions {
   server: string;
@@ -134,11 +150,45 @@ export async function register(options: RegisterOptions): Promise<void> {
 
   // Check if already registered
   if (isRegistered()) {
-    const config = readConfig();
-    console.log(`Already registered as "${config?.deviceName}" (${config?.deviceId})`);
-    console.log(`Server: ${config?.serverUrl}`);
-    console.log(`\nTo re-register, run: ${process.argv[1]} unregister`);
-    return;
+    const existing = readConfig();
+    console.log(`Already registered as "${existing?.deviceName}" (${existing?.deviceId})`);
+    console.log(`Server: ${existing?.serverUrl}`);
+
+    if (!process.stdin.isTTY) {
+      console.error('\nAlready registered. Unregister first or run interactively to re-register.');
+      process.exit(1);
+    }
+
+    const ok = await confirm('\nStop and re-register this device?');
+    if (!ok) {
+      console.log('Aborted.');
+      return;
+    }
+
+    if (isDaemonRunning()) {
+      await stop();
+    }
+
+    const credentials = readCredentials();
+    if (existing && credentials) {
+      try {
+        const response = await fetch(`${existing.serverUrl}/api/devices/${existing.deviceId}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${credentials.refreshToken}` },
+        });
+        if (response.ok || response.status === 204 || response.status === 404) {
+          console.log('Previous device registration removed from server.');
+        } else {
+          console.warn(`Warning: Failed to remove old device from server (HTTP ${response.status}).`);
+        }
+      } catch {
+        console.warn('Warning: Could not reach server to remove old device.');
+      }
+    }
+
+    deleteCredentials();
+    deleteConfig();
+    console.log('');
   }
 
   console.log(`Registering Aider device "${deviceName}" with ${serverUrl}...\n`);

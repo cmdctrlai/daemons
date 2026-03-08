@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/aider",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "CmdCtrl daemon for Aider - connects your workstation to the CmdCtrl orchestration server via AgentAPI",
   "main": "./dist/index.js",
   "bin": {
