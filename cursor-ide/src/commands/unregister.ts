@@ -1,18 +1,35 @@
-import { readConfig, readCredentials, deleteConfig, deleteCredentials, isRegistered } from '../config/config';
+import * as readline from 'readline';
+import { readConfig, readCredentials, deleteConfig, deleteCredentials, isRegistered, isDaemonRunning } from '../config/config';
+import { stop } from './stop';
 
-/**
- * Unregister command - deletes device from server and removes local registration data
- */
+function confirm(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`${question} [y/N] `, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'y');
+    });
+  });
+}
+
 export async function unregister(): Promise<void> {
   if (!isRegistered()) {
     console.log('Not registered.');
     return;
   }
 
+  if (isDaemonRunning()) {
+    const ok = await confirm('Daemon is currently running. Stop it before unregistering?');
+    if (!ok) {
+      console.log('Aborted.');
+      return;
+    }
+    await stop();
+  }
+
   const config = readConfig();
   console.log(`Unregistering "${config?.deviceName}" (${config?.deviceId})...`);
 
-  // Delete device from server
   if (config) {
     const credentials = readCredentials();
     if (credentials) {
