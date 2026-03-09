@@ -187,11 +187,12 @@ function parseLineToMessage(line: string, index: number): MessageEntry | null {
           if (isSystemMessage(queueContent) || isNonUserContent(queueContent)) {
             return null;
           }
+          const ts = timestampMatch ? timestampMatch[1] : '';
           return {
-            uuid: `queue-${index}`,
+            uuid: ts ? `queue-${ts}` : `queue-${index}`,
             role: 'USER',
             content: queueContent,
-            timestamp: timestampMatch ? timestampMatch[1] : '',
+            timestamp: ts,
           };
         }
         return null;
@@ -237,11 +238,16 @@ function parseLineToMessage(line: string, index: number): MessageEntry | null {
       if (isSystemMessage(entry.content) || isNonUserContent(entry.content)) {
         return null;
       }
+      // Use timestamp-based UUID so the ID is stable across both the fast path
+      // (readLastLines, scan-relative index) and the cursor path (readAllLinesSafe,
+      // absolute line index). Positional `queue-${index}` IDs differ between paths
+      // and produce stale cursors that corrupt incremental message fetches.
+      const ts = entry.timestamp as string | undefined;
       return {
-        uuid: `queue-${index}`,
+        uuid: ts ? `queue-${ts}` : `queue-${index}`,
         role: 'USER',
         content: entry.content,
-        timestamp: entry.timestamp || '',
+        timestamp: ts || '',
       };
     }
 

@@ -27,6 +27,11 @@ interface WatchedSession {
   filePath: string;
   lastSize: number;
   processedUuids: Set<string>;
+  // UUIDs of user entries that contained tool_result blocks.
+  // Assistant entries whose parentUuid is in this set are internal
+  // continuation responses (e.g. "No response requested.") and
+  // should not be emitted as AGENT_RESPONSE events.
+  toolResultUuids: Set<string>;
   lastLineCount: number;
   messageCount: number;
   lastMessage: string;
@@ -82,13 +87,14 @@ export class SessionWatcher {
 
     try {
       const stats = fs.statSync(filePath);
-      const { processedUuids, lineCount, messageCount, lastMessage } = this.initializeFromFile(filePath);
+      const { processedUuids, toolResultUuids, lineCount, messageCount, lastMessage } = this.initializeFromFile(filePath);
 
       this.watchedSessions.set(sessionId, {
         sessionId,
         filePath,
         lastSize: stats.size,
         processedUuids,
+        toolResultUuids,
         lastLineCount: lineCount,
         messageCount,
         lastMessage,
@@ -145,8 +151,9 @@ export class SessionWatcher {
    * Initialize processed UUIDs from existing file content
    * This prevents emitting events for entries that existed before we started watching
    */
-  private initializeFromFile(filePath: string): { processedUuids: Set<string>; lineCount: number; messageCount: number; lastMessage: string } {
+  private initializeFromFile(filePath: string): { processedUuids: Set<string>; toolResultUuids: Set<string>; lineCount: number; messageCount: number; lastMessage: string } {
     const processedUuids = new Set<string>();
+    const toolResultUuids = new Set<string>();
     let messageCount = 0;
     let lastMessage = '';
 
@@ -161,13 +168,23 @@ export class SessionWatcher {
             processedUuids.add(entry.uuid);
             messageCount++;
 
+            // Track user entries whose content contains tool_result blocks.
+            // Assistant entries with parentUuid pointing to one of these are
+            // internal continuation responses and should be filtered out.
+            if (entry.type === 'user') {
+              const entryContent = (entry.message as Record<string, unknown> | undefined)?.content;
+              if (Array.isArray(entryContent) && entryContent.some((b: Record<string, unknown>) => b.type === 'tool_result')) {
+                toolResultUuids.add(entry.uuid);
+              }
+            }
+
             // Track last message content for session_activity
             const entryMessage = entry.message as Record<string, unknown> | undefined;
-            const content = entryMessage?.content;
-            if (typeof content === 'string') {
-              lastMessage = content.slice(0, 200);
-            } else if (Array.isArray(content)) {
-              const textBlocks = content.filter((b: Record<string, unknown>) => b.type === 'text');
+            const msgContent = entryMessage?.content;
+            if (typeof msgContent === 'string') {
+              lastMessage = msgContent.slice(0, 200);
+            } else if (Array.isArray(msgContent)) {
+              const textBlocks = msgContent.filter((b: Record<string, unknown>) => b.type === 'text');
               if (textBlocks.length > 0) {
                 lastMessage = (textBlocks[0].text as string || '').slice(0, 200);
               }
@@ -178,9 +195,9 @@ export class SessionWatcher {
         }
       }
 
-      return { processedUuids, lineCount: lines.length, messageCount, lastMessage };
+      return { processedUuids, toolResultUuids, lineCount: lines.length, messageCount, lastMessage };
     } catch {
-      return { processedUuids, lineCount: 0, messageCount: 0, lastMessage: '' };
+      return { processedUuids, toolResultUuids, lineCount: 0, messageCount: 0, lastMessage: '' };
     }
   }
 
@@ -231,7 +248,16 @@ export class SessionWatcher {
       let sawUserMessage = false;
 
       for (const entry of newEntries) {
-        const event = this.entryToEvent(session.sessionId, entry);
+        // Track user entries with tool_result content so we can filter the
+        // assistant "No response requested." replies that follow them.
+        if (entry.type === 'user' && entry.uuid) {
+          const entryContent = (entry.message as Record<string, unknown> | undefined)?.content;
+          if (Array.isArray(entryContent) && entryContent.some((b: Record<string, unknown>) => b.type === 'tool_result')) {
+            session.toolResultUuids.add(entry.uuid as string);
+          }
+        }
+
+        const event = this.entryToEvent(session.sessionId, entry, session.toolResultUuids);
         if (event) {
           console.log(`[SessionWatcher] Emitting ${event.type} for session ${session.sessionId.slice(-8)}: ${event.content.slice(0, 50)}...`);
           this.onEvent(event);
@@ -344,7 +370,7 @@ export class SessionWatcher {
   /**
    * Convert a JSONL entry to a SessionEvent
    */
-  private entryToEvent(sessionId: string, entry: Record<string, unknown>): SessionEvent | null {
+  private entryToEvent(sessionId: string, entry: Record<string, unknown>, toolResultUuids?: Set<string>): SessionEvent | null {
     const entryType = entry.type as string;
     const uuid = entry.uuid as string;
     const timestamp = (entry.timestamp as string) || new Date().toISOString();
@@ -432,6 +458,15 @@ export class SessionWatcher {
 
     // Handle assistant entries
     if (entryType === 'assistant') {
+      // Skip assistant entries that are responses to tool_result user entries.
+      // These are internal continuation responses (e.g. "No response requested.")
+      // that should not appear as agent messages in the UI.
+      const parentUuid = entry.parentUuid as string | undefined;
+      if (parentUuid && toolResultUuids?.has(parentUuid)) {
+        console.log(`[SessionWatcher] Skipping assistant entry ${uuid?.slice(-8)} – parent is tool_result`);
+        return null;
+      }
+
       if (!Array.isArray(content)) {
         console.log(`[SessionWatcher] Assistant entry ${uuid?.slice(-8)} has non-array content:`, typeof content);
         return null;
