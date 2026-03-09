@@ -1,16 +1,14 @@
-import {
-  isDaemonRunning,
-  readPidFile,
-  deletePidFile
-} from '../config/config';
+import { ConfigManager } from '@cmdctrl/daemon-sdk';
+
+const configManager = new ConfigManager('copilot-cli');
 
 export function stop(): void {
-  if (!isDaemonRunning()) {
+  if (!configManager.isDaemonRunning()) {
     console.log('Daemon is not running.');
     return;
   }
 
-  const pid = readPidFile();
+  const pid = configManager.readPidFile();
   if (pid === null) {
     console.log('No PID file found.');
     return;
@@ -28,11 +26,11 @@ export function stop(): void {
       } catch {
         // Process is gone
       }
-      deletePidFile();
+      configManager.deletePidFile();
       console.log('Daemon stopped.');
     }, 2000);
   } catch (err) {
     console.error('Failed to stop daemon:', err);
-    deletePidFile();
+    configManager.deletePidFile();
   }
 }
