@@ -1,22 +1,11 @@
 import * as os from 'os';
-import * as http from 'http';
-import * as https from 'https';
 import * as readline from 'readline';
 import { openSync } from 'fs';
 import { spawn } from 'child_process';
-import { URL } from 'url';
-import {
-  writeConfig,
-  writeCredentials,
-  readConfig,
-  readCredentials,
-  clearRegistration,
-  isRegistered,
-  isDaemonRunning,
-  CmdCtrlConfig,
-  Credentials
-} from '../config/config';
+import { ConfigManager, registerDevice } from '@cmdctrl/daemon-sdk';
 import { stop } from './stop';
+
+const configManager = new ConfigManager('gemini-cli');
 
 function confirm(question: string): Promise<boolean> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -33,92 +22,12 @@ interface RegisterOptions {
   name?: string;
 }
 
-interface DeviceCodeResponse {
-  deviceCode: string;
-  userCode: string;
-  verificationUrl: string;
-  expiresIn: number;
-  interval: number;
-}
-
-interface TokenResponse {
-  accessToken: string;
-  refreshToken: string;
-  expiresIn: number;
-  deviceId: string;
-}
-
-function request(
-  url: string,
-  method: string,
-  body?: object
-): Promise<{ status: number; data: unknown }> {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const client = parsed.protocol === 'https:' ? https : http;
-    const options = {
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json'
-      }
-    };
-    const req = client.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk: string) => (data += chunk));
-      res.on('end', () => {
-        try {
-          resolve({ status: res.statusCode || 0, data: data ? JSON.parse(data) : {} });
-        } catch {
-          resolve({ status: res.statusCode || 0, data: {} });
-        }
-      });
-    });
-    req.on('error', reject);
-    if (body) req.write(JSON.stringify(body));
-    req.end();
-  });
-}
-
-async function pollForToken(
-  serverUrl: string,
-  deviceCode: string,
-  interval: number,
-  expiresIn: number
-): Promise<TokenResponse | null> {
-  const expiresAt = Date.now() + expiresIn * 1000;
-  while (Date.now() < expiresAt) {
-    await new Promise((resolve) => setTimeout(resolve, interval * 1000));
-    try {
-      const response = await request(`${serverUrl}/api/devices/token`, 'POST', { deviceCode });
-      if (response.status === 200) return response.data as TokenResponse;
-      const data = response.data as { error?: string };
-      if (response.status === 400 && data.error === 'authorization_pending') {
-        process.stdout.write('.');
-        continue;
-      }
-      if (response.status >= 400) {
-        console.error('\nError polling for token:', data);
-        return null;
-      }
-    } catch (err) {
-      console.error('\nError polling for token:', err);
-      return null;
-    }
-  }
-  console.error('\nDevice code expired. Please try again.');
-  return null;
-}
-
 export async function register(options: RegisterOptions): Promise<void> {
   const serverUrl = options.server.replace(/\/$/, '');
   const deviceName = options.name || `${os.hostname()}-gemini`;
 
-  if (isRegistered()) {
-    const existing = readConfig();
+  if (configManager.isRegistered()) {
+    const existing = configManager.readConfig();
     console.log(`Already registered as "${existing?.deviceName}" (${existing?.deviceId})`);
     console.log(`Server: ${existing?.serverUrl}`);
 
@@ -133,11 +42,11 @@ export async function register(options: RegisterOptions): Promise<void> {
       return;
     }
 
-    if (isDaemonRunning()) {
+    if (configManager.isDaemonRunning()) {
       await stop();
     }
 
-    const credentials = readCredentials();
+    const credentials = configManager.readCredentials();
     if (existing && credentials) {
       try {
         const response = await fetch(`${existing.serverUrl}/api/devices/${existing.deviceId}`, {
@@ -154,59 +63,43 @@ export async function register(options: RegisterOptions): Promise<void> {
       }
     }
 
-    clearRegistration();
+    configManager.clearRegistration();
     console.log('');
   }
 
   console.log(`Registering Gemini CLI device "${deviceName}" with ${serverUrl}...\n`);
 
-  let codeResponse: DeviceCodeResponse;
-  try {
-    const response = await request(`${serverUrl}/api/devices/code`, 'POST', {
-      deviceName,
-      hostname: os.hostname(),
-      agentType: 'gemini_cli',
-    });
-    if (response.status !== 200) {
-      console.error('Failed to get device code:', response.data);
-      process.exit(1);
+  const result = await registerDevice(
+    serverUrl,
+    deviceName,
+    os.hostname(),
+    'gemini_cli',
+    (url, _userCode) => {
+      console.log('To complete registration, open this URL in your browser:\n');
+      console.log(`  ${url}\n`);
+      console.log('Waiting for verification...');
     }
-    codeResponse = response.data as DeviceCodeResponse;
-  } catch (err) {
-    console.error('Failed to connect to server:', err);
+  );
+
+  if (!result) {
+    console.error('\nDevice code expired. Please try again.');
     process.exit(1);
   }
 
-  console.log('To complete registration, open this URL in your browser:\n');
-  console.log(`  ${codeResponse.verificationUrl}\n`);
-  console.log('Waiting for verification...');
-
-  const tokenResponse = await pollForToken(
+  configManager.writeConfig({
     serverUrl,
-    codeResponse.deviceCode,
-    codeResponse.interval,
-    codeResponse.expiresIn
-  );
+    deviceId: result.deviceId,
+    deviceName,
+  });
 
-  if (!tokenResponse) process.exit(1);
-
-  const config: CmdCtrlConfig = {
-    serverUrl,
-    deviceId: tokenResponse.deviceId,
-    deviceName
-  };
-
-  const credentials: Credentials = {
-    accessToken: tokenResponse.accessToken,
-    refreshToken: tokenResponse.refreshToken,
-    expiresAt: Date.now() + tokenResponse.expiresIn * 1000
-  };
-
-  writeConfig(config);
-  writeCredentials(credentials);
+  configManager.writeCredentials({
+    refreshToken: result.refreshToken,
+    accessToken: result.accessToken,
+    expiresAt: result.expiresIn ? Date.now() + result.expiresIn * 1000 : undefined,
+  });
 
   console.log('\n\nRegistration complete!');
-  console.log(`Device ID: ${tokenResponse.deviceId}`);
+  console.log(`Device ID: ${result.deviceId}`);
 
   if (process.stdin.isTTY) {
     const startNow = await confirm('\nStart daemon in background now?');

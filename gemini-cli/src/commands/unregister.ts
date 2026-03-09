@@ -1,6 +1,8 @@
 import * as readline from 'readline';
-import { readConfig, readCredentials, clearRegistration, isDaemonRunning } from '../config/config';
+import { ConfigManager } from '@cmdctrl/daemon-sdk';
 import { stop } from './stop';
+
+const configManager = new ConfigManager('gemini-cli');
 
 function confirm(question: string): Promise<boolean> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -13,14 +15,14 @@ function confirm(question: string): Promise<boolean> {
 }
 
 export async function unregister(): Promise<void> {
-  const config = readConfig();
+  const config = configManager.readConfig();
 
   if (!config) {
     console.log('Not registered.');
     return;
   }
 
-  if (isDaemonRunning()) {
+  if (configManager.isDaemonRunning()) {
     const ok = await confirm('Daemon is currently running. Stop it before unregistering?');
     if (!ok) {
       console.log('Aborted.');
@@ -31,7 +33,7 @@ export async function unregister(): Promise<void> {
 
   console.log(`Unregistering device "${config.deviceName}" (${config.deviceId})...`);
 
-  const credentials = readCredentials();
+  const credentials = configManager.readCredentials();
   if (credentials) {
     try {
       const response = await fetch(`${config.serverUrl}/api/devices/${config.deviceId}`, {
@@ -50,7 +52,7 @@ export async function unregister(): Promise<void> {
     }
   }
 
-  clearRegistration();
+  configManager.clearRegistration();
   console.log('Local registration data cleared.');
   console.log('You can now register again with: cmdctrl-gemini-cli register -s <server-url>');
 }
