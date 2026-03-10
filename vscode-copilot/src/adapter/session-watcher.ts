@@ -11,6 +11,7 @@ export interface ChatMessage {
   requestId: string;
   text: string;
   response: string;
+  thinkingContent?: string;
   timestamp: number;
   modelId: string;
 }
@@ -41,6 +42,7 @@ interface RawChatSession {
       text: string;
     };
     response: Array<{
+      kind?: string;
       value?: string;
     }>;
     timestamp: number;
@@ -163,9 +165,13 @@ export class SessionWatcher extends EventEmitter {
           requestId: req.requestId,
           text: req.message.text,
           response: req.response
-            .filter(r => r.value)
+            .filter(r => r.value && !r.kind)
             .map(r => r.value!)
             .join('\n'),
+          thinkingContent: req.response
+            .filter(r => r.kind === 'thinking' && r.value)
+            .map(r => r.value!)
+            .join('\n') || undefined,
           timestamp: req.timestamp,
           modelId: req.modelId || 'unknown',
         })),
@@ -177,12 +183,14 @@ export class SessionWatcher extends EventEmitter {
       if (event === 'add') {
         this.emit('session:discovered', session);
       } else if (previousSession) {
-        // Check for new messages
-        const newMessages = session.messages.filter(
-          m => !previousSession.messages.find(pm => pm.requestId === m.requestId)
-        );
-        if (newMessages.length > 0) {
-          this.emit('session:updated', session, newMessages);
+        // New messages (new requestId) or existing messages that received a response
+        const changedMessages = session.messages.filter(m => {
+          const prev = previousSession.messages.find(pm => pm.requestId === m.requestId);
+          if (!prev) return true; // New message
+          return !prev.response && !!m.response; // Response filled in
+        });
+        if (changedMessages.length > 0) {
+          this.emit('session:updated', session, changedMessages);
         }
       }
     } catch (err) {
