@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/vscode-copilot",
-  "version": "0.1.13",
+  "version": "0.1.15",
   "description": "CmdCtrl daemon for VS Code + GitHub Copilot - connects Copilot Chat sessions to the CmdCtrl orchestration server",
   "main": "./dist/index.js",
   "bin": {
@@ -11,7 +11,8 @@
     "dev": "ts-node src/index.ts",
     "start": "node dist/index.js",
     "lint": "eslint src --ext .ts",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "node -e \"const p=require(\\\"./package.json\\\"); const bad=Object.entries(p.dependencies||{}).filter(([,v])=>v.startsWith(\\\"file:\\\")); if(bad.length){console.error(\\\"ERROR: file: dependencies are not allowed in published packages:\\\",bad.map(([k,v])=>k+\\\"=\\\"+v).join(\\\", \\\")); process.exit(1)}\""
   },
   "keywords": [
     "cmdctrl",
@@ -25,7 +26,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "file:../sdk",
+    "@cmdctrl/daemon-sdk": "^1.0.3",
     "commander": "^12.1.0",
     "ws": "^8.18.0",
     "chokidar": "^3.6.0"
