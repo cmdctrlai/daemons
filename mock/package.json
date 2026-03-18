@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/mock-daemon",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "CmdCtrl mock daemon for testing - simulates AI agent behavior without real API calls",
   "main": "./dist/index.js",
   "bin": {

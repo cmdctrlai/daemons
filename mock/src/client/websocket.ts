@@ -29,6 +29,7 @@ import {
 const MAX_RECONNECT_DELAY = 30000;
 const INITIAL_RECONNECT_DELAY = 1000;
 const PING_INTERVAL = 30000;
+const MAX_AUTH_FAILURES = 5; // give up after this many consecutive 401s
 
 interface WatchedSession {
   sessionId: string;
@@ -46,6 +47,7 @@ export class MockDaemonClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
   private shouldReconnect = true;
+  private consecutiveAuthFailures = 0;
   private generator: MockGenerator;
   private watchedSessions: Map<string, WatchedSession> = new Map();
 
@@ -98,6 +100,7 @@ export class MockDaemonClient {
         wasOpen = true;
         console.log('WebSocket connected');
         this.reconnectDelay = INITIAL_RECONNECT_DELAY;
+        this.consecutiveAuthFailures = 0;
         this.startPingInterval();
         this.sendStatus();
         // Mock daemon doesn't discover external sessions
@@ -119,10 +122,16 @@ export class MockDaemonClient {
 
       this.ws.on('unexpected-response', (_req, res) => {
         if (res.statusCode === 401) {
-          console.error('Authentication failed (401). Device may have been removed from the server.');
-          console.error('Run "cmdctrl-mock register" again to re-register this device.');
-          this.shouldReconnect = false;
-          process.exit(1);
+          this.consecutiveAuthFailures++;
+          if (this.consecutiveAuthFailures >= MAX_AUTH_FAILURES) {
+            console.error('Authentication failed (401). Device may have been removed from the server.');
+            console.error('Run "cmdctrl-mock register" again to re-register this device.');
+            this.shouldReconnect = false;
+            process.exit(1);
+          }
+          console.warn(`Authentication failed (401), retrying... (${this.consecutiveAuthFailures}/${MAX_AUTH_FAILURES})`);
+          reject(new Error('Authentication failed (401)'));
+          return;
         }
         reject(new Error(`Unexpected server response: ${res.statusCode}`));
       });
