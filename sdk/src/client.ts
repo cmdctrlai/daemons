@@ -194,6 +194,8 @@ export class DaemonClient {
   private pingTimer: NodeJS.Timeout | null = null;
   private sessionRefreshTimer: NodeJS.Timeout | null = null;
   private shouldReconnect = true;
+  private consecutiveAuthFailures = 0;
+  private readonly maxAuthFailures = 5; // give up after this many consecutive 401s
   private runningTasks: Set<string> = new Set();
 
   // User-provided handlers
@@ -310,6 +312,7 @@ export class DaemonClient {
       this.ws.on('open', async () => {
         wasOpen = true;
         this.reconnectDelay = 1000;
+        this.consecutiveAuthFailures = 0;
         this.startPingInterval();
         this.startSessionRefreshInterval();
         this.sendStatus();
@@ -329,14 +332,20 @@ export class DaemonClient {
 
       this.ws.on('unexpected-response', (_req, res) => {
         if (res.statusCode === 401) {
-          console.error('Authentication failed (401). Device may have been removed from the server.');
-          console.error('Run the "register" command again to re-register this device.');
-          this.shouldReconnect = false;
-          if (this.authFailureHandler) {
-            this.authFailureHandler();
-          } else {
-            process.exit(1);
+          this.consecutiveAuthFailures++;
+          if (this.consecutiveAuthFailures >= this.maxAuthFailures) {
+            console.error('Authentication failed (401). Device may have been removed from the server.');
+            console.error('Run the "register" command again to re-register this device.');
+            this.shouldReconnect = false;
+            if (this.authFailureHandler) {
+              this.authFailureHandler();
+            } else {
+              process.exit(1);
+            }
           }
+          console.warn(`Authentication failed (401), retrying... (${this.consecutiveAuthFailures}/${this.maxAuthFailures})`);
+          reject(new Error('Authentication failed (401)'));
+          return;
         }
         reject(new Error(`Unexpected server response: ${res.statusCode}`));
       });
@@ -407,7 +416,7 @@ export class DaemonClient {
     }
   }
 
-  private sendEvent(taskId: string, eventType: string, data: Record<string, unknown> = {}): void {
+  sendEvent(taskId: string, eventType: string, data: Record<string, unknown> = {}): void {
     this.send({ type: 'event', task_id: taskId, event_type: eventType, ...data });
   }
 
