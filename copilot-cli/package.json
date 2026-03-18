@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/copilot-cli",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "description": "CmdCtrl daemon for GitHub Copilot CLI agent",
   "main": "./dist/index.js",
   "bin": {
@@ -11,7 +11,8 @@
     "dev": "ts-node src/index.ts",
     "lint": "eslint src --ext .ts",
     "start": "node dist/index.js",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "node -e \"const p=require(\\\"./package.json\\\"); const bad=Object.entries(p.dependencies||{}).filter(([,v])=>v.startsWith(\\\"file:\\\")); if(bad.length){console.error(\\\"ERROR: file: dependencies are not allowed in published packages:\\\",bad.map(([k,v])=>k+\\\"=\\\"+v).join(\\\", \\\")); process.exit(1)}\""
   },
   "keywords": [
     "cmdctrl",
@@ -23,7 +24,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "file:../sdk",
+    "@cmdctrl/daemon-sdk": "^1.0.3",
     "commander": "^12.1.0"
   },
   "devDependencies": {
