@@ -28,6 +28,7 @@ const MAX_RECONNECT_DELAY = 30000; // 30 seconds
 const INITIAL_RECONNECT_DELAY = 1000; // 1 second
 const PING_INTERVAL = 30000; // 30 seconds
 const SESSION_REFRESH_INTERVAL = 30000; // 30 seconds
+const MAX_AUTH_FAILURES = 5; // give up after this many consecutive 401s
 
 export class DaemonClient {
   private ws: WebSocket | null = null;
@@ -38,6 +39,7 @@ export class DaemonClient {
   private pingTimer: NodeJS.Timeout | null = null;
   private sessionRefreshTimer: NodeJS.Timeout | null = null;
   private shouldReconnect = true;
+  private consecutiveAuthFailures = 0;
   private adapter: ClaudeAdapter;
   private managedSessionIds: Set<string> = new Set(); // Sessions managed by this daemon
   private lastReportedSessionCount = -1; // Track for change detection
@@ -130,6 +132,7 @@ export class DaemonClient {
         wasOpen = true;
         console.log('WebSocket connected');
         this.reconnectDelay = INITIAL_RECONNECT_DELAY;
+        this.consecutiveAuthFailures = 0;
         this.startPingInterval();
         this.startSessionRefreshInterval();
         this.sendStatus();
@@ -152,10 +155,16 @@ export class DaemonClient {
 
       this.ws.on('unexpected-response', (_req, res) => {
         if (res.statusCode === 401) {
-          console.error('Authentication failed (401). Device may have been removed from the server.');
-          console.error('Run "cmdctrl-claude-code register" again to re-register this device.');
-          this.shouldReconnect = false;
-          process.exit(1);
+          this.consecutiveAuthFailures++;
+          if (this.consecutiveAuthFailures >= MAX_AUTH_FAILURES) {
+            console.error('Authentication failed (401). Device may have been removed from the server.');
+            console.error('Run "cmdctrl-claude-code register" again to re-register this device.');
+            this.shouldReconnect = false;
+            process.exit(1);
+          }
+          console.warn(`Authentication failed (401), retrying... (${this.consecutiveAuthFailures}/${MAX_AUTH_FAILURES})`);
+          reject(new Error('Authentication failed (401)'));
+          return;
         }
         reject(new Error(`Unexpected server response: ${res.statusCode}`));
       });
