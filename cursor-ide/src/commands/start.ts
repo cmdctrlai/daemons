@@ -224,12 +224,10 @@ export async function start(options: StartOptions): Promise<void> {
     // foreground flag acknowledged – daemon always runs in foreground
   }
 
-  try {
-    await client.connect();
-    console.log('Cursor IDE daemon running. Press Ctrl+C to stop.\n');
-    await new Promise(() => {});
-  } catch (err) {
-    console.error('Failed to connect:', err);
-    process.exit(1);
-  }
+  client.connect().catch(() => {
+    console.warn('Initial connection failed, will retry...');
+  });
+
+  console.log('Cursor IDE daemon running. Press Ctrl+C to stop.\n');
+  await new Promise(() => {});
 }
