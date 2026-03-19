@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/gemini-cli",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "CmdCtrl daemon for Google Gemini CLI agent",
   "main": "./dist/index.js",
   "bin": {
@@ -24,13 +24,13 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "^1.0.3",
+    "@cmdctrl/daemon-sdk": "^1.0.6",
     "commander": "^12.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "typescript": "^5.7.2",
-    "ts-node": "^10.9.2"
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
   },
   "engines": {
     "node": ">=18.0.0"
