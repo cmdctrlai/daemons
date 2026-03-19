@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/cursor-cli",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "CmdCtrl daemon for Cursor CLI - connects your workstation to the CmdCtrl orchestration server",
   "main": "./dist/index.js",
   "bin": {
@@ -23,15 +23,15 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "^1.0.3",
+    "@cmdctrl/daemon-sdk": "^1.0.6",
     "commander": "^12.1.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.13",
-    "typescript": "^5.7.2",
-    "ts-node": "^10.9.2"
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
   },
   "engines": {
     "node": ">=18.0.0"
