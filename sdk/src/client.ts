@@ -307,10 +307,7 @@ export class DaemonClient {
         }
       });
 
-      let wasOpen = false;
-
       this.ws.on('open', async () => {
-        wasOpen = true;
         this.reconnectDelay = 1000;
         this.consecutiveAuthFailures = 0;
         this.startPingInterval();
@@ -325,9 +322,7 @@ export class DaemonClient {
       this.ws.on('close', () => {
         this.stopPingInterval();
         this.stopSessionRefreshInterval();
-        if (wasOpen) {
-          this.scheduleReconnect();
-        }
+        this.scheduleReconnect();
       });
 
       this.ws.on('unexpected-response', (_req, res) => {
