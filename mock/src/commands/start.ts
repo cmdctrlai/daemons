@@ -94,14 +94,12 @@ export async function start(options: StartOptions): Promise<void> {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  try {
-    await client.connect();
-    console.log('Mock daemon running. Press Ctrl+C to stop.\n');
+  client.connect().catch(() => {
+    console.warn('Initial connection failed, will retry...');
+  });
 
-    // Keep process alive
-    await new Promise(() => {});
-  } catch (err) {
-    console.error('Failed to connect:', err);
-    process.exit(1);
-  }
+  console.log('Mock daemon running. Press Ctrl+C to stop.\n');
+
+  // Keep process alive
+  await new Promise(() => {});
 }

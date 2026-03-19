@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/mock-daemon",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "CmdCtrl mock daemon for testing - simulates AI agent behavior without real API calls",
   "main": "./dist/index.js",
   "bin": {
@@ -25,14 +25,15 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@cmdctrl/daemon-sdk": "^1.0.6",
     "commander": "^12.1.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.13",
-    "typescript": "^5.7.2",
-    "ts-node": "^10.9.2"
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
   },
   "engines": {
     "node": ">=18.0.0"
