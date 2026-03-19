@@ -126,10 +126,7 @@ export class DaemonClient {
         }
       });
 
-      let wasOpen = false;
-
       this.ws.on('open', () => {
-        wasOpen = true;
         console.log('WebSocket connected');
         this.reconnectDelay = INITIAL_RECONNECT_DELAY;
         this.consecutiveAuthFailures = 0;
@@ -148,9 +145,7 @@ export class DaemonClient {
         console.log(`WebSocket closed: ${code} ${reason}`);
         this.stopPingInterval();
         this.stopSessionRefreshInterval();
-        if (wasOpen) {
-          this.scheduleReconnect();
-        }
+        this.scheduleReconnect();
       });
 
       this.ws.on('unexpected-response', (_req, res) => {

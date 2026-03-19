@@ -81,6 +81,7 @@ function isSystemMessage(content: string): boolean {
     '<system-reminder>',
     '<bash-notification>',
     '<task-notification>',
+    'Base directory for this skill:',
   ];
   for (const prefix of systemPrefixes) {
     if (content.startsWith(prefix)) {
@@ -88,6 +89,19 @@ function isSystemMessage(content: string): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Detect agent no-op responses that Claude emits when it has nothing to say.
+ * These are boilerplate completions, not meaningful content for the user.
+ */
+function isNoOpAgentMessage(content: string): boolean {
+  const noOpPhrases = [
+    'No response requested.',
+    'No response needed.',
+  ];
+  const trimmed = content.trim();
+  return noOpPhrases.some(phrase => trimmed === phrase);
 }
 
 /**
@@ -289,6 +303,11 @@ function parseLineToMessage(line: string, index: number): MessageEntry | null {
 
     // Detect system messages and non-user content (JSON, tags, etc.)
     if (role === 'USER' && (isSystemMessage(text) || isNonUserContent(text))) {
+      return null;
+    }
+
+    // Filter agent no-op responses ("No response requested." etc.)
+    if (role === 'AGENT' && isNoOpAgentMessage(text)) {
       return null;
     }
 

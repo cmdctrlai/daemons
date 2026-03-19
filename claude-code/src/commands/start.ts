@@ -50,21 +50,18 @@ export async function start(options: StartOptions): Promise<void> {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  // Connect and run
-  try {
-    await client.connect();
-    console.log('Connected to server.');
-
-    if (options.foreground) {
-      console.log('Running in foreground. Press Ctrl+C to stop.\n');
-    }
-
-    // Keep process alive - the WebSocket client handles events
-    await new Promise(() => {
-      // Never resolves - daemon runs until killed
-    });
-  } catch (err) {
-    console.error('Failed to start daemon:', err);
-    process.exit(1);
+  if (options.foreground) {
+    console.log('Running in foreground. Press Ctrl+C to stop.\n');
   }
+
+  // Connect and run - initial failure is handled by the reconnect loop,
+  // so we never exit here. The process must stay alive for retry timers to fire.
+  client.connect().catch(() => {
+    console.warn('Initial connection failed, will retry...');
+  });
+
+  // Keep process alive - the WebSocket client handles events and reconnects
+  await new Promise(() => {
+    // Never resolves - daemon runs until killed
+  });
 }
