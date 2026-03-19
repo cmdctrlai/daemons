@@ -69,7 +69,6 @@ export class DaemonClient {
       });
 
       this.ws.on('open', () => {
-        wasOpen = true;
         console.log('WebSocket connected');
         this.reconnectDelay = INITIAL_RECONNECT_DELAY;
         this.consecutiveAuthFailures = 0;
@@ -82,17 +81,10 @@ export class DaemonClient {
         this.handleMessage(data.toString());
       });
 
-      let wasOpen = false;
-
       this.ws.on('close', (code, reason) => {
         console.log(`WebSocket closed: ${code} ${reason}`);
         this.stopPingInterval();
-        // Only reconnect from close if connection was established.
-        // Handshake failures (401, network error) are handled by the
-        // catch block in scheduleReconnect with proper exponential backoff.
-        if (wasOpen) {
-          this.scheduleReconnect();
-        }
+        this.scheduleReconnect();
       });
 
       this.ws.on('unexpected-response', (_req, res) => {
