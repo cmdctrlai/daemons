@@ -165,6 +165,7 @@ export class GeminiSessionWatcher {
       }
 
       let sawAgentResponse = false;
+      let sawUserMessage = false;
 
       for (const msg of newMessages) {
         const content = extractText(msg.content);
@@ -185,6 +186,8 @@ export class GeminiSessionWatcher {
         if (msg.type !== 'user') {
           sawAgentResponse = true;
           session.lastMessage = content.slice(0, 200);
+        } else {
+          sawUserMessage = true;
         }
 
         session.messageCount++;
@@ -192,7 +195,7 @@ export class GeminiSessionWatcher {
 
       session.processedMessageCount = allMessages.length;
 
-      if (sawAgentResponse) {
+      if (sawAgentResponse && !sawUserMessage) {
         this.startCompletionTimer(session);
       }
     } catch (err) {
