@@ -52,16 +52,8 @@ type CompletionCallback = (event: CompletionEvent) => void;
 // Polling interval (500ms)
 const POLL_INTERVAL_MS = 500;
 
-// Time to wait after AGENT_RESPONSE before declaring completion
-// If a tool call (VERBOSE) arrives within this window, completion is cancelled
-// Must be long enough to account for Claude Code writing text and tool_use as
-// SEPARATE entries. Claude often takes 2-4 seconds between writing "Let me do X"
-// and actually writing the tool_use block.
-const COMPLETION_DELAY_MS = 5000;
-
 export class SessionWatcher {
   private watchedSessions: Map<string, WatchedSession> = new Map();
-  private completionTimers: Map<string, NodeJS.Timeout> = new Map();
   private onEvent: EventCallback;
   private onCompletion: CompletionCallback | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -115,9 +107,6 @@ export class SessionWatcher {
    * Stop watching a session file
    */
   unwatchSession(sessionId: string): void {
-    // Cancel any pending completion timer
-    this.cancelCompletionTimer(sessionId);
-
     if (this.watchedSessions.delete(sessionId)) {
       console.log(`[SessionWatcher] Stopped watching session ${sessionId}`);
     }
@@ -133,12 +122,6 @@ export class SessionWatcher {
    * Stop watching all sessions
    */
   unwatchAll(): void {
-    // Cancel all completion timers
-    for (const timer of this.completionTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.completionTimers.clear();
-
     this.watchedSessions.clear();
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
@@ -232,7 +215,7 @@ export class SessionWatcher {
 
       const stats = fs.statSync(session.filePath);
 
-      // Only check if file size changed
+      // Only process if file size changed
       if (stats.size === session.lastSize) {
         return;
       }
@@ -242,19 +225,26 @@ export class SessionWatcher {
       session.lastSize = stats.size;
 
       // First pass: emit events and track what we saw
-      let sawAgentResponse = false;
-      let sawToolCall = false;
       let sawWaitingForInput = false;
       let sawUserMessage = false;
+      let sawSystemEntry = false;
 
       for (const entry of newEntries) {
+        const entryType = entry.type as string;
+
         // Track user entries with tool_result content so we can filter the
         // assistant "No response requested." replies that follow them.
-        if (entry.type === 'user' && entry.uuid) {
+        if (entryType === 'user' && entry.uuid) {
           const entryContent = (entry.message as Record<string, unknown> | undefined)?.content;
           if (Array.isArray(entryContent) && entryContent.some((b: Record<string, unknown>) => b.type === 'tool_result')) {
             session.toolResultUuids.add(entry.uuid as string);
           }
+        }
+
+        // Detect system entries – these are written by Claude Code at the end of
+        // each turn (never mid-turn), making them a reliable turn-complete signal.
+        if (entryType === 'system') {
+          sawSystemEntry = true;
         }
 
         const event = this.entryToEvent(session.sessionId, entry, session.toolResultUuids);
@@ -266,7 +256,6 @@ export class SessionWatcher {
           session.messageCount++;
           if (event.type === 'AGENT_RESPONSE') {
             session.lastMessage = event.content.slice(0, 200);
-            sawAgentResponse = true;
           } else if (event.type === 'USER_MESSAGE') {
             sawUserMessage = true;
           }
@@ -278,8 +267,6 @@ export class SessionWatcher {
             // not actively working. Treat these as "waiting for input" rather than "still working".
             if (this.entryHasWaitingToolUse(entry)) {
               sawWaitingForInput = true;
-            } else {
-              sawToolCall = true;
             }
           }
         }
@@ -288,31 +275,17 @@ export class SessionWatcher {
         }
       }
 
-      // Second pass: completion detection based on entire batch
-      // If user sent a message, cancel any pending completion timer — they're actively engaged
-      // and don't need a push notification for the previous agent response.
-      if (sawUserMessage) {
-        this.cancelCompletionTimer(session.sessionId);
-      }
-
+      // Completion detection based on entire batch
       if (sawWaitingForInput) {
-        // Agent is blocked on user input (plan approval, question) - fire completion immediately
+        // Agent is blocked on user input (plan approval, question) – fire completion immediately
         console.log(`[SessionWatcher] Session ${session.sessionId.slice(-8)} is waiting for user input, firing completion`);
-        this.cancelCompletionTimer(session.sessionId);
-        if (this.onCompletion) {
-          this.onCompletion({
-            sessionId: session.sessionId,
-            filePath: session.filePath,
-            lastMessage: session.lastMessage,
-            messageCount: session.messageCount,
-          });
-        }
-      } else if (sawToolCall) {
-        // Tool call in this batch - cancel any pending timer, agent is still working
-        this.cancelCompletionTimer(session.sessionId);
-      } else if (sawAgentResponse) {
-        // Agent responded with no tool call in this batch - start completion timer
-        this.startCompletionTimer(session);
+        this.fireCompletion(session);
+      } else if (sawSystemEntry && !sawUserMessage) {
+        // System entries mark end-of-turn in Claude Code's JSONL – they are never
+        // written mid-turn, making them a reliable completion signal. No timer needed.
+        // Skip if user also sent a message in the same batch (they already saw the response).
+        console.log(`[SessionWatcher] Session ${session.sessionId.slice(-8)} turn complete (system entry), firing completion`);
+        this.fireCompletion(session);
       }
 
     } catch (err) {
@@ -458,14 +431,6 @@ export class SessionWatcher {
 
     // Handle assistant entries
     if (entryType === 'assistant') {
-      // Skip assistant entries that are responses to tool_result user entries.
-      // These are internal continuation responses (e.g. "No response requested.")
-      // that should not appear as agent messages in the UI.
-      const parentUuid = entry.parentUuid as string | undefined;
-      if (parentUuid && toolResultUuids?.has(parentUuid)) {
-        console.log(`[SessionWatcher] Skipping assistant entry ${uuid?.slice(-8)} – parent is tool_result`);
-        return null;
-      }
 
       if (!Array.isArray(content)) {
         console.log(`[SessionWatcher] Assistant entry ${uuid?.slice(-8)} has non-array content:`, typeof content);
@@ -489,6 +454,22 @@ export class SessionWatcher {
         // Skip very short responses that are likely cursor indicators (e.g., "\", "|")
         // Also skip if content is ONLY whitespace or special characters
         const isLikelyCursor = textContent.length <= 2 && /^[\s\\|/_-]*$/.test(textContent);
+
+        // Skip internal continuation noise – short auto-responses after tool results
+        // like "No response requested." that Claude emits between tool calls.
+        // Only filter these when the parent is a tool_result entry AND the text
+        // matches known noise patterns. Real agent responses that happen to follow
+        // tool results must NOT be filtered.
+        const parentUuid = entry.parentUuid as string | undefined;
+        const isToolResultContinuation = parentUuid && toolResultUuids?.has(parentUuid);
+        const isNoiseResponse = isToolResultContinuation && (
+          textContent === 'No response requested.' ||
+          textContent.length <= 5
+        );
+        if (isNoiseResponse) {
+          console.log(`[SessionWatcher] Skipping noise continuation for ${uuid?.slice(-8)}: "${textContent}"`);
+          return null;
+        }
 
         if (textContent && !isLikelyCursor) {
           console.log(`[SessionWatcher] Emitting AGENT_RESPONSE for ${uuid?.slice(-8)}: "${textContent.slice(0, 50)}..."`);
@@ -639,41 +620,16 @@ export class SessionWatcher {
   }
 
   /**
-   * Start a completion timer for a session
-   * If no tool call arrives within COMPLETION_DELAY_MS, fire the completion callback
+   * Fire the completion callback immediately for a session
    */
-  private startCompletionTimer(session: WatchedSession): void {
-    // Cancel any existing timer first
-    this.cancelCompletionTimer(session.sessionId);
-
-    if (!this.onCompletion) {
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      this.completionTimers.delete(session.sessionId);
-
-      if (this.onCompletion) {
-        this.onCompletion({
-          sessionId: session.sessionId,
-          filePath: session.filePath,
-          lastMessage: session.lastMessage,
-          messageCount: session.messageCount,
-        });
-      }
-    }, COMPLETION_DELAY_MS);
-
-    this.completionTimers.set(session.sessionId, timer);
-  }
-
-  /**
-   * Cancel a pending completion timer for a session
-   */
-  private cancelCompletionTimer(sessionId: string): void {
-    const timer = this.completionTimers.get(sessionId);
-    if (timer) {
-      clearTimeout(timer);
-      this.completionTimers.delete(sessionId);
+  private fireCompletion(session: WatchedSession): void {
+    if (this.onCompletion) {
+      this.onCompletion({
+        sessionId: session.sessionId,
+        filePath: session.filePath,
+        lastMessage: session.lastMessage,
+        messageCount: session.messageCount,
+      });
     }
   }
 }

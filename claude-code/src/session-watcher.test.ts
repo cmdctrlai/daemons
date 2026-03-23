@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execSync } from 'child_process';
-import { SessionWatcher, SessionEvent } from './session-watcher';
+import { SessionWatcher, SessionEvent, CompletionEvent } from './session-watcher';
 
 describe('SessionWatcher', () => {
   let tempDir: string;
@@ -181,6 +181,88 @@ describe('SessionWatcher', () => {
     expect(events.length).toBe(1);
     expect(events[0].type).toBe('USER_MESSAGE');
     expect(events[0].content).toBe('what is the status?');
+  });
+
+  it('should fire completion when system entry appears after agent activity', async () => {
+    const completions: CompletionEvent[] = [];
+    watcher = new SessionWatcher(
+      (event) => { events.push(event); },
+      (completion) => { completions.push(completion); }
+    );
+    watcher.watchSession('test-session-123', tempFile);
+    await sleep(100);
+
+    // User sends a message
+    fs.appendFileSync(tempFile, '{"uuid":"user-1","type":"user","message":{"content":"fix the bug"}}\n');
+    await sleep(600);
+
+    // Agent responds with tool calls
+    fs.appendFileSync(tempFile, '{"uuid":"tool-1","type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Edit","input":{}}]}}\n');
+    await sleep(600);
+
+    // Tool result
+    fs.appendFileSync(tempFile, '{"uuid":"result-1","type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]}}\n');
+    await sleep(600);
+
+    // Agent's final text response
+    fs.appendFileSync(tempFile, '{"uuid":"resp-1","type":"assistant","parentUuid":"result-1","message":{"content":[{"type":"text","text":"Done – fixed the null pointer."}]}}\n');
+    await sleep(600);
+
+    // No completion yet – no system entry
+    expect(completions.length).toBe(0);
+
+    // System entry marks end of turn
+    fs.appendFileSync(tempFile, '{"uuid":"sys-1","type":"system","message":{"content":""}}\n');
+    await sleep(600);
+
+    expect(completions.length).toBe(1);
+    expect(completions[0].sessionId).toBe('test-session-123');
+  });
+
+  it('should NOT fire completion on system entry when user replied in same batch', async () => {
+    const completions: CompletionEvent[] = [];
+    watcher = new SessionWatcher(
+      (event) => { events.push(event); },
+      (completion) => { completions.push(completion); }
+    );
+    watcher.watchSession('test-session-123', tempFile);
+    await sleep(100);
+
+    // System entry and user message arrive in the same batch
+    fs.appendFileSync(tempFile,
+      '{"uuid":"sys-2","type":"system","message":{"content":""}}\n' +
+      '{"uuid":"user-2","type":"user","message":{"content":"now do the other thing"}}\n'
+    );
+    await sleep(600);
+
+    // No completion – user already replied
+    expect(completions.length).toBe(0);
+  });
+
+  it('should NOT fire completion on intermediate agent responses mid-turn', async () => {
+    const completions: CompletionEvent[] = [];
+    watcher = new SessionWatcher(
+      (event) => { events.push(event); },
+      (completion) => { completions.push(completion); }
+    );
+    watcher.watchSession('test-session-123', tempFile);
+    await sleep(100);
+
+    // Agent says something, then makes a tool call – no system entry
+    fs.appendFileSync(tempFile, '{"uuid":"resp-3","type":"assistant","message":{"content":[{"type":"text","text":"Let me read the file."}]}}\n');
+    await sleep(600);
+
+    fs.appendFileSync(tempFile, '{"uuid":"tool-3","type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_3","name":"Read","input":{}}]}}\n');
+    await sleep(600);
+
+    fs.appendFileSync(tempFile, '{"uuid":"result-3","type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_3","content":"file contents"}]}}\n');
+    await sleep(600);
+
+    fs.appendFileSync(tempFile, '{"uuid":"resp-4","type":"assistant","parentUuid":"result-3","message":{"content":[{"type":"text","text":"Now I see the issue. Let me fix it."}]}}\n');
+    await sleep(2000);
+
+    // No completion – no system entry, agent is still working
+    expect(completions.length).toBe(0);
   });
 });
 
