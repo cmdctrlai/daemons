@@ -153,6 +153,7 @@ export class CopilotSessionWatcher {
       }
 
       let sawAgentResponse = false;
+      let sawUserMessage = false;
 
       for (const msg of newMessages) {
         if (!msg.content) continue;
@@ -172,6 +173,8 @@ export class CopilotSessionWatcher {
         if (msg.role === 'agent') {
           sawAgentResponse = true;
           session.lastMessage = msg.content.slice(0, 200);
+        } else if (msg.role === 'user') {
+          sawUserMessage = true;
         }
 
         session.messageCount++;
@@ -179,7 +182,7 @@ export class CopilotSessionWatcher {
 
       session.processedMessageCount = allMessages.length;
 
-      if (sawAgentResponse) {
+      if (sawAgentResponse && !sawUserMessage) {
         this.startCompletionTimer(session);
       }
     } catch (err) {

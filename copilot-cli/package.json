@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/copilot-cli",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "CmdCtrl daemon for GitHub Copilot CLI agent",
   "main": "./dist/index.js",
   "bin": {
