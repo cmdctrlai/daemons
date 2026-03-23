@@ -157,6 +157,7 @@ export class CodexSessionWatcher {
 
       let sawAgentResponse = false;
       let sawTaskComplete = false;
+      let sawUserMessage = false;
 
       for (const msg of newMessages) {
         const uuid = stableUuid(session.sessionId + ':' + msg.id);
@@ -176,6 +177,8 @@ export class CodexSessionWatcher {
         if (msg.role === 'agent') {
           sawAgentResponse = true;
           session.lastMessage = msg.content.slice(0, 200);
+        } else if (msg.role === 'user') {
+          sawUserMessage = true;
         }
         if (msg.isComplete) {
           sawTaskComplete = true;
@@ -186,8 +189,8 @@ export class CodexSessionWatcher {
 
       session.processedMessageCount = allMessages.length;
 
-      // Completion detection
-      if (sawTaskComplete || sawAgentResponse) {
+      // Completion detection – skip if user already replied in the same batch
+      if ((sawTaskComplete || sawAgentResponse) && !sawUserMessage) {
         this.startCompletionTimer(session);
       }
     } catch (err) {
