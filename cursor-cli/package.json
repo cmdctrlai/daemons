@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/cursor-cli",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "CmdCtrl daemon for Cursor CLI - connects your workstation to the CmdCtrl orchestration server",
   "main": "./dist/index.js",
   "bin": {

@@ -129,6 +129,7 @@ export class CursorSessionWatcher {
       if (newMessages.length === 0) return;
 
       let sawAgent = false;
+      let sawUser = false;
 
       for (const msg of newMessages) {
         const uuid = stableUuid(session.sessionId + ':' + msg.id);
@@ -142,6 +143,8 @@ export class CursorSessionWatcher {
         if (msg.role === 'agent') {
           sawAgent = true;
           session.lastMessage = msg.content.slice(0, 200);
+        } else if (msg.role === 'user') {
+          sawUser = true;
         }
 
         session.messageCount++;
@@ -149,7 +152,7 @@ export class CursorSessionWatcher {
 
       session.processedCount = allMessages.length;
 
-      if (sawAgent) this.startCompletionTimer(session);
+      if (sawAgent && !sawUser) this.startCompletionTimer(session);
     } catch (err) {
       console.error(`[CursorWatcher] Error checking session ${session.sessionId}:`, err);
     }
