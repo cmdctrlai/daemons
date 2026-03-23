@@ -174,6 +174,7 @@ export class AiderSessionWatcher {
       if (newMessages.length === 0) return;
 
       let sawAgent = false;
+      let sawUser = false;
       for (const msg of newMessages) {
         const uuid = stableUuid(session.sessionId + ':' + msg.id);
         this.onEvent({
@@ -185,12 +186,14 @@ export class AiderSessionWatcher {
         if (msg.role === 'agent') {
           sawAgent = true;
           session.lastAgentMessage = msg.content.slice(0, 200);
+        } else if (msg.role === 'user') {
+          sawUser = true;
         }
         session.messageCount++;
       }
 
       session.processedCount = found.messages.length;
-      if (sawAgent) this.scheduleCompletion(session);
+      if (sawAgent && !sawUser) this.scheduleCompletion(session);
     } catch (err) {
       console.error(`[AiderWatcher] Error checking session ${session.sessionId}:`, err);
     }
