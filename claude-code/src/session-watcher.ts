@@ -280,10 +280,11 @@ export class SessionWatcher {
         // Agent is blocked on user input (plan approval, question) – fire completion immediately
         console.log(`[SessionWatcher] Session ${session.sessionId.slice(-8)} is waiting for user input, firing completion`);
         this.fireCompletion(session);
-      } else if (sawSystemEntry && !sawUserMessage) {
+      } else if (sawSystemEntry) {
         // System entries mark end-of-turn in Claude Code's JSONL – they are never
-        // written mid-turn, making them a reliable completion signal. No timer needed.
-        // Skip if user also sent a message in the same batch (they already saw the response).
+        // written mid-turn, making them a reliable completion signal.
+        // Always fire even if a user message is in the same batch – the user may
+        // have subscribed for push notifications from a different client.
         console.log(`[SessionWatcher] Session ${session.sessionId.slice(-8)} turn complete (system entry), firing completion`);
         this.fireCompletion(session);
       }

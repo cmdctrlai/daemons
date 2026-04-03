@@ -258,6 +258,27 @@ export class DaemonClient {
       event_type: eventType,
       ...data
     });
+
+    // Backup completion path: when the adapter reports TASK_COMPLETE,
+    // fire session_activity if the SessionWatcher is watching the session.
+    // This handles sessions where Claude Code doesn't write system entries
+    // to the JSONL (the primary completion signal for the SessionWatcher).
+    if (eventType === 'TASK_COMPLETE' && sessionId) {
+      const filePath = findSessionFile(sessionId);
+      if (filePath) {
+        console.log(`[WS] TASK_COMPLETE backup: sending session_activity for session ${sessionId.slice(-8)}`);
+        const message: SessionActivityMessage = {
+          type: 'session_activity',
+          session_id: sessionId,
+          file_path: filePath,
+          last_message: (data.result as string || '').slice(0, 200),
+          message_count: 0,
+          is_completion: true,
+          last_activity: new Date().toISOString(),
+        };
+        this.send(message);
+      }
+    }
   }
 
   /**

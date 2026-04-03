@@ -51,10 +51,13 @@ function getClaudeCli(): string {
 
 // Build a clean environment for spawned Claude CLI processes.
 // Strips CLAUDECODE to avoid the "nested session" guard that was
-// added in recent Claude Code versions.
+// added in recent Claude Code versions. Sets CLAUDE_CODE_ENTRYPOINT
+// to "cli" so sessions appear in `claude --resume` picker (v2.1.90+
+// filters out "sdk-cli" sessions).
 function cleanEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env.CLAUDECODE;
+  env.CLAUDE_CODE_ENTRYPOINT = 'cli';
   return env;
 }
 
