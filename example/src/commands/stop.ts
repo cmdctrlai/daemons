@@ -2,15 +2,15 @@
  * Stop command - stop the running daemon.
  */
 
-import { readPidFile, deletePidFile, isDaemonRunning } from '../config';
+import { config } from '../context';
 
 export function stop(): void {
-  if (!isDaemonRunning()) {
+  if (!config.isDaemonRunning()) {
     console.log('Daemon is not running.');
     return;
   }
 
-  const pid = readPidFile();
+  const pid = config.readPidFile();
   if (pid) {
     try {
       process.kill(pid, 'SIGTERM');
@@ -18,6 +18,6 @@ export function stop(): void {
     } catch {
       console.log('Daemon process not found, cleaning up PID file.');
     }
-    deletePidFile();
+    config.deletePidFile();
   }
 }

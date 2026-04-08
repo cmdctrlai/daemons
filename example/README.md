@@ -1,17 +1,27 @@
-# Cmd+Ctrl Example Daemon
+# CmdCtrl Example Daemon
 
-Minimal reference implementation of a Cmd+Ctrl daemon. Use this as a starting point for integrating your own AI agent with Cmd+Ctrl.
+Minimal reference implementation of a CmdCtrl daemon. Use this as a starting point for integrating your own AI agent with CmdCtrl.
 
-## Quick start
+## Quick Start
 
 ```bash
+# Install dependencies
 npm install
+
+# Build
 npm run build
-node dist/index.js register -s https://app.cmd-ctrl.ai
+
+# Register with your CmdCtrl server
+node dist/index.js register -s http://localhost:4000
+
+# Start the daemon
 node dist/index.js start
+
+# ...later, to remove this device from the server:
+node dist/index.js unregister
 ```
 
-## How to customize
+## How to Customize
 
 The only file you need to modify is **`src/agent.ts`**. It contains three functions:
 
@@ -21,24 +31,25 @@ The only file you need to modify is **`src/agent.ts`**. It contains three functi
 
 Replace the placeholder echo logic with your agent integration (LLM API call, CLI tool, etc.).
 
-## Project structure
+## Project Structure
 
 ```
 src/
-├── index.ts          # CLI entry point (register, start, status, stop)
+├── index.ts          # CLI entry point (register, start, status, stop, unregister)
 ├── agent.ts          # YOUR AGENT LOGIC GOES HERE
-├── daemon-client.ts  # WebSocket client (protocol handling)
-├── messages.ts       # Protocol message type definitions
 ├── message-store.ts  # In-memory message storage
-├── config.ts         # Config and credential management
+├── context.ts        # Agent type, version, and config paths
 └── commands/
     ├── register.ts   # Device registration flow
-    ├── start.ts      # Start daemon
+    ├── start.ts      # Start daemon (wires agent to @cmdctrl/daemon-sdk)
     ├── status.ts     # Check status
-    └── stop.ts       # Stop daemon
+    ├── stop.ts       # Stop daemon
+    └── unregister.ts # Unregister device and clear local config
 ```
+
+WebSocket protocol handling, reconnection, and config/credential management are provided by [`@cmdctrl/daemon-sdk`](../sdk/README.md).
 
 ## Documentation
 
-- [Daemon Protocol Specification](../DAEMON-PROTOCOL.md) — Full protocol reference
-- [Contributing](../CONTRIBUTING.md) — How to submit a new official daemon
+- [Building a Custom Daemon](../../docs/building-a-daemon.md) — Step-by-step tutorial
+- [Daemon Protocol Specification](../../docs/daemon-protocol.md) — Complete WebSocket protocol reference

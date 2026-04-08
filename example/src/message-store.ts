@@ -9,7 +9,7 @@
  */
 
 import { randomUUID } from 'crypto';
-import { MessageEntry } from './messages';
+import type { MessageEntry } from '@cmdctrl/daemon-sdk';
 
 const sessions = new Map<string, MessageEntry[]>();
 

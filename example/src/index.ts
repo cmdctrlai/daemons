@@ -14,6 +14,7 @@
  *   cmdctrl-example start
  *   cmdctrl-example status
  *   cmdctrl-example stop
+ *   cmdctrl-example unregister
  */
 
 import { Command } from 'commander';
@@ -21,6 +22,7 @@ import { register } from './commands/register';
 import { start } from './commands/start';
 import { status } from './commands/status';
 import { stop } from './commands/stop';
+import { unregister } from './commands/unregister';
 
 const program = new Command();
 
@@ -50,5 +52,10 @@ program
   .command('stop')
   .description('Stop the running daemon')
   .action(stop);
+
+program
+  .command('unregister')
+  .description('Unregister this device from the CmdCtrl server and clear local config')
+  .action(unregister);
 
 program.parse();
