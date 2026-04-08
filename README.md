@@ -39,6 +39,15 @@ Or use the hosted install script to set everything up interactively:
 curl -fsSL https://docs.cmd-ctrl.ai/install.sh | bash
 ```
 
+## Documentation
+
+Full docs are at **[docs.cmd-ctrl.ai](https://docs.cmd-ctrl.ai)**:
+
+- **[Installation](https://docs.cmd-ctrl.ai/installation)** – install and register a daemon on your machine
+- **[Building a daemon](https://docs.cmd-ctrl.ai/building-a-daemon)** – step-by-step guide for adapting a new agent
+- **[Daemon protocol](https://docs.cmd-ctrl.ai/daemon-protocol)** – WebSocket protocol reference
+- **[SDK reference](https://docs.cmd-ctrl.ai/reference)** – `@cmdctrl/daemon-sdk` API
+
 ## SDK
 
 The `@cmdctrl/daemon-sdk` package provides the WebSocket client and protocol types used by all official daemons. Use it to build a daemon for any agent.
