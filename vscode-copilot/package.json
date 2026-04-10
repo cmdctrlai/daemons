@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/vscode-copilot",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "CmdCtrl daemon for VS Code + GitHub Copilot - connects Copilot Chat sessions to the CmdCtrl orchestration server",
   "main": "./dist/index.js",
   "bin": {
