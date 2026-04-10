@@ -80,7 +80,7 @@ export async function requestDeviceCode(
   });
 
   if (res.status !== 200) {
-    throw new Error(`Failed to get device code: ${JSON.stringify(res.data)}`);
+    throw new Error(`Failed to get device code: ${res.data?.error || res.data?.message || `HTTP ${res.status}`}`);
   }
 
   return res.data as DeviceCodeResponse;
@@ -126,7 +126,7 @@ export async function pollForToken(
         continue;
       }
 
-      throw new Error(`Unexpected response: ${JSON.stringify(res.data)}`);
+      throw new Error(`Unexpected response: ${res.data?.error || res.data?.message || `HTTP ${res.status}`}`);
     } catch (err) {
       if ((err as Error).message?.startsWith('Unexpected response')) throw err;
       // Network error — keep polling

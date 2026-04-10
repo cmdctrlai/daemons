@@ -137,6 +137,6 @@ Runs the device authorization flow (similar to GitHub CLI).
 
 ## Documentation
 
-- [Building a Custom Daemon](../../docs/building-a-daemon.md) — Step-by-step tutorial
-- [Daemon Protocol Specification](../../docs/daemon-protocol.md) — Complete WebSocket protocol reference
+- [Building a Custom Daemon](https://docs.cmd-ctrl.ai/building-a-daemon) – Step-by-step tutorial
+- [Daemon Protocol Specification](https://docs.cmd-ctrl.ai/daemon-protocol) – Complete WebSocket protocol reference
 - [`daemons/example/`](../example/) — Minimal reference implementation

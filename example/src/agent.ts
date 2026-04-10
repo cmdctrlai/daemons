@@ -25,7 +25,10 @@ const conversations = new Map<string, Array<{ role: string; content: string }>>(
  * Called when a user creates a new session and sends their first message.
  *
  * @param instruction - The user's initial message
- * @param projectPath - Optional working directory hint
+ * @param projectPath - Optional working directory hint from the server.
+ *   SECURITY: If you use this as a `cwd` or in file operations, validate it
+ *   first – resolve it with `path.resolve()`, reject paths containing `..`,
+ *   and ensure it falls within an allowed directory.
  * @param onProgress - Call this to report progress (shown as status in the UI)
  * @returns The agent's response text (Markdown supported)
  */
@@ -62,7 +65,7 @@ export async function startTask(
  *
  * @param sessionId - Your native session ID (returned from startTask via the daemon)
  * @param message - The user's follow-up message
- * @param projectPath - Optional working directory hint
+ * @param projectPath - Optional working directory hint (see startTask for security notes)
  * @param onProgress - Call this to report progress
  * @returns The agent's response text
  */

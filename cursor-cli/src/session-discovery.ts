@@ -109,7 +109,7 @@ export function parseTranscriptFile(filePath: string): ParsedMessage[] {
 /**
  * Attempt to decode a cursor project directory name back to a filesystem path.
  * The encoding replaces '/' with '-' and drops the leading '/'.
- * e.g. "Users-mrwoof-src-testing" → "/Users/mrwoof/src/testing"
+ * e.g. "Users-alice-src-testing" → "/Users/alice/src/testing"
  *
  * We try all possible slash placements and return the first existing path.
  * Falls back to returning the encoded name if nothing exists.

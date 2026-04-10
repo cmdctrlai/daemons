@@ -298,6 +298,12 @@ export class DaemonClient {
       const wsProtocol = serverUrl.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${wsProtocol}//${serverUrl.host}/ws/daemon`;
 
+      // Warn when sending credentials over plaintext to a non-localhost host
+      if (serverUrl.protocol === 'http:' && serverUrl.hostname !== 'localhost' && serverUrl.hostname !== '127.0.0.1') {
+        console.warn(`⚠ Connecting over plaintext HTTP to ${serverUrl.hostname} – credentials will not be encrypted.`);
+        console.warn('  Use an https:// server URL in production.');
+      }
+
       this.ws = new WebSocket(wsUrl, {
         headers: {
           Authorization: `Bearer ${this.options.token}`,

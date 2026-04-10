@@ -122,12 +122,12 @@ function extractReadableText(content: unknown): string {
 
 /**
  * Decode a project directory name to a path
- * e.g., "-Users-mrwoof-src-cmdctrl" -> "/Users/mrwoof/src/cmdctrl"
+ * e.g., "-Users-alice-src-myproject" -> "/Users/alice/src/myproject"
  *
  * The encoding is ambiguous: hyphens in directory names look the same as path separators.
- * e.g., "-Users-mrwoof-src-cmdctrl-admin-interface" could be:
- *   /Users/mrwoof/src/cmdctrl-admin-interface (correct - worktree)
- *   /Users/mrwoof/src/cmdctrl/admin/interface (wrong - doesn't exist)
+ * e.g., "-Users-alice-src-my-project-web-ui" could be:
+ *   /Users/alice/src/my-project-web-ui (correct – worktree)
+ *   /Users/alice/src/my-project/web/ui (wrong – doesn't exist)
  *
  * We solve this by trying all possible decodings and returning the one that:
  * 1. Actually exists on the filesystem
