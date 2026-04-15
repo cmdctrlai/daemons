@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/codex-cli",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "description": "CmdCtrl daemon for OpenAI Codex CLI agent",
   "main": "./dist/index.js",
   "bin": {
