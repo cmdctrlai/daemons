@@ -73,7 +73,7 @@ export async function start(): Promise<void> {
       managedSessionIds.add(sessionId);
     }
     sendEvent(taskId, eventType, data);
-  });
+  }, daemonVersion);
 
   const client = new DaemonClient({
     serverUrl: config.serverUrl,
