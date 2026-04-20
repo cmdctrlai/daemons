@@ -1,0 +1,43 @@
+{
+  "name": "@cmdctrl/openclaw",
+  "version": "0.1.0",
+  "description": "CmdCtrl daemon for OpenClaw – connects your workstation to the CmdCtrl orchestration server",
+  "main": "./dist/index.js",
+  "bin": {
+    "cmdctrl-openclaw": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "node -e \"const p=require(\\\"./package.json\\\"); const bad=Object.entries(p.dependencies||{}).filter(([,v])=>v.startsWith(\\\"file:\\\")); if(bad.length){console.error(\\\"ERROR: file: dependencies are not allowed in published packages:\\\",bad.map(([k,v])=>k+\\\"=\\\"+v).join(\\\", \\\")); process.exit(1)}\""
+  },
+  "keywords": [
+    "cmdctrl",
+    "daemon",
+    "openclaw",
+    "ai",
+    "orchestration"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@cmdctrl/daemon-sdk": "^1.0.6",
+    "commander": "^12.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
