@@ -357,7 +357,7 @@ export class DaemonClient {
     console.log(`Starting task ${msg.task_id}: ${msg.instruction.substring(0, 50)}...`);
 
     try {
-      await this.adapter.startTask(msg.task_id, msg.instruction, msg.project_path);
+      await this.adapter.startTask(msg.task_id, msg.instruction, msg.project_path, msg.images);
     } catch (err) {
       console.error(`Failed to start task ${msg.task_id}:`, err);
       this.sendEvent(msg.task_id, 'ERROR', {
@@ -373,7 +373,7 @@ export class DaemonClient {
     console.log(`Resuming task ${msg.task_id} with session ${msg.session_id}`);
 
     try {
-      await this.adapter.resumeTask(msg.task_id, msg.session_id, msg.message, msg.project_path);
+      await this.adapter.resumeTask(msg.task_id, msg.session_id, msg.message, msg.project_path, msg.images);
     } catch (err) {
       console.error(`Failed to resume task ${msg.task_id}:`, err);
       this.sendEvent(msg.task_id, 'ERROR', {
