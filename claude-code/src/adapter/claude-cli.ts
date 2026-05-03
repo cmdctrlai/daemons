@@ -12,6 +12,62 @@ import {
 import { findSessionFile } from '../message-reader';
 
 const DEFAULT_TIMEOUT = 10 * 60 * 1000; // 10 minutes
+const IMAGE_TMP_DIR = path.join(os.tmpdir(), 'cmdctrl-images');
+
+/**
+ * Save base64 data URL images to local temp files and build a message
+ * with file path references for Claude to read.
+ */
+function saveImagesAndBuildMessage(taskId: string, text: string, images?: string[]): string {
+  if (!images || images.length === 0) {
+    return text;
+  }
+
+  // Ensure temp directory exists
+  fs.mkdirSync(IMAGE_TMP_DIR, { recursive: true });
+
+  const filePaths: string[] = [];
+  for (let i = 0; i < images.length; i++) {
+    const dataUrl = images[i];
+    const parts = dataUrl.split(',', 2);
+    if (parts.length !== 2) {
+      console.log(`[${taskId}] Skipping image ${i + 1}: invalid data URL`);
+      continue;
+    }
+
+    // Determine extension from MIME type
+    let ext = '.png';
+    const header = parts[0];
+    if (header.includes('jpeg') || header.includes('jpg')) ext = '.jpg';
+    else if (header.includes('gif')) ext = '.gif';
+    else if (header.includes('webp')) ext = '.webp';
+
+    // Decode and write to temp file
+    try {
+      const data = Buffer.from(parts[1], 'base64');
+      const filePath = path.join(IMAGE_TMP_DIR, `image_${Date.now()}_${i}${ext}`);
+      fs.writeFileSync(filePath, data);
+      filePaths.push(filePath);
+      console.log(`[${taskId}] Saved image ${i + 1} (${data.length} bytes) to ${filePath}`);
+    } catch (err) {
+      console.error(`[${taskId}] Failed to save image ${i + 1}:`, err);
+    }
+  }
+
+  if (filePaths.length === 0) {
+    return text;
+  }
+
+  // Build message with file path references
+  let result = text;
+  if (text) result += '\n\n';
+  result += 'The user has attached the following image(s). Please read them using your Read tool:\n';
+  for (let i = 0; i < filePaths.length; i++) {
+    result += `\n- Image ${i + 1}: ${filePaths[i]}\n`;
+  }
+
+  return result;
+}
 
 // Find claude CLI in common locations
 function findClaudeCli(): string {
@@ -161,7 +217,8 @@ export class ClaudeAdapter {
   async startTask(
     taskId: string,
     instruction: string,
-    projectPath?: string
+    projectPath?: string,
+    images?: string[]
   ): Promise<void> {
     console.log(`[${taskId}] Starting task: ${instruction.substring(0, 50)}...`);
 
@@ -190,9 +247,12 @@ export class ClaudeAdapter {
       });
     }
 
+    // Save images locally and build the message with file path references
+    const messageWithImages = saveImagesAndBuildMessage(taskId, instruction, images);
+
     // Build command arguments
     const args = [
-      '-p', instruction,
+      '-p', messageWithImages,
       '--output-format', 'stream-json',
       '--verbose',
       '--permission-mode', 'acceptEdits',
@@ -229,7 +289,8 @@ export class ClaudeAdapter {
     taskId: string,
     sessionId: string,
     message: string,
-    projectPath?: string
+    projectPath?: string,
+    images?: string[]
   ): Promise<void> {
     console.log(`[${taskId}] ===== RESUME TASK START =====`);
     console.log(`[${taskId}] Session: ${sessionId.slice(-8)}, Message: "${message.slice(0, 50)}..."`);
@@ -259,9 +320,12 @@ export class ClaudeAdapter {
       cwd = os.homedir();
     }
 
+    // Save images locally and build the message with file path references
+    const messageWithImages = saveImagesAndBuildMessage(taskId, message, images);
+
     // Build command arguments with --resume
     const args = [
-      '-p', message,
+      '-p', messageWithImages,
       '--resume', sessionId,
       '--output-format', 'stream-json',
       '--verbose',
