@@ -88,6 +88,8 @@ export interface TaskHandle {
   instruction: string;
   /** Optional project path hint */
   projectPath?: string;
+  /** Optional base64 data URL images attached by the user */
+  images?: string[];
 
   /** Tell the server your native session ID. Must be called first. */
   sessionStarted(nativeSessionId: string): void;
@@ -113,6 +115,8 @@ export interface ResumeHandle {
   message: string;
   /** Optional project path hint */
   projectPath?: string;
+  /** Optional base64 data URL images attached by the user */
+  images?: string[];
 
   /** Report progress */
   progress(action: string, target: string): void;
@@ -434,6 +438,7 @@ export class DaemonClient {
       taskId,
       instruction: msg.instruction,
       projectPath: msg.project_path,
+      images: msg.images,
       sessionStarted: (id) => this.sendEvent(taskId, 'SESSION_STARTED', { session_id: id }),
       progress: (action, target) => this.sendEvent(taskId, 'PROGRESS', { action, target }),
       output: (text, uuid) => this.sendEvent(taskId, 'OUTPUT', { output: text, user_message_uuid: uuid }),
@@ -461,6 +466,7 @@ export class DaemonClient {
       sessionId: msg.session_id,
       message: msg.message,
       projectPath: msg.project_path,
+      images: msg.images,
       progress: (action, target) => this.sendEvent(taskId, 'PROGRESS', { action, target }),
       output: (text, uuid) => this.sendEvent(taskId, 'OUTPUT', { output: text, user_message_uuid: uuid }),
       complete: (result, uuid) => {
