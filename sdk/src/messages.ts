@@ -20,6 +20,7 @@ export interface TaskStartMessage {
   task_id: string;
   instruction: string;
   project_path?: string;
+  images?: string[];
 }
 
 export interface TaskResumeMessage {
@@ -28,6 +29,7 @@ export interface TaskResumeMessage {
   session_id: string;
   message: string;
   project_path?: string;
+  images?: string[];
 }
 
 export interface TaskCancelMessage {
