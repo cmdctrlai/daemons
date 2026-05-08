@@ -260,12 +260,12 @@ export class DaemonClient {
     });
 
     // Backup completion path: when the adapter reports TASK_COMPLETE,
-    // fire session_activity if the SessionWatcher is watching the session.
-    // This handles sessions where Claude Code doesn't write system entries
-    // to the JSONL (the primary completion signal for the SessionWatcher).
+    // fire session_activity if the SessionWatcher hasn't already fired for
+    // this turn. The watcher's own fire path is the primary signal; this
+    // backup catches turns where the JSONL never produces a system entry.
     if (eventType === 'TASK_COMPLETE' && sessionId) {
       const filePath = findSessionFile(sessionId);
-      if (filePath) {
+      if (filePath && this.sessionWatcher.reserveCompletionFire(sessionId)) {
         console.log(`[WS] TASK_COMPLETE backup: sending session_activity for session ${sessionId.slice(-8)}`);
         const message: SessionActivityMessage = {
           type: 'session_activity',
