@@ -17,6 +17,7 @@
 export { DaemonClient } from './client';
 export type {
   DaemonClientOptions,
+  AutoUpdateConfig,
   TaskHandle,
   ResumeHandle,
   GetMessagesRequest,
@@ -32,6 +33,10 @@ export type { DaemonConfig, DaemonCredentials } from './config';
 // Registration
 export { registerDevice, unregisterDevice, requestDeviceCode, pollForToken } from './register';
 export type { RegistrationResult } from './register';
+
+// Self-update
+export { selfUpdate, fetchLatestVersion, isAutoUpdateSupported } from './update';
+export type { SelfUpdateOptions, SelfUpdateResult, SelfUpdateStatus } from './update';
 
 // Message types
 export type {

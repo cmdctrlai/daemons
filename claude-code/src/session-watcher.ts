@@ -35,6 +35,14 @@ interface WatchedSession {
   lastLineCount: number;
   messageCount: number;
   lastMessage: string;
+  // UUID of the most recent assistant entry seen in this session. Used to
+  // dedup completion events: if Claude Code appends a second `system` entry
+  // long after the turn finished (e.g. a delayed hook write), we don't want
+  // to re-fire completion against an assistant turn that hasn't advanced.
+  latestAssistantUuid?: string;
+  // UUID of the assistant entry the last fired completion was bound to.
+  // Completion only refires when latestAssistantUuid moves past this.
+  lastFiredAssistantUuid?: string;
 }
 
 type EventCallback = (event: SessionEvent) => void;
@@ -79,7 +87,7 @@ export class SessionWatcher {
 
     try {
       const stats = fs.statSync(filePath);
-      const { processedUuids, toolResultUuids, lineCount, messageCount, lastMessage } = this.initializeFromFile(filePath);
+      const { processedUuids, toolResultUuids, lineCount, messageCount, lastMessage, lastAssistantUuid } = this.initializeFromFile(filePath);
 
       this.watchedSessions.set(sessionId, {
         sessionId,
@@ -90,6 +98,11 @@ export class SessionWatcher {
         lastLineCount: lineCount,
         messageCount,
         lastMessage,
+        // Seed both UUIDs to the file's last assistant entry. Treats whatever
+        // is already in the file as "already handled" so a delayed hook system
+        // entry against a pre-existing turn won't fire a fresh push notification.
+        latestAssistantUuid: lastAssistantUuid,
+        lastFiredAssistantUuid: lastAssistantUuid,
       });
 
       console.log(`[SessionWatcher] Started watching session ${sessionId} (${processedUuids.size} entries, ${messageCount} messages)`);
@@ -134,11 +147,12 @@ export class SessionWatcher {
    * Initialize processed UUIDs from existing file content
    * This prevents emitting events for entries that existed before we started watching
    */
-  private initializeFromFile(filePath: string): { processedUuids: Set<string>; toolResultUuids: Set<string>; lineCount: number; messageCount: number; lastMessage: string } {
+  private initializeFromFile(filePath: string): { processedUuids: Set<string>; toolResultUuids: Set<string>; lineCount: number; messageCount: number; lastMessage: string; lastAssistantUuid?: string } {
     const processedUuids = new Set<string>();
     const toolResultUuids = new Set<string>();
     let messageCount = 0;
     let lastMessage = '';
+    let lastAssistantUuid: string | undefined;
 
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
@@ -150,6 +164,10 @@ export class SessionWatcher {
           if (entry.uuid) {
             processedUuids.add(entry.uuid);
             messageCount++;
+
+            if (entry.type === 'assistant') {
+              lastAssistantUuid = entry.uuid;
+            }
 
             // Track user entries whose content contains tool_result blocks.
             // Assistant entries with parentUuid pointing to one of these are
@@ -178,7 +196,7 @@ export class SessionWatcher {
         }
       }
 
-      return { processedUuids, toolResultUuids, lineCount: lines.length, messageCount, lastMessage };
+      return { processedUuids, toolResultUuids, lineCount: lines.length, messageCount, lastMessage, lastAssistantUuid };
     } catch {
       return { processedUuids, toolResultUuids, lineCount: 0, messageCount: 0, lastMessage: '' };
     }
@@ -245,6 +263,12 @@ export class SessionWatcher {
         // each turn (never mid-turn), making them a reliable turn-complete signal.
         if (entryType === 'system') {
           sawSystemEntry = true;
+        }
+
+        // Track the latest assistant entry UUID so completion fires can dedup
+        // by turn boundary (see fireCompletion).
+        if (entryType === 'assistant' && entry.uuid) {
+          session.latestAssistantUuid = entry.uuid as string;
         }
 
         const event = this.entryToEvent(session.sessionId, entry, session.toolResultUuids);
@@ -622,8 +646,18 @@ export class SessionWatcher {
 
   /**
    * Fire the completion callback immediately for a session
+   *
+   * Dedups against the assistant turn UUID. Claude Code occasionally appends
+   * a second `system` entry to the JSONL minutes after a turn finishes (a
+   * delayed hook write), and the watcher used to fire a second completion
+   * for that – yielding a duplicate push notification on the same turn.
+   * Skip when no new assistant entry has appeared since the last fire.
    */
   private fireCompletion(session: WatchedSession): void {
+    if (session.latestAssistantUuid === session.lastFiredAssistantUuid) {
+      return;
+    }
+    session.lastFiredAssistantUuid = session.latestAssistantUuid;
     if (this.onCompletion) {
       this.onCompletion({
         sessionId: session.sessionId,
@@ -632,5 +666,30 @@ export class SessionWatcher {
         messageCount: session.messageCount,
       });
     }
+  }
+
+  /**
+   * Reserve the right to send a completion for this session's current turn.
+   *
+   * Used by external completion paths (e.g. the TASK_COMPLETE backup in the
+   * websocket layer) that send their own session_activity but must not race
+   * with the watcher's own fire. Returns true if no completion has been sent
+   * for the current assistant turn, in which case the caller should send and
+   * we mark the turn as fired. Returns false if already fired – the caller
+   * must skip its send.
+   *
+   * If the session isn't being watched, returns true so the caller can act as
+   * an unconditional fallback (no dedup is possible).
+   */
+  reserveCompletionFire(sessionId: string): boolean {
+    const session = this.watchedSessions.get(sessionId);
+    if (!session) {
+      return true;
+    }
+    if (session.latestAssistantUuid === session.lastFiredAssistantUuid) {
+      return false;
+    }
+    session.lastFiredAssistantUuid = session.latestAssistantUuid;
+    return true;
   }
 }

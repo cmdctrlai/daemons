@@ -87,6 +87,16 @@ export async function start(): Promise<void> {
     agentType: 'cursor_cli',
     token: credentials.refreshToken,
     version: daemonVersion,
+    autoUpdate: true,
+    autoUpdateConfig: {
+      packageName: '@cmdctrl/cursor-cli',
+      binName: 'cmdctrl-cursor-cli',
+      onBeforeUpdate: async () => {
+        sessionWatcher.unwatchAll();
+        await adapter.stopAll();
+        configManager.deletePidFile();
+      },
+    },
   });
 
   client.setSessionsProvider(() => discoverSessions(managedSessionIds));
@@ -137,11 +147,7 @@ export async function start(): Promise<void> {
     return readSessionMessages(req.sessionId, req.limit, req.beforeUuid, req.afterUuid);
   });
 
-  client.onVersionStatus((msg) => {
-    if (msg.status === 'update_available') {
-      console.warn(`Update available: v${msg.latest_version} (you have v${msg.your_version})`);
-    }
-  });
+  // Auto-update is handled by the SDK via autoUpdateConfig above.
 
   const shutdown = async () => {
     console.log('\nShutting down...');

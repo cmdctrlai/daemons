@@ -46,19 +46,30 @@ export async function start(): Promise<void> {
   // Session IDs started via task_start – excluded from native session discovery
   const managedSessionIds = new Set<string>();
 
+  // Track watched sessions: sessionId -> last known message count
+  const watchedMessageCounts = new Map<string, number>();
+  const watchIntervals = new Map<string, ReturnType<typeof setInterval>>();
+
   const client = new DaemonClient({
     serverUrl: config.serverUrl,
     deviceId: config.deviceId,
     agentType: 'opencode',
     token: credentials.refreshToken,
     version: daemonVersion,
+    autoUpdate: true,
+    autoUpdateConfig: {
+      packageName: '@cmdctrl/opencode',
+      binName: 'cmdctrl-opencode',
+      onBeforeUpdate: () => {
+        for (const interval of watchIntervals.values()) clearInterval(interval);
+        watchIntervals.clear();
+        adapter.stopServer();
+        configManager.deletePidFile();
+      },
+    },
   });
 
   client.setSessionsProvider(() => adapter.listSessions(managedSessionIds));
-
-  // Track watched sessions: sessionId -> last known message count
-  const watchedMessageCounts = new Map<string, number>();
-  const watchIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
   client.onWatchSession(async (sessionId) => {
     try {
@@ -126,11 +137,7 @@ export async function start(): Promise<void> {
     return { messages, hasMore };
   });
 
-  client.onVersionStatus((msg) => {
-    if (msg.status === 'update_available') {
-      console.warn(`Update available: v${msg.latest_version} (you have v${msg.your_version})`);
-    }
-  });
+  // Auto-update is handled by the SDK via autoUpdateConfig above.
 
   const shutdown = async () => {
     console.log('\nShutting down...');

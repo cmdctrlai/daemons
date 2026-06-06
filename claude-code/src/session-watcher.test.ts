@@ -239,6 +239,53 @@ describe('SessionWatcher', () => {
     expect(completions.length).toBe(0);
   });
 
+  it('should NOT re-fire completion when a second system entry appears with no new assistant turn', async () => {
+    const completions: CompletionEvent[] = [];
+    watcher = new SessionWatcher(
+      (event) => { events.push(event); },
+      (completion) => { completions.push(completion); }
+    );
+    watcher.watchSession('test-session-dupe', tempFile);
+    await sleep(100);
+
+    // Agent response then system entry – fires once
+    fs.appendFileSync(tempFile, '{"uuid":"resp-dup","type":"assistant","message":{"content":[{"type":"text","text":"All done."}]}}\n');
+    await sleep(600);
+    fs.appendFileSync(tempFile, '{"uuid":"sys-first","type":"system","message":{"content":""}}\n');
+    await sleep(600);
+
+    expect(completions.length).toBe(1);
+
+    // A delayed second system entry arrives later (e.g. hook write) – must NOT
+    // re-fire because the assistant turn (resp-dup) hasn't advanced.
+    fs.appendFileSync(tempFile, '{"uuid":"sys-late","type":"system","message":{"content":""}}\n');
+    await sleep(1000);
+
+    expect(completions.length).toBe(1);
+  });
+
+  it('should suppress TASK_COMPLETE backup fire after watcher already fired the same turn', async () => {
+    const completions: CompletionEvent[] = [];
+    watcher = new SessionWatcher(
+      (event) => { events.push(event); },
+      (completion) => { completions.push(completion); }
+    );
+    watcher.watchSession('test-session-backup', tempFile);
+    await sleep(100);
+
+    // Watcher fires for this turn first
+    fs.appendFileSync(tempFile, '{"uuid":"resp-bk","type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}\n');
+    await sleep(600);
+    fs.appendFileSync(tempFile, '{"uuid":"sys-bk","type":"system","message":{"content":""}}\n');
+    await sleep(600);
+
+    expect(completions.length).toBe(1);
+
+    // The backup path (websocket TASK_COMPLETE) tries to reserve the same turn –
+    // must be denied because the watcher has already fired.
+    expect(watcher.reserveCompletionFire('test-session-backup')).toBe(false);
+  });
+
   it('should NOT fire completion on intermediate agent responses mid-turn', async () => {
     const completions: CompletionEvent[] = [];
     watcher = new SessionWatcher(

@@ -103,11 +103,13 @@ console.log('Daemon connected!');
 The main client class. Handles WebSocket connection, protocol, and message routing.
 
 **Constructor options:**
-- `serverUrl` — CmdCtrl server URL
-- `deviceId` — Device ID from registration
-- `agentType` — Your agent type (snake_case)
-- `token` — Refresh token from registration
-- `version` — Your daemon version
+- `serverUrl` – CmdCtrl server URL
+- `deviceId` – Device ID from registration
+- `agentType` – Your agent type (snake_case)
+- `token` – Refresh token from registration
+- `version` – Your daemon version
+- `autoUpdate` – Optional. When `true`, the SDK self-installs new versions in response to `version_status` from the server (deferred until idle for `update_available`, immediate for `update_required`). Skipped on Windows. Default `false`.
+- `autoUpdateConfig` – Required when `autoUpdate` is `true`. Object with `packageName` (npm package to reinstall, e.g. `@cmdctrl/aider`), `binName` (binary to respawn after update, e.g. `cmdctrl-aider`), and an optional `onBeforeUpdate` callback to release resources (pid files, watchers, child processes) before the daemon installs and exits.
 
 **Handler registration:**
 - `onTaskStart(handler)` — New task from user (required)

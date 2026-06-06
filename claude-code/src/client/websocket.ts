@@ -15,6 +15,7 @@ import {
   VersionStatusMessage,
   SessionInfo,
 } from './messages';
+import { execSync, spawn } from 'child_process';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { SessionEvent, CompletionEvent } from '../session-watcher';
@@ -23,12 +24,16 @@ import { readMessages, findSessionFile } from '../message-reader';
 import { SessionWatcher } from '../session-watcher';
 import { buildContextResponse } from '../handlers/context-handler';
 import { SessionActivityMessage } from './messages';
+import { deletePidFile } from '../config/config';
 
 const MAX_RECONNECT_DELAY = 30000; // 30 seconds
 const INITIAL_RECONNECT_DELAY = 1000; // 1 second
 const PING_INTERVAL = 30000; // 30 seconds
 const SESSION_REFRESH_INTERVAL = 30000; // 30 seconds
 const MAX_AUTH_FAILURES = 5; // give up after this many consecutive 401s
+
+const PACKAGE_NAME = '@cmdctrl/claude-code';
+const BIN_NAME = 'cmdctrl-claude-code';
 
 export class DaemonClient {
   private ws: WebSocket | null = null;
@@ -44,6 +49,16 @@ export class DaemonClient {
   private managedSessionIds: Set<string> = new Set(); // Sessions managed by this daemon
   private lastReportedSessionCount = -1; // Track for change detection
   private sessionWatcher: SessionWatcher;
+  private pendingAutoUpdate: VersionStatusMessage | null = null;
+  private autoUpdateInProgress = false;
+  private idleCheckTimer: NodeJS.Timeout | null = null;
+  /**
+   * Remembers a `latest_version` that already resulted in a no-op install
+   * (npm's registry latest matches what we already have). Stops us from
+   * reattempting the same install on every reconnect. Cleared when the
+   * server advertises a different latest.
+   */
+  private noopAutoUpdateTarget: string | null = null;
 
   constructor(config: CmdCtrlConfig, credentials: Credentials) {
     this.config = config;
@@ -118,11 +133,17 @@ export class DaemonClient {
         }
       }
 
+      // FEAT-068: declare auto-update capability so the server can render
+      // honest banner copy. Windows skips the actual install but the daemon
+      // still has the code, so we only advertise capability where supported.
+      const capabilities = process.platform === 'win32' ? '' : 'auto-update';
+
       this.ws = new WebSocket(wsUrl, {
         headers: {
           Authorization: `Bearer ${this.credentials.refreshToken}`,
           'X-Device-ID': this.config.deviceId,
           'X-Daemon-Version': daemonVersion,
+          ...(capabilities && { 'X-Daemon-Capabilities': capabilities }),
         }
       });
 
@@ -260,12 +281,12 @@ export class DaemonClient {
     });
 
     // Backup completion path: when the adapter reports TASK_COMPLETE,
-    // fire session_activity if the SessionWatcher is watching the session.
-    // This handles sessions where Claude Code doesn't write system entries
-    // to the JSONL (the primary completion signal for the SessionWatcher).
+    // fire session_activity if the SessionWatcher hasn't already fired for
+    // this turn. The watcher's own fire path is the primary signal; this
+    // backup catches turns where the JSONL never produces a system entry.
     if (eventType === 'TASK_COMPLETE' && sessionId) {
       const filePath = findSessionFile(sessionId);
-      if (filePath) {
+      if (filePath && this.sessionWatcher.reserveCompletionFire(sessionId)) {
         console.log(`[WS] TASK_COMPLETE backup: sending session_activity for session ${sessionId.slice(-8)}`);
         const message: SessionActivityMessage = {
           type: 'session_activity',
@@ -462,29 +483,155 @@ export class DaemonClient {
   }
 
   /**
-   * Handle version_status message from server
+   * Handle version_status message from server.
+   *
+   * Auto-update strategy:
+   *   - update_required: install immediately and exec the new version (the
+   *     server has logically rejected this connection; staying alive on the
+   *     old code achieves nothing).
+   *   - update_available: defer until the daemon is idle (no running tasks),
+   *     then install and exec the new version. While deferred, log the
+   *     intent so users can opt out by stopping the daemon.
+   *   - Windows: skip auto-update; the launcher .exe shim is locked while it
+   *     runs and `npm install -g` will fail. Surface a manual instruction.
    */
   private handleVersionStatus(msg: VersionStatusMessage): void {
+    if (msg.status === 'current') return;
+
+    // Don't retry an auto-update that already proved no-op for the same
+    // target (e.g. the server's policy advertised a version that isn't
+    // actually on npm yet). Cleared once the server advertises a different
+    // latest_version.
+    if (msg.latest_version && this.noopAutoUpdateTarget === msg.latest_version) {
+      return;
+    }
+    if (msg.latest_version && this.noopAutoUpdateTarget && this.noopAutoUpdateTarget !== msg.latest_version) {
+      this.noopAutoUpdateTarget = null;
+    }
+
     if (msg.status === 'update_required') {
       console.error(`\n✖ Daemon version ${msg.your_version} is no longer supported (minimum: ${msg.min_version})`);
-      console.error(`  Run: cmdctrl-claude-code update`);
-      if (msg.changelog_url) {
-        console.error(`  Changelog: ${msg.changelog_url}`);
-      }
-      if (msg.message) {
-        console.error(`  ${msg.message}`);
-      }
-      console.error('');
-      this.shouldReconnect = false;
-      process.exit(1);
-    } else if (msg.status === 'update_available') {
-      console.warn(`\n⚠ Update available: v${msg.latest_version} (you have v${msg.your_version})`);
-      console.warn(`  Run: cmdctrl-claude-code update`);
-      if (msg.changelog_url) {
-        console.warn(`  Changelog: ${msg.changelog_url}`);
-      }
-      console.warn('');
+      if (msg.changelog_url) console.error(`  Changelog: ${msg.changelog_url}`);
+      if (msg.message) console.error(`  ${msg.message}`);
+      this.runAutoUpdate(msg).catch((e) => {
+        console.error('[auto-update] failed:', e);
+        this.autoUpdateInProgress = false;
+        process.exit(1);
+      });
+      return;
     }
+
+    // update_available
+    if (process.platform === 'win32') {
+      console.warn(`\n⚠ Update available: v${msg.latest_version} (you have v${msg.your_version})`);
+      console.warn(`  Auto-update is unsupported on Windows. Run: ${BIN_NAME} update\n`);
+      return;
+    }
+
+    if (this.adapter.getRunningTasks().length === 0) {
+      this.runAutoUpdate(msg).catch((e) => {
+        console.error('[auto-update] failed:', e);
+        this.autoUpdateInProgress = false;
+      });
+    } else {
+      this.pendingAutoUpdate = msg;
+      console.log(`\n[auto-update] update available (v${msg.latest_version}). Deferring until ${this.adapter.getRunningTasks().length} active task(s) complete.`);
+      this.startIdleCheck();
+    }
+  }
+
+  private startIdleCheck(): void {
+    if (this.idleCheckTimer) return;
+    this.idleCheckTimer = setInterval(() => {
+      if (!this.pendingAutoUpdate || this.autoUpdateInProgress) {
+        this.stopIdleCheck();
+        return;
+      }
+      if (this.adapter.getRunningTasks().length === 0) {
+        const msg = this.pendingAutoUpdate;
+        this.pendingAutoUpdate = null;
+        this.stopIdleCheck();
+        this.runAutoUpdate(msg).catch((e) => {
+          console.error('[auto-update] failed:', e);
+          this.autoUpdateInProgress = false;
+        });
+      }
+    }, 5000);
+  }
+
+  private stopIdleCheck(): void {
+    if (this.idleCheckTimer) {
+      clearInterval(this.idleCheckTimer);
+      this.idleCheckTimer = null;
+    }
+  }
+
+  private async runAutoUpdate(msg: VersionStatusMessage): Promise<void> {
+    if (this.autoUpdateInProgress) return;
+    this.autoUpdateInProgress = true;
+    this.shouldReconnect = false;
+
+    console.log(`\n[auto-update] installing ${PACKAGE_NAME}@${msg.latest_version} (current: ${msg.your_version})`);
+
+    // Tear down outgoing work BEFORE the install replaces our binary, so
+    // we don't leave dangling websockets, file watchers, or pid files.
+    try {
+      this.stopIdleCheck();
+      this.stopPingInterval();
+      this.stopSessionRefreshInterval();
+      this.sessionWatcher.unwatchAll();
+      if (this.ws) {
+        this.ws.close(1000, 'Auto-updating');
+        this.ws = null;
+      }
+      deletePidFile();
+    } catch (e) {
+      console.error('[auto-update] cleanup error (continuing):', e);
+    }
+
+    try {
+      execSync(`npm install -g ${PACKAGE_NAME}@latest`, { stdio: 'inherit' });
+    } catch {
+      console.error(`\n[auto-update] npm install failed. You may need: sudo npm install -g ${PACKAGE_NAME}@latest`);
+      this.autoUpdateInProgress = false;
+      // Server already disconnected us on update_required; no use staying.
+      if (msg.status === 'update_required') process.exit(1);
+      // For update_available, fall back to reconnect on old version.
+      this.shouldReconnect = true;
+      this.scheduleReconnect();
+      return;
+    }
+
+    // Read the actually-installed version. `npm install -g @pkg@latest` can
+    // pull a different version than the server's policy advertised (when
+    // the policy is ahead of npm). Reporting reality avoids misleading log
+    // lines and lets us detect the no-op case.
+    const installedVersion = readInstalledGlobalVersion(PACKAGE_NAME);
+    if (installedVersion && installedVersion === msg.your_version) {
+      console.warn(`[auto-update] no-op: npm latest is still v${installedVersion}; server's latest (v${msg.latest_version}) may not be published yet.`);
+      this.noopAutoUpdateTarget = msg.latest_version ?? null;
+      this.autoUpdateInProgress = false;
+      if (msg.status === 'update_required') {
+        // Server already rejected us; respawning would just hit immediate
+        // disconnect. Print a manual-install hint and exit.
+        console.error(`  Required version is not on npm yet. Once it's published, run: ${BIN_NAME} update`);
+        process.exit(1);
+      }
+      // For update_available, restore intervals and stay connected on the
+      // current version. Next version_status with the same latest is
+      // ignored by the noop check.
+      this.shouldReconnect = true;
+      this.startPingInterval();
+      this.startSessionRefreshInterval();
+      this.scheduleReconnect();
+      return;
+    }
+
+    // Spawn fresh daemon and exit. The new process will write its own pid file.
+    const child = spawn(BIN_NAME, ['start'], { detached: true, stdio: 'ignore' });
+    child.unref();
+    console.log(`[auto-update] installed v${installedVersion ?? msg.latest_version}; daemon restarting under new version.`);
+    process.exit(0);
   }
 
   /**
@@ -607,5 +754,16 @@ export class DaemonClient {
     // Update credentials file
     console.log('Token refresh not yet implemented');
     return false;
+  }
+}
+
+/** Read the installed version of a globally-installed npm package, or null. */
+function readInstalledGlobalVersion(packageName: string): string | null {
+  try {
+    const npmRoot = execSync('npm root -g', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    const pkg = JSON.parse(readFileSync(join(npmRoot, packageName, 'package.json'), 'utf8'));
+    return typeof pkg.version === 'string' ? pkg.version : null;
+  } catch {
+    return null;
   }
 }

@@ -73,18 +73,28 @@ export async function start(options: StartOptions): Promise<void> {
   const managedSessionIds = new Set<string>();
   const watchedSessions = new Set<string>();
 
+  // Session watcher – chokidar-based file watching of VS Code chat JSON files
+  const sessionWatcher = getSessionWatcher();
+
   const client = new DaemonClient({
     serverUrl: config.serverUrl,
     deviceId: config.deviceId,
     agentType: 'vscode_copilot',
     token: credentials.refreshToken,
     version: daemonVersion,
+    autoUpdate: true,
+    autoUpdateConfig: {
+      packageName: '@cmdctrl/vscode-copilot',
+      binName: 'cmdctrl-vscode-copilot',
+      onBeforeUpdate: async () => {
+        await sessionWatcher.stop();
+        getCDPClient().disconnect();
+        deletePidFile();
+      },
+    },
   });
 
   client.setSessionsProvider(() => discoverSessions(managedSessionIds));
-
-  // Session watcher – chokidar-based file watching of VS Code chat JSON files
-  const sessionWatcher = getSessionWatcher();
 
   sessionWatcher.on('session:updated', (session: CopilotSession, newMessages: ChatMessage[]) => {
     if (!watchedSessions.has(session.sessionId)) return;
@@ -275,16 +285,7 @@ export async function start(options: StartOptions): Promise<void> {
     console.log(`Task cancel requested for ${taskId} (not implemented for VS Code)`);
   });
 
-  client.onVersionStatus((msg) => {
-    if (msg.status === 'update_required') {
-      console.error(`\n✖ Daemon version ${msg.your_version} is no longer supported (minimum: ${msg.min_version})`);
-      console.error('  Run: cmdctrl-vscode-copilot update');
-      process.exit(1);
-    } else if (msg.status === 'update_available') {
-      console.warn(`\n⚠ Update available: v${msg.latest_version} (you have v${msg.your_version})`);
-      console.warn('  Run: cmdctrl-vscode-copilot update');
-    }
-  });
+  // Auto-update is handled by the SDK via autoUpdateConfig above.
 
   const shutdown = async () => {
     console.log('\nShutting down...');

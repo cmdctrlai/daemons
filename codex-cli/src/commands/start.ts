@@ -81,6 +81,15 @@ export async function start(): Promise<void> {
     agentType: 'codex_cli',
     token: credentials.refreshToken,
     version: daemonVersion,
+    autoUpdate: true,
+    autoUpdateConfig: {
+      packageName: '@cmdctrl/codex-cli',
+      binName: 'cmdctrl-codex-cli',
+      onBeforeUpdate: () => {
+        sessionWatcher.unwatchAll();
+        configManager.deletePidFile();
+      },
+    },
   });
 
   client.setSessionsProvider(() => discoverSessions(managedSessionIds));
@@ -121,16 +130,7 @@ export async function start(): Promise<void> {
     return readSessionMessages(req.sessionId, req.limit, req.beforeUuid, req.afterUuid);
   });
 
-  client.onVersionStatus((msg) => {
-    if (msg.status === 'update_required') {
-      console.error(`\n✖ Daemon version ${msg.your_version} is no longer supported (minimum: ${msg.min_version})`);
-      console.error('  Run: cmdctrl-codex-cli update');
-      process.exit(1);
-    } else if (msg.status === 'update_available') {
-      console.warn(`\n⚠ Update available: v${msg.latest_version} (you have v${msg.your_version})`);
-      console.warn('  Run: cmdctrl-codex-cli update');
-    }
-  });
+  // Auto-update is handled by the SDK via autoUpdateConfig above.
 
   const shutdown = async () => {
     console.log('\nShutting down...');
