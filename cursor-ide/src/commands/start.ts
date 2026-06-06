@@ -82,18 +82,28 @@ export async function start(options: StartOptions): Promise<void> {
 
   const managedSessionIds = new Set<string>();
 
+  // Session watcher – polls SQLite for changes and forwards to server
+  const watcher = getSessionWatcher();
+
   const client = new DaemonClient({
     serverUrl: config.serverUrl,
     deviceId: config.deviceId,
     agentType: 'cursor_ide',
     token: credentials.refreshToken,
     version: daemonVersion,
+    autoUpdate: true,
+    autoUpdateConfig: {
+      packageName: '@cmdctrl/cursor-ide',
+      binName: 'cmdctrl-cursor-ide',
+      onBeforeUpdate: () => {
+        watcher.stop();
+        deletePidFile();
+      },
+    },
   });
 
   client.setSessionsProvider(() => discoverSessions(managedSessionIds));
 
-  // Session watcher – polls SQLite for changes and forwards to server
-  const watcher = getSessionWatcher();
   watcher.start((event) => {
     client.sendSessionActivity(
       event.session_id,
@@ -196,16 +206,7 @@ export async function start(options: StartOptions): Promise<void> {
     console.log(`Task cancel requested for ${taskId} (not implemented for Cursor)`);
   });
 
-  client.onVersionStatus((msg) => {
-    if (msg.status === 'update_required') {
-      console.error(`\n✖ Daemon version ${msg.your_version} is no longer supported (minimum: ${msg.min_version})`);
-      console.error('  Run: cmdctrl-cursor-ide update');
-      process.exit(1);
-    } else if (msg.status === 'update_available') {
-      console.warn(`\n⚠ Update available: v${msg.latest_version} (you have v${msg.your_version})`);
-      console.warn('  Run: cmdctrl-cursor-ide update');
-    }
-  });
+  // Auto-update is handled by the SDK via autoUpdateConfig above.
 
   const shutdown = async () => {
     console.log('\nShutting down...');

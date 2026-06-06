@@ -7,6 +7,7 @@ import {
   isRegistered,
   writePidFile,
   isDaemonRunning,
+  deletePidFile,
 } from '../config/config';
 import { AiderAdapter } from '../adapter/agentapi';
 import { discoverSessions, readSessionMessages, stableUuid } from '../session-discovery';
@@ -142,6 +143,16 @@ export async function start(_options: StartOptions): Promise<void> {
     agentType: 'aider',
     token: credentials.refreshToken,
     version: daemonVersion,
+    autoUpdate: true,
+    autoUpdateConfig: {
+      packageName: '@cmdctrl/aider',
+      binName: 'cmdctrl-aider',
+      onBeforeUpdate: async () => {
+        sessionWatcher.unwatchAll();
+        await adapter.stopAll();
+        deletePidFile();
+      },
+    },
   });
 
   client.setSessionsProvider(() => discoverSessions(managedSessionIds));
@@ -215,16 +226,7 @@ export async function start(_options: StartOptions): Promise<void> {
     await adapter.cancelTask(taskId);
   });
 
-  client.onVersionStatus((msg) => {
-    if (msg.status === 'update_required') {
-      console.error(`\n✖ Daemon version ${msg.your_version} is no longer supported (minimum: ${msg.min_version})`);
-      console.error('  Run: cmdctrl-aider update');
-      process.exit(1);
-    } else if (msg.status === 'update_available') {
-      console.warn(`\n⚠ Update available: v${msg.latest_version} (you have v${msg.your_version})`);
-      console.warn('  Run: cmdctrl-aider update');
-    }
-  });
+  // Auto-update is handled by the SDK via autoUpdateConfig above.
 
   const shutdown = async () => {
     console.log('\nShutting down...');

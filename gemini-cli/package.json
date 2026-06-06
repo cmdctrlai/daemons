@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/gemini-cli",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "CmdCtrl daemon for Google Gemini CLI agent",
   "main": "./dist/index.js",
   "bin": {

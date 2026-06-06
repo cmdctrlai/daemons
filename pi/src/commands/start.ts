@@ -50,6 +50,14 @@ export async function start(): Promise<void> {
     agentType: AGENT_TYPE,
     token: creds.refreshToken,
     version: DAEMON_VERSION,
+    autoUpdate: true,
+    autoUpdateConfig: {
+      packageName: '@cmdctrl/pi',
+      binName: 'cmdctrl-pi',
+      onBeforeUpdate: () => {
+        config.deletePidFile();
+      },
+    },
   });
 
   // --- Session watcher. Emits events for active observers of a session. ---

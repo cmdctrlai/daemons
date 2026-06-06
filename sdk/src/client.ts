@@ -54,6 +54,7 @@ import {
   SessionInfo,
   SessionStatus,
 } from './messages';
+import { selfUpdate, isAutoUpdateSupported } from './update';
 
 // ============================================================
 // Configuration
@@ -74,6 +75,28 @@ export interface DaemonClientOptions {
   maxReconnectDelay?: number;
   /** Ping interval in ms (default: 30000) */
   pingInterval?: number;
+  /**
+   * If true, the client will install new daemon versions automatically when
+   * the server sends `version_status` with `update_available` (deferred until
+   * idle) or `update_required` (immediate). Requires `autoUpdate` config.
+   * Default: false – callers must opt in explicitly.
+   */
+  autoUpdate?: boolean;
+  /** Required if `autoUpdate` is true. */
+  autoUpdateConfig?: AutoUpdateConfig;
+}
+
+export interface AutoUpdateConfig {
+  /** npm package name to install, e.g. '@cmdctrl/aider' */
+  packageName: string;
+  /** Binary to spawn after update, e.g. 'cmdctrl-aider' */
+  binName: string;
+  /**
+   * Called before the daemon installs and exits. Use this to release
+   * resources held by the running process (pid file, file watchers,
+   * spawned child processes). Optional.
+   */
+  onBeforeUpdate?: () => Promise<void> | void;
 }
 
 // ============================================================
@@ -190,9 +213,13 @@ type SessionsProvider = () => SessionInfo[] | Promise<SessionInfo[]>;
 // Client
 // ============================================================
 
+type ResolvedOptions = Omit<Required<DaemonClientOptions>, 'autoUpdateConfig'> & {
+  autoUpdateConfig?: AutoUpdateConfig;
+};
+
 export class DaemonClient {
   private ws: WebSocket | null = null;
-  private options: Required<DaemonClientOptions>;
+  private options: ResolvedOptions;
   private reconnectDelay: number;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
@@ -201,6 +228,16 @@ export class DaemonClient {
   private consecutiveAuthFailures = 0;
   private readonly maxAuthFailures = 5; // give up after this many consecutive 401s
   private runningTasks: Set<string> = new Set();
+  private pendingAutoUpdate: VersionStatusMessage | null = null;
+  private autoUpdateInProgress = false;
+  /**
+   * Remembers the `latest_version` the server told us about most recently
+   * that we already tried to install and found to be a no-op (i.e. npm's
+   * registry latest matches what we already have). Stops us from
+   * reattempting the same install on every reconnect. Cleared when the
+   * server advertises a different latest.
+   */
+  private noopAutoUpdateTarget: string | null = null;
 
   // User-provided handlers
   private taskStartHandler?: TaskStartHandler;
@@ -218,9 +255,13 @@ export class DaemonClient {
     this.options = {
       maxReconnectDelay: 30000,
       pingInterval: 30000,
+      autoUpdate: false,
       ...options,
     };
     this.reconnectDelay = 1000;
+    if (this.options.autoUpdate && !this.options.autoUpdateConfig) {
+      throw new Error('autoUpdate=true requires autoUpdateConfig');
+    }
   }
 
   // ------------------------------------------------------------------
@@ -308,12 +349,18 @@ export class DaemonClient {
         console.warn('  Use an https:// server URL in production.');
       }
 
+      // FEAT-068: declare auto-update capability so the server can render
+      // honest banner copy ("will update when idle" vs. "needs an update").
+      const capabilities: string[] = [];
+      if (this.options.autoUpdate) capabilities.push('auto-update');
+
       this.ws = new WebSocket(wsUrl, {
         headers: {
           Authorization: `Bearer ${this.options.token}`,
           'X-Device-ID': this.options.deviceId,
           'X-Agent-Type': this.options.agentType,
           'X-Daemon-Version': this.options.version,
+          ...(capabilities.length > 0 && { 'X-Daemon-Capabilities': capabilities.join(',') }),
         }
       });
 
@@ -427,6 +474,143 @@ export class DaemonClient {
 
   private sendStatus(): void {
     this.send({ type: 'status', running_tasks: Array.from(this.runningTasks) });
+    if (this.runningTasks.size === 0) {
+      this.maybeRunPendingAutoUpdate();
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Internal: auto-update
+  // ------------------------------------------------------------------
+
+  private maybeRunPendingAutoUpdate(): void {
+    if (!this.pendingAutoUpdate || this.autoUpdateInProgress) return;
+    if (this.runningTasks.size > 0) return;
+    const msg = this.pendingAutoUpdate;
+    this.pendingAutoUpdate = null;
+    this.runAutoUpdate(msg).catch((e) => {
+      console.error('[auto-update] failed:', e);
+      this.autoUpdateInProgress = false;
+    });
+  }
+
+  private handleVersionStatus(m: VersionStatusMessage): void {
+    const cfg = this.options.autoUpdateConfig;
+    const auto = this.options.autoUpdate && cfg !== undefined;
+
+    if (m.status === 'current') return;
+
+    // Don't retry an auto-update attempt that already proved no-op for the
+    // same target (e.g. the server advertised a version that isn't actually
+    // published yet). Clearing happens once the server advertises a
+    // different latest_version.
+    if (auto && m.latest_version && this.noopAutoUpdateTarget === m.latest_version) {
+      return;
+    }
+    if (m.latest_version && this.noopAutoUpdateTarget && this.noopAutoUpdateTarget !== m.latest_version) {
+      this.noopAutoUpdateTarget = null;
+    }
+
+    if (m.status === 'update_required') {
+      console.error(`\n✖ Daemon v${m.your_version} is no longer supported (minimum: v${m.min_version}).`);
+      if (m.changelog_url) console.error(`  Changelog: ${m.changelog_url}`);
+      if (m.message) console.error(`  ${m.message}`);
+      if (auto) {
+        // Server has logically disconnected us – install immediately, don't wait for idle.
+        this.runAutoUpdate(m).catch((e) => {
+          console.error('[auto-update] failed:', e);
+          this.autoUpdateInProgress = false;
+        });
+      } else {
+        console.error(`  Run: ${cfg ? cfg.binName : 'cmdctrl-<daemon>'} update\n`);
+        this.shouldReconnect = false;
+        this.disconnect();
+      }
+      return;
+    }
+
+    // update_available
+    if (!auto) {
+      console.warn(`\n⚠ Update available: v${m.latest_version} (you have v${m.your_version})`);
+      if (m.changelog_url) console.warn(`  Changelog: ${m.changelog_url}`);
+      console.warn(`  Run: ${cfg ? cfg.binName : 'cmdctrl-<daemon>'} update\n`);
+      return;
+    }
+
+    if (this.runningTasks.size === 0) {
+      this.runAutoUpdate(m).catch((e) => {
+        console.error('[auto-update] failed:', e);
+        this.autoUpdateInProgress = false;
+      });
+    } else {
+      this.pendingAutoUpdate = m;
+      console.log(`\n[auto-update] update available (v${m.latest_version}). Deferring until ${this.runningTasks.size} active task(s) complete.`);
+    }
+  }
+
+  private async runAutoUpdate(msg: VersionStatusMessage): Promise<void> {
+    const cfg = this.options.autoUpdateConfig;
+    if (!cfg) return;
+    this.autoUpdateInProgress = true;
+
+    if (!isAutoUpdateSupported()) {
+      console.warn(`\n⚠ Update available (v${msg.latest_version}) but auto-update is not supported on this platform.`);
+      console.warn(`  Run manually: npm install -g ${cfg.packageName}@latest`);
+      this.autoUpdateInProgress = false;
+      return;
+    }
+
+    console.log(`\n[auto-update] installing ${cfg.packageName}@${msg.latest_version} (current: ${this.options.version})`);
+
+    if (cfg.onBeforeUpdate) {
+      try {
+        await cfg.onBeforeUpdate();
+      } catch (e) {
+        console.error('[auto-update] onBeforeUpdate failed:', e);
+      }
+    }
+
+    this.shouldReconnect = false;
+    await this.disconnect();
+
+    const result = await selfUpdate({
+      packageName: cfg.packageName,
+      binName: cfg.binName,
+      currentVersion: this.options.version,
+      latestVersion: msg.latest_version,
+      restartAfter: true,
+    });
+
+    if (result.status === 'updated') {
+      console.log(`[auto-update] installed v${result.toVersion}; daemon restarting under new version.`);
+      process.exit(0);
+    } else if (result.status === 'up-to-date') {
+      // Server's policy said a newer version exists, but npm install pulled
+      // the same version we're already on – likely because the policy's
+      // latest_version isn't actually published yet. Don't loop: remember
+      // this target so the next version_status with the same latest_version
+      // is ignored until the server advertises a different version.
+      console.warn(`[auto-update] no-op: npm latest is still v${result.toVersion}; server's latest (v${msg.latest_version}) may not be published yet.`);
+      this.noopAutoUpdateTarget = msg.latest_version ?? null;
+      this.autoUpdateInProgress = false;
+      if (msg.status === 'update_required') {
+        // Server has already rejected us; reconnecting would just get another
+        // immediate disconnect. Print a manual-install hint and stay down.
+        console.error(`  Required version is not on npm yet. Once it's published, run: ${cfg.binName} update`);
+        this.shouldReconnect = false;
+      } else {
+        this.shouldReconnect = true;
+        this.connect().catch(() => {});
+      }
+    } else {
+      console.error(`[auto-update] ${result.status}: ${result.error ?? 'unknown error'}`);
+      this.autoUpdateInProgress = false;
+      // For update_required the server has rejected us; staying connected is futile.
+      if (msg.status !== 'update_required') {
+        this.shouldReconnect = true;
+        this.connect().catch(() => {});
+      }
+    }
   }
 
   // ------------------------------------------------------------------
@@ -631,10 +815,7 @@ export class DaemonClient {
         if (this.versionStatusHandler) {
           this.versionStatusHandler(m);
         }
-        if (m.status === 'update_required') {
-          this.shouldReconnect = false;
-          this.disconnect();
-        }
+        this.handleVersionStatus(m);
         break;
       }
     }

@@ -10,6 +10,8 @@ import {
   extractProgressFromToolUse
 } from './events';
 import { findSessionFile } from '../message-reader';
+import { rewriteSdkCliEntrypoint } from './entrypoint-rewrite';
+import { KeyedMutex } from './keyed-mutex';
 
 const DEFAULT_TIMEOUT = 10 * 60 * 1000; // 10 minutes
 const IMAGE_TMP_DIR = path.join(os.tmpdir(), 'cmdctrl-images');
@@ -206,6 +208,9 @@ type EventCallback = (
 export class ClaudeAdapter {
   private running: Map<string, RunningTask> = new Map();
   private onEvent: EventCallback;
+  // Serializes resumes per session: only one `claude --resume` runs at a time
+  // for a given session id. See resumeTask.
+  private resumeLock = new KeyedMutex();
 
   constructor(onEvent: EventCallback) {
     this.onEvent = onEvent;
@@ -311,6 +316,17 @@ export class ClaudeAdapter {
 
     this.running.set(taskId, rt);
 
+    // Serialize resumes of the same session. Hold this lock from here until the
+    // child process exits, so a second resume of this session can't spawn
+    // before the current turn is committed. Two `claude --resume` processes
+    // writing the same JSONL at once fork it and silently orphan a turn.
+    const releaseLock = await this.resumeLock.acquire(sessionId);
+    // task_id is per-session, so a later message for this session overwrites
+    // our entry in `running` while we wait here. That's fine – every queued
+    // message still runs, in arrival order; we never drop one. The close/error
+    // handlers below guard their map cleanup with an identity check so a prior
+    // task's exit can't delete a newer task's entry.
+
     // Validate cwd exists (same logic as startTask)
     let cwd: string | undefined = undefined;
     if (projectPath && fs.existsSync(projectPath)) {
@@ -320,29 +336,44 @@ export class ClaudeAdapter {
       cwd = os.homedir();
     }
 
-    // Save images locally and build the message with file path references
-    const messageWithImages = saveImagesAndBuildMessage(taskId, message, images);
+    let proc: ChildProcess;
+    try {
+      // Save images locally and build the message with file path references
+      const messageWithImages = saveImagesAndBuildMessage(taskId, message, images);
 
-    // Build command arguments with --resume
-    const args = [
-      '-p', messageWithImages,
-      '--resume', sessionId,
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--permission-mode', 'acceptEdits',
-      '--allowedTools', ALLOWED_TOOLS
-    ];
+      // Build command arguments with --resume
+      const args = [
+        '-p', messageWithImages,
+        '--resume', sessionId,
+        '--output-format', 'stream-json',
+        '--verbose',
+        '--permission-mode', 'acceptEdits',
+        '--allowedTools', ALLOWED_TOOLS
+      ];
 
-    console.log(`[${taskId}] Spawning resume: ${getClaudeCli()} --resume ${sessionId} with cwd: ${cwd || 'default'}`);
+      console.log(`[${taskId}] Spawning resume: ${getClaudeCli()} --resume ${sessionId} with cwd: ${cwd || 'default'}`);
 
-    // Spawn Claude CLI with same cwd as original task (no shell - direct execution)
-    const proc = spawn(getClaudeCli(), args, {
-      cwd,
-      env: cleanEnv(),
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
+      // Spawn Claude CLI with same cwd as original task (no shell - direct execution)
+      proc = spawn(getClaudeCli(), args, {
+        cwd,
+        env: cleanEnv(),
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+    } catch (err) {
+      // Setup/spawn failed before a process exists – don't leak the lock.
+      this.running.delete(taskId);
+      releaseLock();
+      throw err;
+    }
 
     rt.process = proc;
+
+    // Hold the per-session lock until this resume is fully done. The close
+    // handler below releases it *after* the post-exit entrypoint rewrite, so the
+    // next resume can't append while that rewrite's atomic replace is in flight
+    // (which would clobber the appended lines). The error path has no rewrite
+    // and releases directly. Release is idempotent.
+    proc.once('error', releaseLock);
 
     // Track if we've seen the "no conversation found" error
     let sessionNotFound = false;
@@ -366,7 +397,14 @@ export class ClaudeAdapter {
         if (rt.timeoutHandle) {
           clearTimeout(rt.timeoutHandle);
         }
-        this.running.delete(taskId);
+        // Only clear the map entry if it's still ours – a newer message for
+        // this session may have replaced it (task_id is per-session).
+        if (this.running.get(taskId) === rt) {
+          this.running.delete(taskId);
+        }
+        // The resumed session didn't exist, so there's nothing to fork – free
+        // the lock before falling back to a fresh (new-session) start.
+        releaseLock();
         // Start fresh instead
         this.startTask(taskId, message, projectPath);
         return;
@@ -376,7 +414,17 @@ export class ClaudeAdapter {
       if (rt.timeoutHandle) {
         clearTimeout(rt.timeoutHandle);
       }
-      this.running.delete(taskId);
+      // Only clear the map entry if it's still ours – a newer message for this
+      // session may have replaced it while we ran (task_id is per-session).
+      if (this.running.get(taskId) === rt) {
+        this.running.delete(taskId);
+      }
+      // BUG-074: rewrite entrypoint:"sdk-cli" → "cli" so the session
+      // shows up correctly when resumed from `claude --resume` later.
+      rewriteSdkCliEntrypoint(rt.sessionId);
+      // Release only after the rewrite, so the next queued resume of this
+      // session starts from a fully-settled file.
+      releaseLock();
     });
 
     // Set timeout
@@ -473,6 +521,9 @@ export class ClaudeAdapter {
         clearTimeout(rt.timeoutHandle);
       }
       this.running.delete(taskId);
+      // BUG-074: rewrite entrypoint:"sdk-cli" → "cli" so the session
+      // shows up correctly when resumed from `claude --resume` later.
+      rewriteSdkCliEntrypoint(rt.sessionId);
     });
 
     proc.on('error', (err) => {
@@ -522,7 +573,11 @@ export class ClaudeAdapter {
       if (rt.timeoutHandle) {
         clearTimeout(rt.timeoutHandle);
       }
-      this.running.delete(taskId);
+      // Only clear if still ours (task_id is per-session; a newer message may
+      // have replaced this entry).
+      if (this.running.get(taskId) === rt) {
+        this.running.delete(taskId);
+      }
     });
   }
 

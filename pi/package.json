@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/pi",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CmdCtrl daemon for the pi coding agent (@mariozechner/pi-coding-agent)",
   "main": "./dist/index.js",
   "bin": {
