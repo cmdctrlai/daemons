@@ -12,6 +12,7 @@ import {
 import { findSessionFile } from '../message-reader';
 import { rewriteSdkCliEntrypoint } from './entrypoint-rewrite';
 import { KeyedMutex } from './keyed-mutex';
+import { deliverToBgSession } from './claude-daemon';
 
 const DEFAULT_TIMEOUT = 10 * 60 * 1000; // 10 minutes
 const IMAGE_TMP_DIR = path.join(os.tmpdir(), 'cmdctrl-images');
@@ -327,6 +328,39 @@ export class ClaudeAdapter {
     // handlers below guard their map cleanup with an identity check so a prior
     // task's exit can't delete a newer task's entry.
 
+    let messageWithImages: string;
+    try {
+      // Save images locally and build the message with file path references.
+      messageWithImages = saveImagesAndBuildMessage(taskId, message, images);
+
+      // If the target session is running as a live background agent, `claude
+      // --resume` refuses it ("is currently running as a background agent").
+      // Deliver through the supervisor control socket instead – the same transport
+      // agent view uses to reply to a running session. On success the bg agent
+      // writes the user turn and its response to the session JSONL, which
+      // SessionWatcher streams to the app; we just need to make sure it's watched.
+      const outcome = await deliverToBgSession(sessionId, messageWithImages);
+      if (outcome.delivered) {
+        console.log(`[${taskId}] Delivered to live background agent via control socket`);
+        if (this.running.get(taskId) === rt) {
+          this.running.delete(taskId);
+        }
+        this.onEvent(taskId, 'SESSION_STARTED', { session_id: sessionId });
+        releaseLock();
+        return;
+      }
+      if (outcome.reason !== 'not-bg') {
+        console.log(`[${taskId}] Background delivery unavailable (${outcome.reason}${outcome.code ? `: ${outcome.code}` : ''}), falling back to --resume`);
+      }
+    } catch (err) {
+      // Setup failed before a process exists – don't leak the lock.
+      if (this.running.get(taskId) === rt) {
+        this.running.delete(taskId);
+      }
+      releaseLock();
+      throw err;
+    }
+
     // Validate cwd exists (same logic as startTask)
     let cwd: string | undefined = undefined;
     if (projectPath && fs.existsSync(projectPath)) {
@@ -338,9 +372,6 @@ export class ClaudeAdapter {
 
     let proc: ChildProcess;
     try {
-      // Save images locally and build the message with file path references
-      const messageWithImages = saveImagesAndBuildMessage(taskId, message, images);
-
       // Build command arguments with --resume
       const args = [
         '-p', messageWithImages,

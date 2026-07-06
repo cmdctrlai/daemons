@@ -624,6 +624,21 @@ export function readMessages(
     return { messages: [], hasMore: false };
   }
 
+  return readMessagesFromFile(filePath, limit, beforeUuid, afterUuid);
+}
+
+/**
+ * Read and paginate messages from a JSONL file path.
+ *
+ * Split out from readMessages (which resolves the session ID to a path) so the
+ * cursor/pagination logic can be unit-tested against fixture files.
+ */
+export function readMessagesFromFile(
+  filePath: string,
+  limit: number,
+  beforeUuid?: string,
+  afterUuid?: string
+): { messages: MessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
   // Fast path: no cursor – use backward reader for efficiency on large files
   if (!beforeUuid && !afterUuid) {
     const lines = readLastLines(filePath, limit);
@@ -677,19 +692,13 @@ export function readMessages(
         newestUuid: resultMessages.length > 0 ? resultMessages[resultMessages.length - 1].uuid : undefined,
       };
     }
-    // Stale cursor (likely compacted away) - fall back to returning latest messages
-    // This ensures clients get current data even after session compaction
-    const endIndex = allMessages.length;
-    const beginIndex = Math.max(0, endIndex - limit);
-    const resultMessages = allMessages.slice(beginIndex, endIndex);
-    const hasMore = beginIndex > 0;
-
-    return {
-      messages: resultMessages,
-      hasMore,
-      oldestUuid: resultMessages.length > 0 ? resultMessages[0].uuid : undefined,
-      newestUuid: resultMessages.length > 0 ? resultMessages[resultMessages.length - 1].uuid : undefined,
-    };
+    // Stale cursor (likely compacted away) - return empty, mirroring the
+    // beforeUuid path below. "After this cursor" is unanswerable once the cursor
+    // no longer exists in the file, so returning the file tail here made clients
+    // append already-seen messages to the bottom of the live view – old messages
+    // resurfacing under their original timestamps after an overnight compaction.
+    // The client reconciles via its periodic full reload (no cursor) instead.
+    return { messages: [], hasMore: false };
   }
 
   // Handle beforeUuid - return messages BEFORE the given UUID (for loading older)
