@@ -24,6 +24,12 @@ jest.mock('child_process', () => ({
 jest.mock('./entrypoint-rewrite', () => ({
   rewriteSdkCliEntrypoint: jest.fn(),
 }));
+// These tests assert on the `--resume` spawn path. Force the background-agent
+// delivery check to report "not a bg session" so it stays hermetic (no reliance
+// on a live Claude Code supervisor) and falls straight through to spawn.
+jest.mock('./claude-daemon', () => ({
+  deliverToBgSession: jest.fn().mockResolvedValue({ delivered: false, reason: 'not-bg' }),
+}));
 
 import { spawn } from 'child_process';
 import { ClaudeAdapter } from './claude-cli';
