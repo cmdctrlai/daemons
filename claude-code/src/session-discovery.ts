@@ -22,6 +22,56 @@ export interface ExternalSession {
   last_activity: string; // ISO timestamp
   is_active: boolean;
   message_count: number;
+  cli_user_title?: string; // Set by Claude Code's /rename, scanned from ~/.claude/sessions/<pid>.json
+}
+
+/**
+ * Per-PID JSON written by Claude Code processes at ~/.claude/sessions/<pid>.json.
+ * Updated live when the user runs /rename inside a session.
+ */
+interface ClaudeProcessFile {
+  pid?: number;
+  sessionId?: string;
+  name?: string;
+  updatedAt?: number;
+}
+
+/**
+ * Scan ~/.claude/sessions/*.json for live /rename values.
+ * Returns a map of sessionId -> name. Empty names and missing files are skipped.
+ *
+ * The name field is the only live source of /rename – the per-project sessions-index.json
+ * customTitle is only written on session close.
+ */
+export function discoverCliUserTitles(sessionsDir?: string): Map<string, string> {
+  const result = new Map<string, string>();
+  const dir = sessionsDir ?? path.join(os.homedir(), '.claude', 'sessions');
+  if (!fs.existsSync(dir)) {
+    return result;
+  }
+
+  let files: string[];
+  try {
+    files = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
+  } catch {
+    return result;
+  }
+
+  for (const f of files) {
+    try {
+      const content = fs.readFileSync(path.join(dir, f), 'utf-8');
+      const parsed: ClaudeProcessFile = JSON.parse(content);
+      if (!parsed.sessionId || !parsed.name) continue;
+      const name = parsed.name.trim();
+      if (!name) continue;
+      result.set(parsed.sessionId, name);
+    } catch {
+      // Stale or unreadable file – skip
+      continue;
+    }
+  }
+
+  return result;
 }
 
 export interface ExternalSessionsByProject {
@@ -372,6 +422,13 @@ export async function discoverSessions(excludeSessionIDs: Set<string> = new Set(
         continue;
       }
     }
+  }
+
+  // Overlay live CLI /rename values from ~/.claude/sessions/<pid>.json.
+  // Iterate the (small) rename map, not the (potentially large) session map.
+  for (const [sessionId, name] of discoverCliUserTitles()) {
+    const session = sessionMap.get(sessionId);
+    if (session) session.cli_user_title = name;
   }
 
   // Convert to array and sort by last activity (most recent first)

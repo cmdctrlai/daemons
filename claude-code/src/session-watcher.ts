@@ -60,6 +60,17 @@ type CompletionCallback = (event: CompletionEvent) => void;
 // Polling interval (500ms)
 const POLL_INTERVAL_MS = 500;
 
+// Agent no-op responses – boilerplate text Claude emits when it has nothing
+// meaningful to say. The CLI internally maintains a set of these (variable WB6
+// in the leaked source). We match all known variants.
+const NO_OP_RESPONSES = new Set([
+  'No response requested.',
+  'No response needed.',
+  'No response.',
+  'No response received',
+  'No response from model',
+]);
+
 export class SessionWatcher {
   private watchedSessions: Map<string, WatchedSession> = new Map();
   private onEvent: EventCallback;
@@ -246,6 +257,7 @@ export class SessionWatcher {
       let sawWaitingForInput = false;
       let sawUserMessage = false;
       let sawSystemEntry = false;
+      let sawEndTurn = false;
 
       for (const entry of newEntries) {
         const entryType = entry.type as string;
@@ -265,10 +277,17 @@ export class SessionWatcher {
           sawSystemEntry = true;
         }
 
-        // Track the latest assistant entry UUID so completion fires can dedup
-        // by turn boundary (see fireCompletion).
-        if (entryType === 'assistant' && entry.uuid) {
-          session.latestAssistantUuid = entry.uuid as string;
+        // Assistant entries carry both the dedup key (uuid → turn boundary)
+        // and the authoritative completion signal (message.stop_reason).
+        if (entryType === 'assistant') {
+          if (entry.uuid) {
+            session.latestAssistantUuid = entry.uuid as string;
+          }
+          const message = entry.message as Record<string, unknown> | undefined;
+          const stopReason = message?.stop_reason as string | undefined;
+          if (stopReason === 'end_turn' || stopReason === 'max_tokens') {
+            sawEndTurn = true;
+          }
         }
 
         const event = this.entryToEvent(session.sessionId, entry, session.toolResultUuids);
@@ -299,17 +318,22 @@ export class SessionWatcher {
         }
       }
 
-      // Completion detection based on entire batch
+      // Completion detection based on entire batch.
+      // Priority order: waiting-for-input > stop_reason > system entry (fallback)
       if (sawWaitingForInput) {
         // Agent is blocked on user input (plan approval, question) – fire completion immediately
         console.log(`[SessionWatcher] Session ${session.sessionId.slice(-8)} is waiting for user input, firing completion`);
         this.fireCompletion(session);
+      } else if (sawEndTurn) {
+        // stop_reason "end_turn" or "max_tokens" on an assistant entry – the
+        // authoritative API signal that the model's turn is complete.
+        console.log(`[SessionWatcher] Session ${session.sessionId.slice(-8)} turn complete (stop_reason), firing completion`);
+        this.fireCompletion(session);
       } else if (sawSystemEntry) {
-        // System entries mark end-of-turn in Claude Code's JSONL – they are never
-        // written mid-turn, making them a reliable completion signal.
-        // Always fire even if a user message is in the same batch – the user may
-        // have subscribed for push notifications from a different client.
-        console.log(`[SessionWatcher] Session ${session.sessionId.slice(-8)} turn complete (system entry), firing completion`);
+        // Fallback: system entries mark end-of-turn in Claude Code's JSONL.
+        // Kept as a safety net for older JSONL formats or edge cases where
+        // stop_reason is missing.
+        console.log(`[SessionWatcher] Session ${session.sessionId.slice(-8)} turn complete (system entry fallback), firing completion`);
         this.fireCompletion(session);
       }
 
@@ -383,7 +407,44 @@ export class SessionWatcher {
         return null;
       }
 
+      // Skip subagent internal messages – these are part of a sidechain
+      // conversation and should never be shown in the main UI.
+      if (entry.isSidechain) {
+        return null;
+      }
+
+      // Entries with sourceToolAssistantUUID or toolUseResult are tool-result
+      // wrappers, not real user messages. The JSONL stores tool results as
+      // type:"user" entries (required by the Claude API format), but they should
+      // be treated as internal machinery, not displayed as user chat bubbles.
+      if (entry.sourceToolAssistantUUID || entry.toolUseResult) {
+        // Still emit as VERBOSE if there's displayable content
+        if (Array.isArray(content)) {
+          const toolResultBlock = content.find(
+            (block: Record<string, unknown>) => block.type === 'tool_result'
+          ) as Record<string, unknown> | undefined;
+          if (toolResultBlock) {
+            const rawContent = toolResultBlock.content;
+            const resultContent = typeof rawContent === 'string'
+              ? rawContent
+              : (Array.isArray(rawContent) ? JSON.stringify(rawContent) : String(rawContent || ''));
+            if (resultContent.trim()) {
+              return {
+                type: 'VERBOSE',
+                sessionId,
+                uuid,
+                content: resultContent.length > 200 ? resultContent.slice(0, 200) + '...' : resultContent,
+                timestamp,
+                isToolResult: true,
+              };
+            }
+          }
+        }
+        return null;
+      }
+
       // Check if this is a tool_result (internal, but we emit as VERBOSE)
+      // Fallback for entries without sourceToolAssistantUUID marker
       if (Array.isArray(content)) {
         const hasToolResult = content.some(
           (block: Record<string, unknown>) => block.type === 'tool_result'
@@ -457,6 +518,11 @@ export class SessionWatcher {
     // Handle assistant entries
     if (entryType === 'assistant') {
 
+      // Skip subagent internal messages
+      if (entry.isSidechain) {
+        return null;
+      }
+
       if (!Array.isArray(content)) {
         console.log(`[SessionWatcher] Assistant entry ${uuid?.slice(-8)} has non-array content:`, typeof content);
         return null;
@@ -480,16 +546,15 @@ export class SessionWatcher {
         // Also skip if content is ONLY whitespace or special characters
         const isLikelyCursor = textContent.length <= 2 && /^[\s\\|/_-]*$/.test(textContent);
 
-        // Skip internal continuation noise – short auto-responses after tool results
-        // like "No response requested." that Claude emits between tool calls.
-        // Only filter these when the parent is a tool_result entry AND the text
-        // matches known noise patterns. Real agent responses that happen to follow
-        // tool results must NOT be filtered.
+        // Skip agent no-op responses – boilerplate text Claude emits when it has
+        // nothing meaningful to say, typically after tool results. The CLI
+        // internally maintains a set of these strings; we match all known variants.
+        // Filter these unconditionally (they are never meaningful user-facing content)
+        // AND also catch very short continuations after tool results as a fallback.
         const parentUuid = entry.parentUuid as string | undefined;
         const isToolResultContinuation = parentUuid && toolResultUuids?.has(parentUuid);
-        const isNoiseResponse = isToolResultContinuation && (
-          textContent === 'No response requested.' ||
-          textContent.length <= 5
+        const isNoiseResponse = NO_OP_RESPONSES.has(textContent) || (
+          isToolResultContinuation && textContent.length <= 5
         );
         if (isNoiseResponse) {
           console.log(`[SessionWatcher] Skipping noise continuation for ${uuid?.slice(-8)}: "${textContent}"`);
