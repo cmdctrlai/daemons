@@ -249,7 +249,7 @@ describe('SessionWatcher', () => {
     await sleep(100);
 
     // Agent response then system entry – fires once
-    fs.appendFileSync(tempFile, '{"uuid":"resp-dup","type":"assistant","message":{"content":[{"type":"text","text":"All done."}]}}\n');
+    fs.appendFileSync(tempFile, '{"uuid":"resp-dup","type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"All done."}]}}\n');
     await sleep(600);
     fs.appendFileSync(tempFile, '{"uuid":"sys-first","type":"system","message":{"content":""}}\n');
     await sleep(600);
@@ -274,7 +274,7 @@ describe('SessionWatcher', () => {
     await sleep(100);
 
     // Watcher fires for this turn first
-    fs.appendFileSync(tempFile, '{"uuid":"resp-bk","type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}\n');
+    fs.appendFileSync(tempFile, '{"uuid":"resp-bk","type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Done."}]}}\n');
     await sleep(600);
     fs.appendFileSync(tempFile, '{"uuid":"sys-bk","type":"system","message":{"content":""}}\n');
     await sleep(600);
@@ -285,6 +285,7 @@ describe('SessionWatcher', () => {
     // must be denied because the watcher has already fired.
     expect(watcher.reserveCompletionFire('test-session-backup')).toBe(false);
   });
+
 
   it('should NOT fire completion on intermediate agent responses mid-turn', async () => {
     const completions: CompletionEvent[] = [];

@@ -94,14 +94,21 @@ function isSystemMessage(content: string): boolean {
 /**
  * Detect agent no-op responses that Claude emits when it has nothing to say.
  * These are boilerplate completions, not meaningful content for the user.
+ *
+ * The Claude Code CLI internally maintains a set of these strings (leaked as
+ * variable WB6 in the source). We match all known variants here.
  */
+const NO_OP_RESPONSES = new Set([
+  'No response requested.',
+  'No response needed.',
+  'No response.',
+  'No response received',
+  'No response from model',
+]);
+
 function isNoOpAgentMessage(content: string): boolean {
-  const noOpPhrases = [
-    'No response requested.',
-    'No response needed.',
-  ];
   const trimmed = content.trim();
-  return noOpPhrases.some(phrase => trimmed === phrase);
+  return NO_OP_RESPONSES.has(trimmed);
 }
 
 /**

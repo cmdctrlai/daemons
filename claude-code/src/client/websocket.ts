@@ -283,7 +283,8 @@ export class DaemonClient {
     // Backup completion path: when the adapter reports TASK_COMPLETE,
     // fire session_activity if the SessionWatcher hasn't already fired for
     // this turn. The watcher's own fire path is the primary signal; this
-    // backup catches turns where the JSONL never produces a system entry.
+    // backup catches turns where the JSONL never produces a completion
+    // marker (e.g. system entry missing and stop_reason absent).
     if (eventType === 'TASK_COMPLETE' && sessionId) {
       const filePath = findSessionFile(sessionId);
       if (filePath && this.sessionWatcher.reserveCompletionFire(sessionId)) {
@@ -698,7 +699,8 @@ export class DaemonClient {
         last_message: s.last_message,
         last_activity: s.last_activity,
         is_active: s.is_active,
-        message_count: s.message_count
+        message_count: s.message_count,
+        cli_user_title: s.cli_user_title
       }));
 
       this.send({
