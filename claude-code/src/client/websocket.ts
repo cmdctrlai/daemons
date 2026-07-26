@@ -26,11 +26,16 @@ import { buildContextResponse } from '../handlers/context-handler';
 import { SessionActivityMessage } from './messages';
 import { deletePidFile } from '../config/config';
 
-const MAX_RECONNECT_DELAY = 30000; // 30 seconds
-const INITIAL_RECONNECT_DELAY = 1000; // 1 second
+const BASE_RECONNECT_DELAY = 1000; // 1 second, before jitter
+const MAX_RECONNECT_DELAY = 60000; // 60 seconds
 const PING_INTERVAL = 30000; // 30 seconds
 const SESSION_REFRESH_INTERVAL = 30000; // 30 seconds
-const MAX_AUTH_FAILURES = 5; // give up after this many consecutive 401s
+// Purely advisory: past this many consecutive 401s in a row, log a louder
+// hint in case the device was actually removed. We never stop reconnecting
+// on our own – the server returns 401 both for a genuinely invalid token
+// and for a transient DB error on the credential lookup, so the daemon
+// can't tell those apart and giving up would strand a recoverable connection.
+const AUTH_FAILURE_WARN_THRESHOLD = 5;
 
 const PACKAGE_NAME = '@cmdctrl/claude-code';
 const BIN_NAME = 'cmdctrl-claude-code';
@@ -39,7 +44,7 @@ export class DaemonClient {
   private ws: WebSocket | null = null;
   private config: CmdCtrlConfig;
   private credentials: Credentials;
-  private reconnectDelay = INITIAL_RECONNECT_DELAY;
+  private reconnectAttempt = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
   private sessionRefreshTimer: NodeJS.Timeout | null = null;
@@ -149,7 +154,7 @@ export class DaemonClient {
 
       this.ws.on('open', () => {
         console.log('WebSocket connected');
-        this.reconnectDelay = INITIAL_RECONNECT_DELAY;
+        this.reconnectAttempt = 0;
         this.consecutiveAuthFailures = 0;
         this.startPingInterval();
         this.startSessionRefreshInterval();
@@ -166,23 +171,29 @@ export class DaemonClient {
         console.log(`WebSocket closed: ${code} ${reason}`);
         this.stopPingInterval();
         this.stopSessionRefreshInterval();
+        reject(new Error('Connection closed'));
         this.scheduleReconnect();
       });
 
-      this.ws.on('unexpected-response', (_req, res) => {
+      // ws does not abort the handshake or emit 'close' on its own once a
+      // listener is registered here, so a failed upgrade (401, a cold-start
+      // 500, etc.) would otherwise leave a dangling request and never retry.
+      // Clean up the request and drive the retry ourselves.
+      this.ws.on('unexpected-response', (req, res) => {
+        req.destroy();
+        this.ws = null;
         if (res.statusCode === 401) {
           this.consecutiveAuthFailures++;
-          if (this.consecutiveAuthFailures >= MAX_AUTH_FAILURES) {
-            console.error('Authentication failed (401). Device may have been removed from the server.');
-            console.error('Run "cmdctrl-claude-code register" again to re-register this device.');
-            this.shouldReconnect = false;
-            process.exit(1);
+          if (this.consecutiveAuthFailures === AUTH_FAILURE_WARN_THRESHOLD) {
+            console.error(`Authentication has failed ${this.consecutiveAuthFailures} times in a row. If this device was removed from the server, run "cmdctrl-claude-code register" again. Retrying in the background in case this is transient.`);
+          } else {
+            console.warn(`Authentication failed (401), retrying with backoff... (attempt ${this.consecutiveAuthFailures})`);
           }
-          console.warn(`Authentication failed (401), retrying... (${this.consecutiveAuthFailures}/${MAX_AUTH_FAILURES})`);
           reject(new Error('Authentication failed (401)'));
-          return;
+        } else {
+          reject(new Error(`Unexpected server response: ${res.statusCode}`));
         }
-        reject(new Error(`Unexpected server response: ${res.statusCode}`));
+        this.scheduleReconnect();
       });
 
       this.ws.on('error', (err) => {
@@ -636,27 +647,28 @@ export class DaemonClient {
   }
 
   /**
-   * Schedule reconnection with exponential backoff
+   * Unbounded reconnect: capped exponential backoff with full jitter
+   * (uniform between 0 and min(cap, base * 2^attempt)). Never gives up –
+   * a transient outage must recover without the daemon exiting or a human
+   * re-registering it. connect()'s own failure handlers call this, so a
+   * connection attempt reschedules itself on failure.
    */
   private scheduleReconnect(): void {
-    if (!this.shouldReconnect) {
-      return;
-    }
+    if (!this.shouldReconnect || this.reconnectTimer) return;
 
-    console.log(`Reconnecting in ${this.reconnectDelay / 1000}s...`);
+    const delay = this.nextReconnectDelay(this.reconnectAttempt);
+    this.reconnectAttempt++;
+    console.log(`Reconnecting in ${Math.round(delay / 1000)}s...`);
 
-    this.reconnectTimer = setTimeout(async () => {
-      try {
-        await this.connect();
-      } catch {
-        // Increase delay with exponential backoff
-        this.reconnectDelay = Math.min(
-          this.reconnectDelay * 2,
-          MAX_RECONNECT_DELAY
-        );
-        this.scheduleReconnect();
-      }
-    }, this.reconnectDelay);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect().catch(() => {});
+    }, delay);
+  }
+
+  private nextReconnectDelay(attempt: number): number {
+    const exp = Math.min(MAX_RECONNECT_DELAY, BASE_RECONNECT_DELAY * 2 ** Math.min(attempt, 20));
+    return Math.random() * exp;
   }
 
   /**
@@ -745,17 +757,6 @@ export class DaemonClient {
    */
   removeManagedSession(sessionId: string): void {
     this.managedSessionIds.delete(sessionId);
-  }
-
-  /**
-   * Refresh access token using refresh token
-   */
-  async refreshToken(): Promise<boolean> {
-    // TODO: Implement token refresh
-    // POST to server with refresh token, get new access token
-    // Update credentials file
-    console.log('Token refresh not yet implemented');
-    return false;
   }
 }
 
