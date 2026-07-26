@@ -71,7 +71,9 @@ export interface DaemonClientOptions {
   token: string;
   /** Your daemon's semantic version (e.g., "1.0.0") */
   version: string;
-  /** Maximum reconnect delay in ms (default: 30000) */
+  /** Base reconnect delay in ms, before jitter (default: 1000) */
+  baseReconnectDelay?: number;
+  /** Maximum reconnect delay in ms (default: 60000) */
   maxReconnectDelay?: number;
   /** Ping interval in ms (default: 30000) */
   pingInterval?: number;
@@ -220,13 +222,19 @@ type ResolvedOptions = Omit<Required<DaemonClientOptions>, 'autoUpdateConfig'> &
 export class DaemonClient {
   private ws: WebSocket | null = null;
   private options: ResolvedOptions;
-  private reconnectDelay: number;
+  private reconnectAttempt = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
   private sessionRefreshTimer: NodeJS.Timeout | null = null;
   private shouldReconnect = true;
   private consecutiveAuthFailures = 0;
-  private readonly maxAuthFailures = 5; // give up after this many consecutive 401s
+  // Purely advisory: past this many consecutive 401s in a row, nudge the
+  // caller via onAuthFailure in case the device was actually removed. We
+  // never stop retrying on our own – a 401 here is indistinguishable from a
+  // transient server-side hiccup (e.g. the API returns 401 on a DB error,
+  // not just on a genuinely invalid token), so giving up would strand a
+  // daemon that would have recovered on its own.
+  private readonly authFailureWarnThreshold = 5;
   private runningTasks: Set<string> = new Set();
   private pendingAutoUpdate: VersionStatusMessage | null = null;
   private autoUpdateInProgress = false;
@@ -253,12 +261,12 @@ export class DaemonClient {
 
   constructor(options: DaemonClientOptions) {
     this.options = {
-      maxReconnectDelay: 30000,
+      baseReconnectDelay: 1000,
+      maxReconnectDelay: 60000,
       pingInterval: 30000,
       autoUpdate: false,
       ...options,
     };
-    this.reconnectDelay = 1000;
     if (this.options.autoUpdate && !this.options.autoUpdateConfig) {
       throw new Error('autoUpdate=true requires autoUpdateConfig');
     }
@@ -317,9 +325,11 @@ export class DaemonClient {
   }
 
   /**
-   * Register handler for authentication failures (HTTP 401 on connect).
-   * Called when the server rejects the device credentials, typically because
-   * the device was removed. If not set, defaults to process.exit(1).
+   * Register handler for repeated authentication failures (HTTP 401 on
+   * connect, several in a row). This is advisory only – the client keeps
+   * retrying with backoff regardless of auth failures, since a 401 can't be
+   * reliably distinguished from a transient server-side issue. Use this to
+   * surface a "you may need to re-register this device" hint to the user.
    */
   onAuthFailure(handler: AuthFailureHandler): this {
     this.authFailureHandler = handler;
@@ -365,7 +375,7 @@ export class DaemonClient {
       });
 
       this.ws.on('open', async () => {
-        this.reconnectDelay = 1000;
+        this.reconnectAttempt = 0;
         this.consecutiveAuthFailures = 0;
         this.startPingInterval();
         this.startSessionRefreshInterval();
@@ -379,27 +389,30 @@ export class DaemonClient {
       this.ws.on('close', () => {
         this.stopPingInterval();
         this.stopSessionRefreshInterval();
+        reject(new Error('Connection closed'));
         this.scheduleReconnect();
       });
 
-      this.ws.on('unexpected-response', (_req, res) => {
+      // ws does not abort the handshake or emit 'close' on its own once a
+      // listener is registered here, so a failed upgrade (401, a cold-start
+      // 500, etc.) would otherwise leave a dangling request and never retry.
+      // Clean up the request and drive the retry ourselves.
+      this.ws.on('unexpected-response', (req, res) => {
+        req.destroy();
+        this.ws = null;
         if (res.statusCode === 401) {
           this.consecutiveAuthFailures++;
-          if (this.consecutiveAuthFailures >= this.maxAuthFailures) {
-            console.error('Authentication failed (401). Device may have been removed from the server.');
-            console.error('Run the "register" command again to re-register this device.');
-            this.shouldReconnect = false;
-            if (this.authFailureHandler) {
-              this.authFailureHandler();
-            } else {
-              process.exit(1);
-            }
+          if (this.consecutiveAuthFailures === this.authFailureWarnThreshold) {
+            console.error(`Authentication has failed ${this.consecutiveAuthFailures} times in a row. If this device was removed from the server, re-register with the "register" command. Retrying in the background in case this is transient.`);
+            this.authFailureHandler?.();
+          } else {
+            console.warn(`Authentication failed (401), retrying with backoff... (attempt ${this.consecutiveAuthFailures})`);
           }
-          console.warn(`Authentication failed (401), retrying... (${this.consecutiveAuthFailures}/${this.maxAuthFailures})`);
           reject(new Error('Authentication failed (401)'));
-          return;
+        } else {
+          reject(new Error(`Unexpected server response: ${res.statusCode}`));
         }
-        reject(new Error(`Unexpected server response: ${res.statusCode}`));
+        this.scheduleReconnect();
       });
 
       this.ws.on('error', (err) => {
@@ -413,7 +426,10 @@ export class DaemonClient {
   /** Disconnect from the server. */
   async disconnect(): Promise<void> {
     this.shouldReconnect = false;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.stopPingInterval();
     this.stopSessionRefreshInterval();
     if (this.ws) {
@@ -825,16 +841,27 @@ export class DaemonClient {
   // Internal: reconnection and keepalive
   // ------------------------------------------------------------------
 
+  /**
+   * Unbounded reconnect: capped exponential backoff with full jitter
+   * (uniform between 0 and min(cap, base * 2^attempt)). Never gives up –
+   * a transient outage must recover without the daemon exiting or a human
+   * re-registering it. `connect()`'s own failure handlers call this, so a
+   * connection attempt reschedules itself on failure.
+   */
   private scheduleReconnect(): void {
-    if (!this.shouldReconnect) return;
-    this.reconnectTimer = setTimeout(async () => {
-      try {
-        await this.connect();
-      } catch {
-        this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.options.maxReconnectDelay);
-        this.scheduleReconnect();
-      }
-    }, this.reconnectDelay);
+    if (!this.shouldReconnect || this.reconnectTimer) return;
+    const delay = this.nextReconnectDelay(this.reconnectAttempt);
+    this.reconnectAttempt++;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect().catch(() => {});
+    }, delay);
+  }
+
+  private nextReconnectDelay(attempt: number): number {
+    const { baseReconnectDelay, maxReconnectDelay } = this.options;
+    const exp = Math.min(maxReconnectDelay, baseReconnectDelay * 2 ** Math.min(attempt, 20));
+    return Math.random() * exp;
   }
 
   private startPingInterval(): void {

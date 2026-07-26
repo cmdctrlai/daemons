@@ -121,6 +121,8 @@ export interface SessionInfo {
   last_activity: string;
   is_active: boolean;
   message_count: number;
+  /** Live value from Claude Code's /rename (scanned from ~/.claude/sessions/<pid>.json). Optional for backwards compatibility. */
+  cli_user_title?: string;
 }
 
 export interface ReportSessionsMessage {
