@@ -230,10 +230,9 @@ export class DaemonClient {
   private consecutiveAuthFailures = 0;
   // Purely advisory: past this many consecutive 401s in a row, nudge the
   // caller via onAuthFailure in case the device was actually removed. We
-  // never stop retrying on our own – a 401 here is indistinguishable from a
-  // transient server-side hiccup (e.g. the API returns 401 on a DB error,
-  // not just on a genuinely invalid token), so giving up would strand a
-  // daemon that would have recovered on its own.
+  // never stop retrying on our own – a 401 here can't be reliably told apart
+  // from a transient failure, so giving up would strand a daemon that would
+  // have recovered on its own.
   private readonly authFailureWarnThreshold = 5;
   private runningTasks: Set<string> = new Set();
   private pendingAutoUpdate: VersionStatusMessage | null = null;
@@ -359,7 +358,7 @@ export class DaemonClient {
         console.warn('  Use an https:// server URL in production.');
       }
 
-      // FEAT-068: declare auto-update capability so the server can render
+      // Declare auto-update capability so the server can render
       // honest banner copy ("will update when idle" vs. "needs an update").
       const capabilities: string[] = [];
       if (this.options.autoUpdate) capabilities.push('auto-update');
@@ -394,8 +393,8 @@ export class DaemonClient {
       });
 
       // ws does not abort the handshake or emit 'close' on its own once a
-      // listener is registered here, so a failed upgrade (401, a cold-start
-      // 500, etc.) would otherwise leave a dangling request and never retry.
+      // listener is registered here, so a failed upgrade (401, 5xx, etc.)
+      // would otherwise leave a dangling request and never retry.
       // Clean up the request and drive the retry ourselves.
       this.ws.on('unexpected-response', (req, res) => {
         req.destroy();

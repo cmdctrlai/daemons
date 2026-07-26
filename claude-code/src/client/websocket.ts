@@ -32,9 +32,9 @@ const PING_INTERVAL = 30000; // 30 seconds
 const SESSION_REFRESH_INTERVAL = 30000; // 30 seconds
 // Purely advisory: past this many consecutive 401s in a row, log a louder
 // hint in case the device was actually removed. We never stop reconnecting
-// on our own – the server returns 401 both for a genuinely invalid token
-// and for a transient DB error on the credential lookup, so the daemon
-// can't tell those apart and giving up would strand a recoverable connection.
+// on our own – an auth rejection can't be reliably told apart from a
+// transient failure, so giving up would strand a connection that would
+// otherwise have recovered.
 const AUTH_FAILURE_WARN_THRESHOLD = 5;
 
 const PACKAGE_NAME = '@cmdctrl/claude-code';
@@ -138,7 +138,7 @@ export class DaemonClient {
         }
       }
 
-      // FEAT-068: declare auto-update capability so the server can render
+      // Declare auto-update capability so the server can render
       // honest banner copy. Windows skips the actual install but the daemon
       // still has the code, so we only advertise capability where supported.
       const capabilities = process.platform === 'win32' ? '' : 'auto-update';
@@ -176,8 +176,8 @@ export class DaemonClient {
       });
 
       // ws does not abort the handshake or emit 'close' on its own once a
-      // listener is registered here, so a failed upgrade (401, a cold-start
-      // 500, etc.) would otherwise leave a dangling request and never retry.
+      // listener is registered here, so a failed upgrade (401, 5xx, etc.)
+      // would otherwise leave a dangling request and never retry.
       // Clean up the request and drive the retry ourselves.
       this.ws.on('unexpected-response', (req, res) => {
         req.destroy();

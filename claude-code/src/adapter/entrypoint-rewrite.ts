@@ -8,7 +8,7 @@
  * entrypoint:"sdk-cli". When the user later runs `claude --resume <id>`
  * from a real terminal, Claude Code's resume picker filters out
  * sdk-cli-tagged entries and sessions, so mobile-driven turns disappear
- * from the CLI view. BUG-074.
+ * from the CLI view.
  *
  * This rewriter runs after each daemon-spawned Claude process exits,
  * walks the affected session's JSONL, and rewrites the entrypoint marker
