@@ -450,7 +450,7 @@ export class ClaudeAdapter {
       if (this.running.get(taskId) === rt) {
         this.running.delete(taskId);
       }
-      // BUG-074: rewrite entrypoint:"sdk-cli" → "cli" so the session
+      // Rewrite entrypoint:"sdk-cli" → "cli" so the session
       // shows up correctly when resumed from `claude --resume` later.
       rewriteSdkCliEntrypoint(rt.sessionId);
       // Release only after the rewrite, so the next queued resume of this
@@ -552,7 +552,7 @@ export class ClaudeAdapter {
         clearTimeout(rt.timeoutHandle);
       }
       this.running.delete(taskId);
-      // BUG-074: rewrite entrypoint:"sdk-cli" → "cli" so the session
+      // Rewrite entrypoint:"sdk-cli" → "cli" so the session
       // shows up correctly when resumed from `claude --resume` later.
       rewriteSdkCliEntrypoint(rt.sessionId);
     });

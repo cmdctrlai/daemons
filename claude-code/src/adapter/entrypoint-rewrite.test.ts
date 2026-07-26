@@ -1,5 +1,5 @@
 /**
- * Tests for the entrypoint-rewrite utility (BUG-074).
+ * Tests for the entrypoint-rewrite utility.
  *
  * Covers the per-file rewrite logic. The session-id lookup wrapper
  * (rewriteSdkCliEntrypoint) is a thin shim over findSessionFile +
