@@ -44,22 +44,32 @@ export async function start(): Promise<void> {
   // Session IDs started via task_start – excluded from native session discovery
   const managedSessionIds = new Set<string>();
 
+  // Session watching – poll the transcript for new messages
+  const watchedCounts = new Map<string, number>();
+  const watchIntervals = new Map<string, ReturnType<typeof setInterval>>();
+  const adapter = new OpenClawAdapter();
+
   const client = new DaemonClient({
     serverUrl: config.serverUrl,
     deviceId: config.deviceId,
     agentType: 'openclaw',
     token: credentials.refreshToken,
     version: daemonVersion,
+    autoUpdate: true,
+    autoUpdateConfig: {
+      packageName: '@cmdctrl/openclaw',
+      binName: 'cmdctrl-openclaw',
+      onBeforeUpdate: () => {
+        for (const interval of watchIntervals.values()) clearInterval(interval);
+        watchIntervals.clear();
+        adapter.stopAll();
+        configManager.deletePidFile();
+      },
+    },
   });
-
-  const adapter = new OpenClawAdapter();
 
   // Report existing OpenClaw sessions from the state directory
   client.setSessionsProvider(() => discoverSessions(managedSessionIds));
-
-  // Session watching – poll the transcript for new messages
-  const watchedCounts = new Map<string, number>();
-  const watchIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
   client.onWatchSession(async (sessionId) => {
     try {
@@ -140,11 +150,7 @@ export async function start(): Promise<void> {
     return readMessages(req.sessionId, req.limit, req.beforeUuid, req.afterUuid);
   });
 
-  client.onVersionStatus((msg) => {
-    if (msg.status === 'update_available') {
-      console.warn(`Update available: v${msg.latest_version} (you have v${msg.your_version})`);
-    }
-  });
+  // Auto-update is handled by the SDK via autoUpdateConfig above.
 
   // Graceful shutdown
   const shutdown = async () => {
