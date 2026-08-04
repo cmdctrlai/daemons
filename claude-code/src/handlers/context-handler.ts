@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { findSessionFile } from '../message-reader';
-import { SessionStatus, ContextResponseMessage } from '../client/messages';
+import { SessionStatus } from '@cmdctrl/daemon-sdk';
 
 interface JournalEntry {
   type: string;
@@ -293,53 +293,4 @@ export function extractSessionContext(
     console.error(`[ContextHandler] Failed to extract context for session ${sessionId}:`, err);
     return null;
   }
-}
-
-/**
- * Build a context response message
- */
-export function buildContextResponse(
-  requestId: string,
-  sessionId: string,
-  options: {
-    includeInitialPrompt?: boolean;
-    recentMessagesCount?: number;
-    includeLastToolUse?: boolean;
-  } = {}
-): ContextResponseMessage {
-  const context = extractSessionContext(sessionId, options);
-
-  if (!context) {
-    return {
-      type: 'context_response',
-      request_id: requestId,
-      session_id: sessionId,
-      context: {
-        title: '',
-        project_path: '',
-        message_count: 0,
-        last_activity_at: new Date().toISOString(),
-        status: 'stale',
-      },
-      error: `Session ${sessionId} not found`,
-    };
-  }
-
-  return {
-    type: 'context_response',
-    request_id: requestId,
-    session_id: sessionId,
-    context: {
-      title: context.title,
-      project_path: context.projectPath,
-      initial_prompt: context.initialPrompt,
-      recent_messages: context.recentMessages,
-      last_tool_use: context.lastToolUse,
-      message_count: context.messageCount,
-      started_at: context.startedAt,
-      last_activity_at: context.lastActivityAt,
-      status: context.status,
-      status_detail: context.statusDetail,
-    },
-  };
 }

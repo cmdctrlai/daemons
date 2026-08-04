@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { MessageEntry } from './client/messages';
+import { MessageEntry } from '@cmdctrl/daemon-sdk';
 
 // Size of chunks to read when scanning for messages
 const CHUNK_SIZE = 64 * 1024; // 64KB

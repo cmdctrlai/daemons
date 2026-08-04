@@ -28,11 +28,14 @@ export async function status(): Promise<void> {
   console.log(`  Device ID: ${config.deviceId}`);
 
   // Token status
-  const tokenExpired = credentials.expiresAt < Date.now();
-  console.log(`\nToken: ${tokenExpired ? 'Expired' : 'Valid'}`);
-  if (!tokenExpired) {
-    const expiresIn = Math.round((credentials.expiresAt - Date.now()) / 1000 / 60);
-    console.log(`  Expires in: ${expiresIn} minutes`);
+  const expiresAt = credentials.expiresAt;
+  if (expiresAt !== undefined) {
+    const tokenExpired = expiresAt < Date.now();
+    console.log(`\nToken: ${tokenExpired ? 'Expired' : 'Valid'}`);
+    if (!tokenExpired) {
+      const expiresIn = Math.round((expiresAt - Date.now()) / 1000 / 60);
+      console.log(`  Expires in: ${expiresIn} minutes`);
+    }
   }
 
   // Daemon status

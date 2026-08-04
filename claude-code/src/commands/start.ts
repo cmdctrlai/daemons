@@ -5,7 +5,7 @@ import {
   writePidFile,
   isDaemonRunning
 } from '../config/config';
-import { DaemonClient } from '../client/websocket';
+import { createDaemon } from '../client/daemon';
 
 interface StartOptions {
   foreground?: boolean;
@@ -17,13 +17,13 @@ interface StartOptions {
 export async function start(options: StartOptions): Promise<void> {
   // Check registration
   if (!isRegistered()) {
-    console.error('Device not registered. Run "cmdctrl-claude-code-daemon register" first.');
+    console.error('Device not registered. Run "cmdctrl-claude-code register" first.');
     process.exit(1);
   }
 
   // Check if already running
   if (isDaemonRunning()) {
-    console.error('Daemon is already running. Run "cmdctrl-claude-code-daemon stop" first.');
+    console.error('Daemon is already running. Run "cmdctrl-claude-code stop" first.');
     process.exit(1);
   }
 
@@ -37,13 +37,12 @@ export async function start(options: StartOptions): Promise<void> {
   // Write PID file
   writePidFile(process.pid);
 
-  // Create and start client
-  const client = new DaemonClient(config, credentials);
+  const daemon = createDaemon(config, credentials);
 
   // Handle shutdown signals
   const shutdown = async () => {
     console.log('\nShutting down...');
-    await client.disconnect();
+    await daemon.shutdown();
     process.exit(0);
   };
 
@@ -56,7 +55,7 @@ export async function start(options: StartOptions): Promise<void> {
 
   // Connect and run - initial failure is handled by the reconnect loop,
   // so we never exit here. The process must stay alive for retry timers to fire.
-  client.connect().catch(() => {
+  daemon.client.connect().catch(() => {
     console.warn('Initial connection failed, will retry...');
   });
 
