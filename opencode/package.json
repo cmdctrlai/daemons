@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/opencode",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "CmdCtrl daemon for OpenCode - connects your workstation to the CmdCtrl orchestration server",
   "main": "./dist/index.js",
   "bin": {
@@ -23,7 +23,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "^1.0.6",
+    "@cmdctrl/daemon-sdk": "^1.2.0",
     "commander": "^12.1.0",
     "ws": "^8.18.0"
   },
