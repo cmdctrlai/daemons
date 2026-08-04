@@ -1,45 +1,33 @@
-import { execSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { fetchLatestVersion, selfUpdate } from '@cmdctrl/daemon-sdk';
 import { isDaemonRunning } from '../config/config';
 import { stop } from './stop';
 
+const PACKAGE_NAME = '@cmdctrl/claude-code';
+const BIN_NAME = 'cmdctrl-claude-code';
+
 // Get the current version from package.json
 function getCurrentVersion(): string {
-  try {
-    const pkg = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf-8'));
-    return pkg.version;
-  } catch {
+  for (const rel of [['..', '..', 'package.json'], ['..', 'package.json']]) {
     try {
-      const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf-8'));
-      return pkg.version;
+      return JSON.parse(readFileSync(join(__dirname, ...rel), 'utf-8')).version;
     } catch {
-      return 'unknown';
+      continue;
     }
   }
-}
-
-// Fetch the latest version from npm registry
-async function getLatestVersion(packageName: string): Promise<string | null> {
-  try {
-    const response = await fetch(`https://registry.npmjs.org/${packageName}/latest`);
-    if (!response.ok) return null;
-    const data = await response.json() as { version: string };
-    return data.version;
-  } catch {
-    return null;
-  }
+  return 'unknown';
 }
 
 export async function update(): Promise<void> {
-  const packageName = '@cmdctrl/claude-code';
   const currentVersion = getCurrentVersion();
   const wasRunning = isDaemonRunning();
 
   console.log(`Current version: ${currentVersion}`);
   console.log(`Checking for updates...`);
 
-  const latestVersion = await getLatestVersion(packageName);
+  const latestVersion = await fetchLatestVersion(PACKAGE_NAME);
 
   if (!latestVersion) {
     console.error('Failed to check for updates. Check your internet connection.');
@@ -57,34 +45,35 @@ export async function update(): Promise<void> {
     await stop();
   }
 
-  console.log(`Updating ${packageName}: v${currentVersion} → v${latestVersion}`);
+  console.log(`Updating ${PACKAGE_NAME}: v${currentVersion} → v${latestVersion}`);
 
-  try {
-    execSync(`npm install -g ${packageName}@latest`, {
-      stdio: 'inherit',
-    });
-  } catch {
-    console.error('\nUpdate failed. You may need to run with sudo:');
-    console.error(`  sudo npm install -g ${packageName}@latest`);
-    process.exit(1);
+  const result = await selfUpdate({
+    packageName: PACKAGE_NAME,
+    binName: BIN_NAME,
+    currentVersion,
+    latestVersion,
+    restartAfter: wasRunning,
+  });
+
+  if (result.status === 'updated') {
+    console.log(`\nUpdated successfully to v${result.toVersion}`);
+    if (wasRunning) console.log('Daemon restarted.');
+    return;
   }
 
-  // Verify the update
-  try {
-    const result = execSync(`cmdctrl-claude-code --version`, { encoding: 'utf-8' }).trim();
-    console.log(`\nUpdated successfully to v${result}`);
-  } catch {
-    console.log(`\nUpdate installed. Run 'cmdctrl-claude-code --version' to verify.`);
+  if (result.status === 'up-to-date') {
+    console.log(`\nAlready up to date (v${result.toVersion}).`);
+  } else {
+    console.error(`\n${result.error ?? 'Update failed.'}`);
   }
 
-  // Restart daemon if it was running before update
+  // selfUpdate only respawns after a successful install, so restore the daemon
+  // ourselves when nothing was installed.
   if (wasRunning) {
     console.log('Restarting daemon...');
-    const child = spawn('cmdctrl-claude-code', ['start'], {
-      detached: true,
-      stdio: 'ignore',
-    });
+    const child = spawn(BIN_NAME, ['start'], { detached: true, stdio: 'ignore' });
     child.unref();
-    console.log('Daemon restarted.');
   }
+
+  if (result.status !== 'up-to-date') process.exit(1);
 }
