@@ -130,6 +130,35 @@ export interface ReportSessionsMessage {
   sessions: SessionInfo[];
 }
 
+/** One slash command a daemon is willing to have autocompleted in the composer. */
+export interface SlashCommandInfo {
+  /** Command name without the leading slash, e.g. "compact". */
+  name: string;
+  /** Short human-readable summary. Omitted for commands the daemon knows only by name. */
+  description?: string;
+  /** Argument shape shown next to the name, e.g. "<title>". */
+  usage_hint?: string;
+}
+
+/** The commands available to sessions running in one project directory. */
+export interface SlashCommandSet {
+  /** Absolute project path the set applies to. */
+  project: string;
+  commands: SlashCommandInfo[];
+}
+
+/**
+ * Full replacement of everything the daemon currently knows about slash commands,
+ * keyed by project. Sent on connect and whenever a set changes – not per session,
+ * because the command set is a property of the project and the user's environment,
+ * and repeating it inside every `report_sessions` tick would multiply an identical
+ * payload by the session count.
+ */
+export interface ReportSlashCommandsMessage {
+  type: 'report_slash_commands';
+  sets: SlashCommandSet[];
+}
+
 export interface MessageEntry {
   uuid: string;
   role: 'USER' | 'AGENT' | 'SYSTEM';
@@ -188,6 +217,7 @@ export type DaemonMessage =
   | StatusMessage
   | EventMessage
   | ReportSessionsMessage
+  | ReportSlashCommandsMessage
   | MessagesResponseMessage
   | SessionActivityMessage
   | ContextResponseMessage;

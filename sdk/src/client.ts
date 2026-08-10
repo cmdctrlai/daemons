@@ -52,6 +52,7 @@ import {
   VersionStatusMessage,
   MessageEntry,
   SessionInfo,
+  SlashCommandSet,
   SessionStatus,
 } from './messages';
 import { selfUpdate, isAutoUpdateSupported } from './update';
@@ -86,6 +87,14 @@ export interface DaemonClientOptions {
   autoUpdate?: boolean;
   /** Required if `autoUpdate` is true. */
   autoUpdateConfig?: AutoUpdateConfig;
+  /**
+   * Log connection lifecycle plus every non-ping/pong frame as
+   * `[WS IN] <type>: <json>` / `[WS OUT] <type>: <json>`, truncated to 200
+   * characters. The daemon log is the primary troubleshooting surface for
+   * protocol problems, so daemons that people debug in the field want this on.
+   * Default: false.
+   */
+  logFrames?: boolean;
 }
 
 export interface AutoUpdateConfig {
@@ -194,6 +203,12 @@ export interface ContextResponse {
   lastActivityAt: string;
   status: SessionStatus;
   statusDetail?: string;
+  /**
+   * Set when the context could not be built (e.g. the session no longer
+   * exists). The response is still sent so the server can stop waiting on
+   * the request instead of timing it out.
+   */
+  error?: string;
 }
 
 // ============================================================
@@ -210,6 +225,36 @@ type ContextRequestHandler = (req: ContextRequest) => ContextResponse | null | P
 type VersionStatusHandler = (status: VersionStatusMessage) => void;
 type AuthFailureHandler = () => void;
 type SessionsProvider = () => SessionInfo[] | Promise<SessionInfo[]>;
+type SlashCommandsProvider = () => SlashCommandSet[];
+type RunningTasksProvider = () => string[];
+
+/** Reads a Node response stream (e.g. the `res` from a ws 'unexpected-response' event) to completion. */
+function readResponseBody(res: NodeJS.ReadableStream): Promise<string> {
+  return new Promise((resolve) => {
+    let body = '';
+    res.on('data', (chunk) => { body += chunk; });
+    res.on('end', () => resolve(body));
+    res.on('error', () => resolve(body));
+  });
+}
+
+/**
+ * Parses a `Retry-After` header into milliseconds. Only the integer-seconds
+ * form (e.g. "12") is honoured – the HTTP-date form is technically valid
+ * per RFC 7231, but the server only ever sends integer seconds, so treating
+ * anything else (missing, malformed, negative, or a date) as "no minimum"
+ * is a deliberate choice: it lets the caller fall back to normal backoff
+ * instead of risking NaN, a negative delay, or a hot retry loop.
+ */
+function parseRetryAfterMs(header: string | undefined): number | undefined {
+  if (!header || !/^\d+$/.test(header.trim())) return undefined;
+  return Number(header.trim()) * 1000;
+}
+
+/** Frame text for the `logFrames` log lines, capped so one frame stays one line. */
+function truncateFrame(json: string): string {
+  return json.length > 200 ? `${json.substring(0, 200)}...` : json;
+}
 
 // ============================================================
 // Client
@@ -237,6 +282,7 @@ export class DaemonClient {
   private runningTasks: Set<string> = new Set();
   private pendingAutoUpdate: VersionStatusMessage | null = null;
   private autoUpdateInProgress = false;
+  private idleCheckTimer: NodeJS.Timeout | null = null;
   /**
    * Remembers the `latest_version` the server told us about most recently
    * that we already tried to install and found to be a no-op (i.e. npm's
@@ -257,6 +303,8 @@ export class DaemonClient {
   private versionStatusHandler?: VersionStatusHandler;
   private authFailureHandler?: AuthFailureHandler;
   private sessionsProvider?: SessionsProvider;
+  private slashCommandsProvider?: SlashCommandsProvider;
+  private runningTasksProvider?: RunningTasksProvider;
 
   constructor(options: DaemonClientOptions) {
     this.options = {
@@ -264,6 +312,7 @@ export class DaemonClient {
       maxReconnectDelay: 60000,
       pingInterval: 30000,
       autoUpdate: false,
+      logFrames: false,
       ...options,
     };
     if (this.options.autoUpdate && !this.options.autoUpdateConfig) {
@@ -341,6 +390,32 @@ export class DaemonClient {
     return this;
   }
 
+  /**
+   * Register a provider for the slash commands the agent accepts, per project.
+   * Optional – a daemon that can't enumerate its agent's commands simply omits
+   * it and clients render a composer with no autocomplete menu.
+   */
+  setSlashCommandsProvider(provider: SlashCommandsProvider): this {
+    this.slashCommandsProvider = provider;
+    return this;
+  }
+
+  /**
+   * Register a provider for the running-task set. Optional.
+   *
+   * By default the client tracks running tasks itself, from the lifetime of
+   * the `onTaskStart` / `onTaskResume` handler promises. That model does not
+   * fit a daemon whose tasks end on paths no handler promise can observe – a
+   * turn handed off to another process, a killed child, a task superseded by a
+   * newer message for the same session. Such a daemon provides its own set
+   * here, and the client reports it in `status` and consults it before
+   * installing a deferred update.
+   */
+  setRunningTasksProvider(provider: RunningTasksProvider): this {
+    this.runningTasksProvider = provider;
+    return this;
+  }
+
   // ------------------------------------------------------------------
   // Connection
   // ------------------------------------------------------------------
@@ -363,6 +438,8 @@ export class DaemonClient {
       const capabilities: string[] = [];
       if (this.options.autoUpdate) capabilities.push('auto-update');
 
+      if (this.options.logFrames) console.log(`Connecting to ${wsUrl}...`);
+
       this.ws = new WebSocket(wsUrl, {
         headers: {
           Authorization: `Bearer ${this.options.token}`,
@@ -374,18 +451,21 @@ export class DaemonClient {
       });
 
       this.ws.on('open', async () => {
+        if (this.options.logFrames) console.log('WebSocket connected');
         this.reconnectAttempt = 0;
         this.consecutiveAuthFailures = 0;
         this.startPingInterval();
         this.startSessionRefreshInterval();
         this.sendStatus();
         await this.reportSessions();
+        this.reportSlashCommands();
         resolve();
       });
 
       this.ws.on('message', (data) => this.handleMessage(data.toString()));
 
-      this.ws.on('close', () => {
+      this.ws.on('close', (code, reason) => {
+        if (this.options.logFrames) console.log(`WebSocket closed: ${code} ${reason}`);
         this.stopPingInterval();
         this.stopSessionRefreshInterval();
         reject(new Error('Connection closed'));
@@ -408,13 +488,41 @@ export class DaemonClient {
             console.warn(`Authentication failed (401), retrying with backoff... (attempt ${this.consecutiveAuthFailures})`);
           }
           reject(new Error('Authentication failed (401)'));
+          this.scheduleReconnect();
+        } else if (res.statusCode === 426) {
+          // The server rejected this daemon's version before ever upgrading
+          // the connection (see daemon_hub.go's pre-upgrade version gate).
+          // The body is shaped like a version_status message, so route it
+          // through the same handling a post-connect version_status gets -
+          // this is what prints the upgrade prompt / triggers auto-update
+          // and decides whether to keep retrying.
+          reject(new Error('Daemon version is below the minimum supported version'));
+          readResponseBody(res).then((body) => {
+            try {
+              const m = JSON.parse(body) as VersionStatusMessage;
+              this.versionStatusHandler?.(m);
+              this.handleVersionStatus(m);
+            } catch {
+              console.error(`Server rejected this daemon's version (426) but the response could not be read: ${body}`);
+            }
+            this.scheduleReconnect();
+          });
+        } else if (res.statusCode === 429) {
+          // The server throttles connect attempts per device (see
+          // daemon_hub.go's connect_throttle) and sets Retry-After to the
+          // seconds remaining before the next token refills. Honour it as a
+          // floor on the next attempt – normal backoff can still push the
+          // delay later, but never sooner than the server asked for.
+          reject(new Error('Connection rate limited (429)'));
+          this.scheduleReconnect(parseRetryAfterMs(res.headers['retry-after']));
         } else {
           reject(new Error(`Unexpected server response: ${res.statusCode}`));
+          this.scheduleReconnect();
         }
-        this.scheduleReconnect();
       });
 
       this.ws.on('error', (err) => {
+        if (this.options.logFrames) console.error('WebSocket error:', err.message);
         if (this.ws?.readyState === WebSocket.OPEN) {
           this.ws.terminate();
         }
@@ -431,6 +539,7 @@ export class DaemonClient {
     }
     this.stopPingInterval();
     this.stopSessionRefreshInterval();
+    this.stopIdleCheck();
     if (this.ws) {
       this.ws.close(1000, 'Daemon shutting down');
       this.ws = null;
@@ -473,13 +582,28 @@ export class DaemonClient {
     }
   }
 
+  /**
+   * Report the per-project slash command sets to the server. Sent on connect and
+   * whenever the daemon learns the set has changed. No-op without a provider.
+   */
+  reportSlashCommands(): void {
+    if (!this.slashCommandsProvider) return;
+    const sets = this.slashCommandsProvider();
+    if (sets.length === 0) return;
+    this.send({ type: 'report_slash_commands', sets });
+  }
+
   // ------------------------------------------------------------------
   // Internal: message sending
   // ------------------------------------------------------------------
 
   private send(message: DaemonMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(message));
+      const json = JSON.stringify(message);
+      if (this.options.logFrames && message.type !== 'pong') {
+        console.log(`[WS OUT] ${message.type}:`, truncateFrame(json));
+      }
+      this.ws.send(json);
     }
   }
 
@@ -488,10 +612,16 @@ export class DaemonClient {
   }
 
   private sendStatus(): void {
-    this.send({ type: 'status', running_tasks: Array.from(this.runningTasks) });
-    if (this.runningTasks.size === 0) {
+    const running = this.runningTaskIds();
+    this.send({ type: 'status', running_tasks: running });
+    if (running.length === 0) {
       this.maybeRunPendingAutoUpdate();
     }
+  }
+
+  /** The authoritative running-task set: the caller's, if it provided one. */
+  private runningTaskIds(): string[] {
+    return this.runningTasksProvider ? this.runningTasksProvider() : Array.from(this.runningTasks);
   }
 
   // ------------------------------------------------------------------
@@ -500,13 +630,32 @@ export class DaemonClient {
 
   private maybeRunPendingAutoUpdate(): void {
     if (!this.pendingAutoUpdate || this.autoUpdateInProgress) return;
-    if (this.runningTasks.size > 0) return;
+    if (this.runningTaskIds().length > 0) return;
     const msg = this.pendingAutoUpdate;
     this.pendingAutoUpdate = null;
+    this.stopIdleCheck();
     this.runAutoUpdate(msg).catch((e) => {
       console.error('[auto-update] failed:', e);
       this.autoUpdateInProgress = false;
     });
+  }
+
+  /**
+   * Poll for idleness while an update is deferred. `sendStatus` already
+   * re-checks on every task transition the client itself sees, but a daemon
+   * that owns its running-task set finishes tasks without telling us, so
+   * without this the deferred update would wait for the next unrelated status.
+   */
+  private startIdleCheck(): void {
+    if (this.idleCheckTimer) return;
+    this.idleCheckTimer = setInterval(() => this.maybeRunPendingAutoUpdate(), 5000);
+  }
+
+  private stopIdleCheck(): void {
+    if (this.idleCheckTimer) {
+      clearInterval(this.idleCheckTimer);
+      this.idleCheckTimer = null;
+    }
   }
 
   private handleVersionStatus(m: VersionStatusMessage): void {
@@ -552,14 +701,16 @@ export class DaemonClient {
       return;
     }
 
-    if (this.runningTasks.size === 0) {
+    const running = this.runningTaskIds();
+    if (running.length === 0) {
       this.runAutoUpdate(m).catch((e) => {
         console.error('[auto-update] failed:', e);
         this.autoUpdateInProgress = false;
       });
     } else {
       this.pendingAutoUpdate = m;
-      console.log(`\n[auto-update] update available (v${m.latest_version}). Deferring until ${this.runningTasks.size} active task(s) complete.`);
+      console.log(`\n[auto-update] update available (v${m.latest_version}). Deferring until ${running.length} active task(s) complete.`);
+      this.startIdleCheck();
     }
   }
 
@@ -567,6 +718,7 @@ export class DaemonClient {
     const cfg = this.options.autoUpdateConfig;
     if (!cfg) return;
     this.autoUpdateInProgress = true;
+    this.stopIdleCheck();
 
     if (!isAutoUpdateSupported()) {
       console.warn(`\n⚠ Update available (v${msg.latest_version}) but auto-update is not supported on this platform.`);
@@ -695,7 +847,12 @@ export class DaemonClient {
     try {
       msg = JSON.parse(raw);
     } catch {
+      if (this.options.logFrames) console.error('Failed to parse message:', raw);
       return;
+    }
+
+    if (this.options.logFrames && msg.type !== 'ping') {
+      console.log(`[WS IN] ${msg.type}:`, truncateFrame(raw));
     }
 
     switch (msg.type) {
@@ -817,6 +974,7 @@ export class DaemonClient {
                 status: ctx.status,
                 status_detail: ctx.statusDetail,
               },
+              error: ctx.error,
             });
           }
         } catch {
@@ -845,12 +1003,15 @@ export class DaemonClient {
    * (uniform between 0 and min(cap, base * 2^attempt)). Never gives up –
    * a transient outage must recover without the daemon exiting or a human
    * re-registering it. `connect()`'s own failure handlers call this, so a
-   * connection attempt reschedules itself on failure.
+   * connection attempt reschedules itself on failure. `minDelayMs` sets a
+   * floor under the computed backoff (e.g. from a 429's Retry-After) – it
+   * can only push the delay later, never shorten it.
    */
-  private scheduleReconnect(): void {
+  private scheduleReconnect(minDelayMs = 0): void {
     if (!this.shouldReconnect || this.reconnectTimer) return;
-    const delay = this.nextReconnectDelay(this.reconnectAttempt);
+    const delay = Math.max(this.nextReconnectDelay(this.reconnectAttempt), minDelayMs);
     this.reconnectAttempt++;
+    if (this.options.logFrames) console.log(`Reconnecting in ${Math.round(delay / 1000)}s...`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect().catch(() => {});

@@ -34,6 +34,10 @@ export interface DaemonCredentials {
  * configManager.writeConfig({ serverUrl: '...', deviceId: '...', deviceName: '...' });
  * const config = configManager.readConfig();
  * ```
+ *
+ * Pass `configDir` to store the files somewhere else – e.g. to run a second
+ * instance of the same daemon against a different server without disturbing
+ * the primary registration.
  */
 export class ConfigManager {
   readonly configDir: string;
@@ -41,8 +45,8 @@ export class ConfigManager {
   readonly credentialsFile: string;
   readonly pidFile: string;
 
-  constructor(daemonName: string) {
-    this.configDir = path.join(os.homedir(), `.cmdctrl-${daemonName}`);
+  constructor(daemonName: string, configDir?: string) {
+    this.configDir = configDir || path.join(os.homedir(), `.cmdctrl-${daemonName}`);
     this.configFile = path.join(this.configDir, 'config.json');
     this.credentialsFile = path.join(this.configDir, 'credentials');
     this.pidFile = path.join(this.configDir, 'daemon.pid');

@@ -5,8 +5,12 @@ let mockWsInstance: any;
 
 // Governs how each newly constructed MockWS behaves on the next tick, so
 // tests can simulate a connect failure before the client's 'open' handler
-// would otherwise fire. Reset between tests.
-let nextConnectOutcome: 'open' | { unexpectedResponse: number } | 'hang' = 'open';
+// would otherwise fire. Reset between tests. `body` is only meaningful for
+// `unexpectedResponse: 426` (the pre-upgrade version rejection), whose
+// response carries a version_status-shaped JSON body. `headers` is only
+// meaningful for `unexpectedResponse: 429` (the connect-throttle
+// rejection), whose response carries a Retry-After header.
+let nextConnectOutcome: 'open' | { unexpectedResponse: number; body?: string; headers?: Record<string, string> } | 'hang' = 'open';
 // Counts every MockWS construction, i.e. every connection attempt made by
 // the client (initial + every reconnect). Reset between tests.
 let connectAttemptCount = 0;
@@ -31,7 +35,16 @@ jest.mock('ws', () => {
           this.emit('open');
         } else {
           this.readyState = 0; // CONNECTING – matches real ws behavior on a rejected upgrade
-          this.emit('unexpected-response', { destroy: () => {} }, { statusCode: outcome.unexpectedResponse });
+          const res = new EE();
+          res.statusCode = outcome.unexpectedResponse;
+          res.headers = outcome.headers ?? {};
+          this.emit('unexpected-response', { destroy: () => {} }, res);
+          // A separate tick so 'data'/'end' listeners attached synchronously
+          // by the client's 'unexpected-response' handler are in place first.
+          setTimeout(() => {
+            if (outcome.body !== undefined) res.emit('data', outcome.body);
+            res.emit('end');
+          }, 0);
         }
       }, 0);
     }
@@ -46,6 +59,8 @@ jest.mock('ws', () => {
 });
 
 import { DaemonClient } from '../client';
+import { SlashCommandSet } from '../messages';
+import * as updateModule from '../update';
 
 function createClient(overrides: Record<string, any> = {}): DaemonClient {
   return new DaemonClient({
@@ -314,6 +329,81 @@ describe('DaemonClient', () => {
     });
   });
 
+  describe('version_status via pre-upgrade rejection (426)', () => {
+    // The server now rejects a below-minimum daemon before ever upgrading
+    // the connection (see daemon_hub.go), returning a version_status-shaped
+    // JSON body on a 426 instead of upgrading and sending it over the
+    // socket. This must be routed through the exact same handling as a
+    // post-connect version_status message.
+    test('parses the rejection body and reports it through onVersionStatus', async () => {
+      nextConnectOutcome = {
+        unexpectedResponse: 426,
+        body: JSON.stringify({
+          type: 'version_status', status: 'update_required',
+          your_version: '0.1.0', min_version: '1.0.0', message: 'Please upgrade.',
+        }),
+      };
+      const client = createClient();
+      const statuses: string[] = [];
+      client.onVersionStatus((msg) => statuses.push(msg.status));
+
+      client.connect().catch(() => {});
+      // MockWS fires 'unexpected-response' after 0ms, then schedules a
+      // further 0ms timer to emit 'data'/'end' on the response - advancing
+      // by 1ms (not 0ms) is what lets a timer scheduled during another
+      // timer's callback actually run, same as the reconnect-backoff tests
+      // below.
+      await jest.advanceTimersByTimeAsync(1);
+
+      expect(statuses).toEqual(['update_required']);
+    });
+
+    test('update_required with no auto-update configured stops future reconnects', async () => {
+      nextConnectOutcome = {
+        unexpectedResponse: 426,
+        body: JSON.stringify({
+          type: 'version_status', status: 'update_required',
+          your_version: '0.1.0', min_version: '1.0.0',
+        }),
+      };
+      const client = createClient();
+      client.connect().catch(() => {});
+      await jest.advanceTimersByTimeAsync(1);
+
+      connectAttemptCount = 0;
+      await jest.advanceTimersByTimeAsync(120000);
+
+      expect(connectAttemptCount).toBe(0);
+    });
+
+    test('is recognized as a version rejection, not a generic unexpected response', async () => {
+      nextConnectOutcome = { unexpectedResponse: 426 };
+      const client = createClient();
+      let rejection: Error | undefined;
+      client.connect().catch((e) => { rejection = e; });
+      await jest.advanceTimersByTimeAsync(1);
+
+      // The generic branch would reject with "Unexpected server response:
+      // 426" - a distinct message confirms the dedicated 426 branch ran.
+      expect(rejection?.message).toBe('Daemon version is below the minimum supported version');
+      await client.disconnect();
+    });
+
+    test('an unparseable body is logged and does not crash - a reconnect is still scheduled', async () => {
+      nextConnectOutcome = { unexpectedResponse: 426 }; // no body -> empty string -> JSON.parse throws
+      const client = createClient();
+      client.connect().catch(() => {});
+      await jest.advanceTimersByTimeAsync(1);
+
+      connectAttemptCount = 0;
+      nextConnectOutcome = 'open';
+      await jest.advanceTimersByTimeAsync(60000);
+
+      expect(connectAttemptCount).toBeGreaterThan(0);
+      await client.disconnect();
+    });
+  });
+
   describe('context_request', () => {
     test('routes context request and sends response', async () => {
       const client = createClient();
@@ -395,6 +485,46 @@ describe('DaemonClient', () => {
 
       const report = mockWsInstance.sentMessages.find((m: any) => m.type === 'report_sessions');
       expect(report?.sessions).toEqual(sessions);
+      await client.disconnect();
+    });
+  });
+
+  describe('reportSlashCommands', () => {
+    const sets: SlashCommandSet[] = [{ project: '/repo', commands: [{ name: 'compact', description: 'Compact' }] }];
+
+    const cases: Array<{ name: string; provider?: () => SlashCommandSet[]; expected: unknown }> = [
+      { name: 'sends nothing without a provider', expected: undefined },
+      { name: 'sends nothing when the daemon knows no commands yet', provider: () => [], expected: undefined },
+      { name: 'sends the provider sets on connect', provider: () => sets, expected: { type: 'report_slash_commands', sets } },
+    ];
+
+    test.each(cases)('$name', async ({ provider, expected }) => {
+      const client = createClient();
+      if (provider) client.setSlashCommandsProvider(provider);
+
+      const p = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await p;
+
+      expect(mockWsInstance.sentMessages.find((m: any) => m.type === 'report_slash_commands')).toEqual(expected);
+      await client.disconnect();
+    });
+
+    test('re-sends the current sets on demand', async () => {
+      const client = createClient();
+      let current: SlashCommandSet[] = sets;
+      client.setSlashCommandsProvider(() => current);
+
+      const p = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await p;
+
+      current = [{ project: '/repo', commands: [{ name: 'compact' }, { name: 'deploy' }] }];
+      client.reportSlashCommands();
+
+      const reports = mockWsInstance.sentMessages.filter((m: any) => m.type === 'report_slash_commands');
+      expect(reports).toHaveLength(2);
+      expect(reports[1].sets).toEqual(current);
       await client.disconnect();
     });
   });
@@ -598,6 +728,67 @@ describe('DaemonClient', () => {
       expect(resetDelay).toBe(500); // back to attempt-0 tier: 0.5 * 1000
       await client.disconnect();
     });
+
+    describe('connect throttle rejection (429)', () => {
+      // The server throttles connect attempts per device (see
+      // connect_throttle.go) and sets Retry-After to the seconds remaining
+      // before the next token refills. The client must never schedule the
+      // next attempt sooner than that, but a missing or malformed value
+      // must fall back to normal backoff rather than risk NaN, a negative
+      // delay, or a hot retry loop.
+      test.each([
+        { label: 'integer seconds', header: '5', expectedDelay: 5000 },
+        { label: 'missing header', header: undefined, expectedDelay: 500 },
+        { label: 'non-numeric value', header: 'soon', expectedDelay: 500 },
+        { label: 'negative value', header: '-5', expectedDelay: 500 },
+        { label: 'decimal value', header: '2.5', expectedDelay: 500 },
+        { label: 'empty string', header: '', expectedDelay: 500 },
+      ])('$label: reconnect delay is $expectedDelay ms', async ({ header, expectedDelay }) => {
+        jest.spyOn(Math, 'random').mockReturnValue(0.5);
+        const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+
+        nextConnectOutcome = {
+          unexpectedResponse: 429,
+          headers: header !== undefined ? { 'retry-after': header } : {},
+        };
+        const client = createClient({ baseReconnectDelay: 1000, maxReconnectDelay: 60000 });
+        client.connect().catch(() => {});
+        await jest.advanceTimersByTimeAsync(1);
+
+        expect(lastReconnectDelay(setTimeoutSpy)).toBe(expectedDelay);
+        await client.disconnect();
+      });
+
+      test('a Retry-After shorter than the current backoff never shortens the delay', async () => {
+        jest.spyOn(Math, 'random').mockReturnValue(0.5);
+        const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+
+        nextConnectOutcome = { unexpectedResponse: 500 };
+        const client = createClient({ baseReconnectDelay: 1000, maxReconnectDelay: 60000 });
+        client.connect().catch(() => {});
+
+        // Drive three generic failures so backoff has grown past 1s.
+        let lastDelay = 0;
+        for (let i = 0; i < 3; i++) {
+          setTimeoutSpy.mockClear();
+          await jest.advanceTimersByTimeAsync(lastDelay);
+          await jest.advanceTimersByTimeAsync(1);
+          lastDelay = lastReconnectDelay(setTimeoutSpy);
+        }
+        expect(lastDelay).toBe(2000); // 0.5 * min(60000, 1000 * 2^2)
+
+        // The next attempt is throttled with a Retry-After far below what
+        // normal backoff would produce here (4000ms) – the delay must stay
+        // at the normal-backoff value, not drop to the 1s floor.
+        setTimeoutSpy.mockClear();
+        nextConnectOutcome = { unexpectedResponse: 429, headers: { 'retry-after': '1' } };
+        await jest.advanceTimersByTimeAsync(lastDelay);
+        await jest.advanceTimersByTimeAsync(1);
+
+        expect(lastReconnectDelay(setTimeoutSpy)).toBe(4000); // 0.5 * min(60000, 1000 * 2^3)
+        await client.disconnect();
+      });
+    });
   });
 
   describe('auth failure handling (401)', () => {
@@ -641,6 +832,157 @@ describe('DaemonClient', () => {
 
       expect(authFailureCalls).toBe(2);
       await client.disconnect();
+    });
+  });
+
+  describe('running tasks provider', () => {
+    const cases: Array<{ name: string; provided: string[]; expected: string[] }> = [
+      { name: 'empty provider reports no running tasks', provided: [], expected: [] },
+      { name: 'provider owns the reported set', provided: ['t1', 't2'], expected: ['t1', 't2'] },
+    ];
+
+    test.each(cases)('$name', async ({ provided, expected }) => {
+      const client = createClient();
+      client.setRunningTasksProvider(() => provided);
+
+      const p = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await p;
+
+      const status = mockWsInstance.sentMessages.find((m: any) => m.type === 'status');
+      expect(status.running_tasks).toEqual(expected);
+      await client.disconnect();
+    });
+
+    test('provider overrides the tasks the client tracked itself', async () => {
+      const client = createClient();
+      // Handler never settles: without a provider the client would report t1
+      // as running for the rest of the process's life.
+      client.onTaskStart(() => new Promise<void>(() => {}));
+      client.setRunningTasksProvider(() => []);
+
+      const p = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await p;
+
+      simulateMessage({ type: 'task_start', task_id: 't1', instruction: 'go' });
+      await jest.advanceTimersByTimeAsync(0);
+
+      const statuses = mockWsInstance.sentMessages.filter((m: any) => m.type === 'status');
+      expect(statuses[statuses.length - 1].running_tasks).toEqual([]);
+      await client.disconnect();
+    });
+  });
+
+  describe('deferred auto-update with a running tasks provider', () => {
+    // A daemon that owns its running-task set finishes tasks without telling
+    // the client, so the deferred update has to be re-checked on a timer.
+    test('installs once the provider reports idle', async () => {
+      const selfUpdate = jest.spyOn(updateModule, 'selfUpdate')
+        .mockResolvedValue({ status: 'failed', fromVersion: '1.0.0', error: 'stubbed' });
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      jest.spyOn(console, 'log').mockImplementation(() => {});
+
+      let running = ['t1'];
+      const client = createClient({
+        autoUpdate: true,
+        autoUpdateConfig: { packageName: '@cmdctrl/test', binName: 'cmdctrl-test' },
+      });
+      client.setRunningTasksProvider(() => running);
+
+      const p = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await p;
+
+      simulateMessage({ type: 'version_status', status: 'update_available', your_version: '1.0.0', latest_version: '1.1.0' });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(selfUpdate).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(5000);
+      expect(selfUpdate).not.toHaveBeenCalled();
+
+      running = [];
+      await jest.advanceTimersByTimeAsync(5000);
+      expect(selfUpdate).toHaveBeenCalledTimes(1);
+
+      await client.disconnect();
+      jest.restoreAllMocks();
+    });
+  });
+
+  describe('context_request error responses', () => {
+    test('sends the error alongside the placeholder context', async () => {
+      const client = createClient();
+      client.onContextRequest(() => ({
+        title: '',
+        projectPath: '',
+        messageCount: 0,
+        lastActivityAt: '2026-01-01T00:00:00Z',
+        status: 'stale' as const,
+        error: 'Session s1 not found',
+      }));
+
+      const p = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await p;
+
+      simulateMessage({ type: 'context_request', request_id: 'r1', session_id: 's1', include: {} });
+      await jest.advanceTimersByTimeAsync(0);
+
+      const response = mockWsInstance.sentMessages.find((m: any) => m.type === 'context_response');
+      expect(response.error).toBe('Session s1 not found');
+      expect(response.context.status).toBe('stale');
+      await client.disconnect();
+    });
+  });
+
+  describe('frame logging', () => {
+    const cases: Array<{ name: string; logFrames: boolean; expectLogged: boolean }> = [
+      { name: 'logs frames when enabled', logFrames: true, expectLogged: true },
+      { name: 'stays silent by default', logFrames: false, expectLogged: false },
+    ];
+
+    test.each(cases)('$name', async ({ logFrames, expectLogged }) => {
+      const logged: string[] = [];
+      const spy = jest.spyOn(console, 'log').mockImplementation((...args) => {
+        logged.push(args.join(' '));
+      });
+
+      const client = createClient({ logFrames });
+      const p = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await p;
+
+      simulateMessage({ type: 'watch_session', session_id: 's1', file_path: '/tmp/s.jsonl' });
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(logged.some((l) => l.startsWith('[WS IN] watch_session:'))).toBe(expectLogged);
+      expect(logged.some((l) => l.startsWith('[WS OUT] status:'))).toBe(expectLogged);
+
+      await client.disconnect();
+      spy.mockRestore();
+    });
+
+    test('truncates long frames to 200 characters', async () => {
+      const logged: string[] = [];
+      const spy = jest.spyOn(console, 'log').mockImplementation((...args) => {
+        logged.push(args.join(' '));
+      });
+
+      const client = createClient({ logFrames: true });
+      const p = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await p;
+
+      client.sendEvent('t1', 'OUTPUT', { output: 'x'.repeat(500) });
+
+      const line = logged.find((l) => l.startsWith('[WS OUT] event:'))!;
+      const frame = line.substring('[WS OUT] event: '.length);
+      expect(frame).toHaveLength(203); // 200 characters plus the ellipsis
+      expect(frame.endsWith('...')).toBe(true);
+
+      await client.disconnect();
+      spy.mockRestore();
     });
   });
 });
