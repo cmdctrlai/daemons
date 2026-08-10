@@ -46,6 +46,8 @@ jest.mock('@cmdctrl/daemon-sdk', () => ({
     }
     setRunningTasksProvider(p: Handler) { handlers.runningTasks = p; return this; }
     setSessionsProvider(p: Handler) { handlers.sessions = p; return this; }
+    setSlashCommandsProvider(p: Handler) { handlers.slashCommands = p; return this; }
+    reportSlashCommands() { sent.push({ type: 'report_slash_commands', sets: handlers.slashCommands() }); }
     onTaskStart(h: Handler) { handlers.taskStart = h; return this; }
     onTaskResume(h: Handler) { handlers.taskResume = h; return this; }
     onTaskCancel(h: Handler) { handlers.taskCancel = h; return this; }
@@ -59,6 +61,7 @@ jest.mock('@cmdctrl/daemon-sdk', () => ({
 
 const adapter = {
   onEvent: undefined as Handler | undefined,
+  onSlashCommands: undefined as Handler | undefined,
   startTask: jest.fn(),
   resumeTask: jest.fn(),
   cancelTask: jest.fn(),
@@ -77,8 +80,9 @@ const watcher = {
 
 jest.mock('../adapter/claude-cli', () => ({
   ClaudeAdapter: class {
-    constructor(onEvent: Handler) {
+    constructor(onEvent: Handler, onSlashCommands: Handler) {
       adapter.onEvent = onEvent;
+      adapter.onSlashCommands = onSlashCommands;
     }
     startTask(...args: unknown[]) { return adapter.startTask(...args); }
     resumeTask(...args: unknown[]) { return adapter.resumeTask(...args); }
@@ -110,6 +114,7 @@ jest.mock('../session-discovery', () => ({ discoverSessions: jest.fn() }));
 
 jest.mock('../handlers/context-handler', () => ({ extractSessionContext: jest.fn() }));
 
+import { rmSync } from 'fs';
 import { createDaemon } from './daemon';
 import { findSessionFile, readMessages } from '../message-reader';
 import { discoverSessions } from '../session-discovery';
@@ -130,6 +135,9 @@ function build() {
 beforeEach(() => {
   jest.clearAllMocks();
   sent.length = 0;
+  // The registry persists to the mocked config dir; a cache surviving from an
+  // earlier run would make the first record() a no-op and hide the report.
+  rmSync('/tmp/cmdctrl-claude-code-test/slash-commands.json', { force: true });
   watcher.reserveCompletionFire.mockReturnValue(true);
   adapter.getRunningTasks.mockReturnValue(['task-1']);
   jest.spyOn(console, 'log').mockImplementation(() => {});
@@ -386,6 +394,68 @@ describe('context requests', () => {
       status: 'stale',
       error: 'Session s1 not found',
     }));
+  });
+});
+
+describe('slash commands', () => {
+  const cases: Array<{ name: string; runs: Array<[string, string[]]>; reports: number; expected: unknown }> = [
+    {
+      name: 'reports the filtered set the first time a project is seen',
+      runs: [['/repo', ['compact', 'model', 'release-notes']]],
+      reports: 1,
+      expected: [{ project: '/repo', commands: [
+        { name: 'compact', description: 'Summarize the conversation to free up context' },
+        { name: 'release-notes' },
+      ] }],
+    },
+    {
+      name: 'stays quiet when a project reports the same set again',
+      runs: [['/repo', ['compact']], ['/repo', ['compact']]],
+      reports: 1,
+      expected: [{ project: '/repo', commands: [
+        { name: 'compact', description: 'Summarize the conversation to free up context' },
+      ] }],
+    },
+    {
+      name: 're-reports when a project gains a command',
+      runs: [['/repo', ['compact']], ['/repo', ['compact', 'deploy']]],
+      reports: 2,
+      expected: [{ project: '/repo', commands: [
+        { name: 'compact', description: 'Summarize the conversation to free up context' },
+        { name: 'deploy' },
+      ] }],
+    },
+    {
+      name: 'keeps one set per project',
+      runs: [['/repo-a', ['compact']], ['/repo-b', ['deploy']]],
+      reports: 2,
+      expected: [
+        { project: '/repo-a', commands: [
+          { name: 'compact', description: 'Summarize the conversation to free up context' },
+        ] },
+        { project: '/repo-b', commands: [{ name: 'deploy' }] },
+      ],
+    },
+    {
+      name: 'ignores a run that advertised nothing',
+      runs: [['/repo', []]],
+      reports: 0,
+      expected: undefined,
+    },
+  ];
+
+  test.each(cases)('$name', ({ runs, reports, expected }) => {
+    build();
+
+    for (const [project, commands] of runs) {
+      adapter.onSlashCommands!(project, commands);
+    }
+
+    const sentReports = sent.filter((m) => m.type === 'report_slash_commands');
+    expect(sentReports).toHaveLength(reports);
+    if (expected) {
+      expect(sentReports[sentReports.length - 1].sets).toEqual(expected);
+    }
   });
 });
 
