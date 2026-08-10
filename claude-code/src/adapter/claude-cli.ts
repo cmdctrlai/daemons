@@ -206,15 +206,23 @@ type EventCallback = (
   data: Record<string, unknown>
 ) => void;
 
+/**
+ * Called with the slash commands the CLI advertised for a run's working
+ * directory. Not an agent event – it describes the environment, not the task.
+ */
+type SlashCommandsCallback = (project: string, commands: string[]) => void;
+
 export class ClaudeAdapter {
   private running: Map<string, RunningTask> = new Map();
   private onEvent: EventCallback;
+  private onSlashCommands?: SlashCommandsCallback;
   // Serializes resumes per session: only one `claude --resume` runs at a time
   // for a given session id. See resumeTask.
   private resumeLock = new KeyedMutex();
 
-  constructor(onEvent: EventCallback) {
+  constructor(onEvent: EventCallback, onSlashCommands?: SlashCommandsCallback) {
     this.onEvent = onEvent;
+    this.onSlashCommands = onSlashCommands;
   }
 
   /**
@@ -628,6 +636,11 @@ export class ClaudeAdapter {
 
     switch (event.type) {
       case 'system':
+        // The CLI enumerates the project's slash commands on every init, which is
+        // the only place they can be learned without spending a turn on a probe.
+        if (event.subtype === 'init' && event.cwd && event.slash_commands?.length) {
+          this.onSlashCommands?.(event.cwd, event.slash_commands);
+        }
         if (event.subtype === 'init' && event.session_id) {
           rt.sessionId = event.session_id;
           console.log(`[${taskId}] Session initialized: ${event.session_id}`);

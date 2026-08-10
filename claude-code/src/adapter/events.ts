@@ -9,6 +9,13 @@ export interface StreamEvent {
   message?: MessageContent;
   result?: string;
   permission_denials?: PermissionDenial[];
+  /** Working directory the CLI resolved for the run. Present on `system`/`init`. */
+  cwd?: string;
+  /**
+   * Every slash command this CLI accepts for this working directory – built-ins
+   * plus the user's own skills and commands. Present on `system`/`init`.
+   */
+  slash_commands?: string[];
 }
 
 export interface MessageContent {

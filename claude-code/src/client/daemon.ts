@@ -10,12 +10,13 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { DaemonClient, isAutoUpdateSupported } from '@cmdctrl/daemon-sdk';
-import { CmdCtrlConfig, Credentials, deletePidFile } from '../config/config';
+import { CmdCtrlConfig, CONFIG_DIR, Credentials, deletePidFile } from '../config/config';
 import { ClaudeAdapter } from '../adapter/claude-cli';
 import { SessionWatcher, SessionEvent, CompletionEvent } from '../session-watcher';
 import { discoverSessions } from '../session-discovery';
 import { readMessages, findSessionFile } from '../message-reader';
 import { extractSessionContext } from '../handlers/context-handler';
+import { SlashCommandRegistry } from '../slash-commands';
 
 const PACKAGE_NAME = '@cmdctrl/claude-code';
 const BIN_NAME = 'cmdctrl-claude-code';
@@ -90,13 +91,23 @@ export function createDaemon(config: CmdCtrlConfig, credentials: Credentials): C
     },
   );
 
-  const adapter = new ClaudeAdapter((taskId, eventType, data) => {
-    watchSessionFromEvent(eventType, data.session_id as string | undefined);
-    client.sendEvent(taskId, eventType, data);
-    if (eventType === 'TASK_COMPLETE') {
-      fireBackupCompletion(data.session_id as string | undefined, data.result as string | undefined);
-    }
-  });
+  const slashCommands = new SlashCommandRegistry(join(CONFIG_DIR, 'slash-commands.json'));
+
+  const adapter = new ClaudeAdapter(
+    (taskId, eventType, data) => {
+      watchSessionFromEvent(eventType, data.session_id as string | undefined);
+      client.sendEvent(taskId, eventType, data);
+      if (eventType === 'TASK_COMPLETE') {
+        fireBackupCompletion(data.session_id as string | undefined, data.result as string | undefined);
+      }
+    },
+    (project, commands) => {
+      if (slashCommands.record(project, commands)) {
+        console.log(`[WS] Slash commands changed for ${project}, re-reporting`);
+        client.reportSlashCommands();
+      }
+    },
+  );
 
   /**
    * Watch a task's session file as soon as we learn its id, so agent output
@@ -149,6 +160,8 @@ export function createDaemon(config: CmdCtrlConfig, credentials: Credentials): C
   client.setRunningTasksProvider(() => adapter.getRunningTasks());
 
   client.setSessionsProvider(() => discoverSessions());
+
+  client.setSlashCommandsProvider(() => slashCommands.all());
 
   client.onTaskStart(async (task) => {
     console.log(`Starting task ${task.taskId}: ${task.instruction.substring(0, 50)}...`);
