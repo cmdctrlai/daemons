@@ -1,0 +1,199 @@
+name: Sync daemon versions
+
+# Trigger on push to main ONLY.
+#
+# DO NOT add a `pull_request` or `pull_request_target` trigger to this
+# workflow. This repo is public, so anyone can open a PR against it. A
+# fork-triggerable workflow that holds DAEMON_VERSION_CI_TOKEN would hand
+# that secret to whoever opens the PR (via `pull_request_target`) or would
+# run untrusted PR code with the secret in scope (via `pull_request` combined
+# with a secrets-bearing job). `push` to `main` only runs for commits that
+# already made it past review, which is the only time this token should be
+# usable at all.
+on:
+  push:
+    branches:
+      - main
+
+# Read-only checkout; no other permissions are needed.
+permissions:
+  contents: read
+
+# Serializes overlapping runs so two near-simultaneous pushes to main can't
+# race each other's PUTs to the same daemon-versions rows. This is a
+# belt-and-braces pairing with the server-side compare-and-set guard in
+# cmdctrl-api's UpsertDaemonVersionPolicyViaCI: this group stops two runs of
+# *this* workflow from ever executing at once, which is the common case,
+# while the CAS is the correctness backstop for what queuing can't reach -
+# e.g. a manual curl against the same endpoint, or another workflow/runner
+# hitting the same admin API concurrently. Queuing (not canceling) matters
+# here: a run that gets to the middle of syncing several agents shouldn't be
+# cut off mid-way, so the next push waits its turn instead of racing in.
+concurrency:
+  group: sync-daemon-versions
+  cancel-in-progress: false
+
+jobs:
+  sync-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the before/after diff below always has both ends
+          # available locally, regardless of how many commits this push
+          # contains.
+          fetch-depth: 0
+
+      - name: Update daemon-versions for changed agents
+        env:
+          DAEMON_VERSION_CI_TOKEN: ${{ secrets.DAEMON_VERSION_CI_TOKEN }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          # Real agent directories only - kept in lockstep with the AGENTS
+          # list in the private repo's sync-daemons.sh, minus "sdk" and
+          # "example" which are not agent types. Directories that exist in
+          # this repo but aren't real agent_types rows in the private DB
+          # (e.g. "mock", used for local testing, or an agent not yet synced)
+          # are deliberately left out rather than guessed at - an unknown
+          # directory is skipped, never treated as an agent type.
+          AGENT_DIRS=(
+            claude-code
+            aider
+            codex-cli
+            copilot-cli
+            cursor-cli
+            cursor-ide
+            gemini-cli
+            openclaw
+            opencode
+            pi
+            vscode-copilot
+          )
+
+          is_known_agent_dir() {
+            local dir="$1"
+            for known in "${AGENT_DIRS[@]}"; do
+              [[ "$dir" == "$known" ]] && return 0
+            done
+            return 1
+          }
+
+          # Every agent package.json, used whenever we can't trust a diff
+          # against BEFORE_SHA to tell us what actually changed.
+          all_pkgs() {
+            find . -mindepth 2 -maxdepth 2 -name package.json | sed 's|^\./||'
+          }
+
+          # A brand-new branch (or the repo's very first push) has an
+          # all-zero BEFORE_SHA with nothing to diff against locally - treat
+          # every agent package.json as changed rather than silently syncing
+          # nothing.
+          if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            changed_pkgs=$(all_pkgs)
+          elif ! changed_pkgs=$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA" -- '*/package.json'); then
+            # git diff itself failed - e.g. BEFORE_SHA is unreachable after a
+            # force-push or history rewrite - not "no differences" (which
+            # exits 0 with empty output). Treating a diff error as "nothing
+            # changed" would silently stop syncing every affected agent, so
+            # fall back to the same "sync everything" behavior as the
+            # all-zero-SHA case above rather than trusting a diff we know is
+            # unreliable.
+            echo "::warning::git diff between $BEFORE_SHA and $AFTER_SHA failed - syncing every agent package.json instead of guessing what changed."
+            changed_pkgs=$(all_pkgs)
+          fi
+
+          if [[ -z "$changed_pkgs" ]]; then
+            echo "No package.json changes in this push - nothing to sync."
+            exit 0
+          fi
+
+          failures=0
+          while IFS= read -r pkg_path; do
+            [[ -z "$pkg_path" ]] && continue
+            dir="${pkg_path%/package.json}"
+
+            if ! is_known_agent_dir "$dir"; then
+              echo "Skipping '$dir' - not a recognized agent directory."
+              continue
+            fi
+
+            if [[ ! -f "$pkg_path" ]]; then
+              echo "Skipping '$dir' - package.json no longer present at HEAD."
+              continue
+            fi
+
+            agent_type="${dir//-/_}"
+            version=$(jq -r '.version' "$pkg_path")
+
+            if [[ -z "$version" || "$version" == "null" ]]; then
+              echo "::error::$dir: could not read a version from $pkg_path"
+              failures=1
+              continue
+            fi
+
+            echo "Syncing $dir -> agent_type=$agent_type version=$version"
+
+            # Build the body with jq rather than bash string interpolation -
+            # a version containing a quote or backslash would otherwise
+            # break the JSON or inject keys.
+            body=$(jq -n --arg v "$version" '{recommendedVersion: $v, latestVersion: $v}')
+
+            # A transport failure (DNS, connection refused, etc.) makes curl
+            # itself exit nonzero before any HTTP status exists. Treat that
+            # the same as a bad status - one failed package, not a script
+            # abort - so the per-package failures tally below stays accurate
+            # instead of silently dropping the rest of the loop.
+            if ! http_status=$(curl -sS -o /tmp/daemon-version-response.txt -w '%{http_code}' \
+              -X PUT "https://api.cmd-ctrl.ai/api/admin/daemon-versions/${agent_type}" \
+              -H "Authorization: Bearer ${DAEMON_VERSION_CI_TOKEN}" \
+              -H 'Content-Type: application/json' \
+              -d "$body"); then
+              echo "::error::$dir: curl request failed before receiving an HTTP response (network/DNS error)"
+              failures=1
+              continue
+            fi
+
+            if [[ "$http_status" == "409" ]]; then
+              # The server rejected this write. An equal-version re-run is a
+              # no-op success on the server (never a 409), so every 409
+              # reaching this branch is a genuine regression against server
+              # state - either this package.json is behind the stored
+              # version, or another writer (a second run, a manual request)
+              # changed the row between the server's read and its write. A
+              # permanently-green check with only a warning here is exactly
+              # the silent staleness this workflow exists to prevent, so
+              # this now fails the job instead of continuing.
+              # grep exits non-zero when the body isn't a downgrade rejection
+              # (the concurrent-write-conflict case has no "lower than
+              # stored" text) - `|| true` keeps that from tripping `set -e`
+              # and aborting the whole run instead of just this package.
+              stored_version=$(grep -oE 'lower than stored [^: ]+' /tmp/daemon-version-response.txt | awk '{print $NF}' || true)
+              if [[ -n "$stored_version" ]]; then
+                echo "::error::$dir: agent_type=$agent_type stored version ($stored_version) is newer than what this push proposed ($version). Fix: bump $pkg_path to at least $stored_version (or newer), or re-sync the daemon source if $dir's real published version is actually ahead. Server response:"
+              else
+                echo "::error::$dir: agent_type=$agent_type rejected updating to $version - another writer changed the stored policy between the server's read and its write. Fix: re-run this workflow against current state. Server response:"
+              fi
+              cat /tmp/daemon-version-response.txt
+              failures=1
+              continue
+            fi
+
+            if [[ "$http_status" -lt 200 || "$http_status" -ge 300 ]]; then
+              # Body is safe to print - it's the API's response, never the
+              # request we sent (which is the only place the secret appears).
+              echo "::error::$dir: daemon-versions update failed with HTTP $http_status"
+              cat /tmp/daemon-version-response.txt
+              failures=1
+              continue
+            fi
+
+            echo "$dir: OK ($http_status)"
+          done <<< "$changed_pkgs"
+
+          if [[ "$failures" -ne 0 ]]; then
+            echo "::error::One or more daemon-versions updates failed - see above."
+            exit 1
+          fi
