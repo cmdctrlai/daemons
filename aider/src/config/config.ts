@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import { spawnDetached as sdkSpawnDetached } from '@cmdctrl/daemon-sdk';
 
 export interface CmdCtrlConfig {
@@ -19,6 +20,7 @@ const CONFIG_DIR = path.join(os.homedir(), '.cmdctrl-aider');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const CREDENTIALS_FILE = path.join(CONFIG_DIR, 'credentials');
 const PID_FILE = path.join(CONFIG_DIR, 'daemon.pid');
+const SESSION_SALT_FILE = path.join(CONFIG_DIR, 'session-salt');
 
 /**
  * Ensure the config directory exists with proper permissions
@@ -165,4 +167,26 @@ export function isDaemonRunning(): boolean {
   }
 }
 
-export { CONFIG_DIR, CONFIG_FILE, CREDENTIALS_FILE, PID_FILE };
+/**
+ * Read the persisted per-device salt used to derive discovered session IDs,
+ * creating it on first use. The salt keeps a session's native ID from being
+ * derivable from public inputs (history file path + start time) alone.
+ *
+ * It must never rotate: the same session is re-discovered from disk on every
+ * restart and must yield the same ID, so a changed salt would orphan every
+ * existing session.
+ */
+export function getSessionSalt(): string {
+  try {
+    const existing = fs.readFileSync(SESSION_SALT_FILE, 'utf-8').trim();
+    if (existing) return existing;
+  } catch {
+    // Not created yet – fall through and generate one.
+  }
+  ensureConfigDir();
+  const salt = crypto.randomBytes(32).toString('hex');
+  fs.writeFileSync(SESSION_SALT_FILE, salt, { mode: 0o600 });
+  return salt;
+}
+
+export { CONFIG_DIR, CONFIG_FILE, CREDENTIALS_FILE, PID_FILE, SESSION_SALT_FILE };

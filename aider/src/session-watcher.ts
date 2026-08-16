@@ -6,7 +6,7 @@
  */
 
 import * as fs from 'fs';
-import { parseHistoryFile, stableUuid } from './session-discovery';
+import { parseHistoryFile, stableUuid, sessionIdFor } from './session-discovery';
 
 const POLL_INTERVAL_MS = 500;
 const COMPLETION_DELAY_MS = 1500;
@@ -68,7 +68,7 @@ export class AiderSessionWatcher {
     try {
       const stat = fs.statSync(filePath);
       const allSessions = parseHistoryFile(filePath);
-      const session = allSessions.find(s => stableUuid(`aider:${filePath}:${s.startTime}`) === sessionId);
+      const session = allSessions.find(s => sessionIdFor(filePath, s.startTime) === sessionId);
       const existingCount = session?.messages.length ?? 0;
       const lastAgent = session?.messages.slice().reverse().find(m => m.role === 'agent');
 
@@ -138,7 +138,7 @@ export class AiderSessionWatcher {
     try {
       const sessions = parseHistoryFile(filePath);
       for (const s of sessions) {
-        if (stableUuid(`aider:${filePath}:${s.startTime}`) === sessionId) {
+        if (sessionIdFor(filePath, s.startTime) === sessionId) {
           return s.startTime;
         }
       }
