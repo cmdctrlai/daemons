@@ -13,7 +13,12 @@ import { AGENT_TYPE, DAEMON_VERSION, config } from '../context';
 import { startTask, resumeTask, cancelTask, registerSession } from '../agent';
 import { storeMessage, getMessages } from '../message-store';
 
-export async function start(): Promise<void> {
+interface StartOptions {
+  foreground?: boolean;
+  detach?: boolean;
+}
+
+export async function start(options: StartOptions = {}): Promise<void> {
   if (!config.isRegistered()) {
     console.error('Not registered. Run: cmdctrl-example register -s <server-url>');
     process.exit(1);
@@ -22,6 +27,13 @@ export async function start(): Promise<void> {
   if (config.isDaemonRunning()) {
     console.error('Daemon is already running.');
     process.exit(1);
+  }
+
+  if (options.detach) {
+    const { pid, logFile } = config.spawnDetached();
+    console.log(`Daemon started in background (pid ${pid}).`);
+    console.log(`Logs: ${logFile}`);
+    return;
   }
 
   const cfg = config.readConfig()!;

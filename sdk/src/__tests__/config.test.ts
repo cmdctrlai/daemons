@@ -1,7 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { ConfigManager, DaemonConfig, DaemonCredentials } from '../config';
+import { EventEmitter } from 'events';
+import { ConfigManager, DaemonConfig, DaemonCredentials, spawnDetached } from '../config';
+
+const mockSpawn = jest.fn();
+jest.mock('child_process', () => ({
+  spawn: (...args: unknown[]) => mockSpawn(...args),
+}));
 
 function makeTmpManager(): { manager: ConfigManager; cleanup: () => void } {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdk-config-test-'));
@@ -185,10 +191,12 @@ describe('ConfigManager', () => {
   });
 
   describe('isDaemonRunning', () => {
-    test('returns true for current process PID', () => {
+    test('returns true for another live PID', () => {
+      // Use the parent process – guaranteed to exist and guaranteed not to
+      // be `process.pid`, which is special-cased (see below).
       const { manager, cleanup } = makeTmpManager();
       try {
-        manager.writePidFile(process.pid);
+        manager.writePidFile(process.ppid);
         expect(manager.isDaemonRunning()).toBe(true);
       } finally {
         cleanup();
@@ -213,6 +221,144 @@ describe('ConfigManager', () => {
       try {
         expect(manager.isDaemonRunning()).toBe(false);
       } finally {
+        cleanup();
+      }
+    });
+
+    test('returns false when the pidfile names the calling process itself', () => {
+      // A detached child sees its own pid in the pidfile (the parent wrote
+      // it before exiting) – that must read as "not already running", or
+      // the child locks itself out on startup.
+      const { manager, cleanup } = makeTmpManager();
+      try {
+        manager.writePidFile(process.pid);
+        expect(manager.isDaemonRunning()).toBe(false);
+        // Unlike a stale pid, this is not cleaned up – it's a live pid,
+        // just the caller's own.
+        expect(manager.readPidFile()).toBe(process.pid);
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  describe('spawnDetached', () => {
+    function makeTmpDir(): { dir: string; cleanup: () => void } {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdk-detach-test-'));
+      return { dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+    }
+
+    function fakeChild(pid: number) {
+      const child = new EventEmitter() as EventEmitter & { pid: number; unref: jest.Mock };
+      child.pid = pid;
+      child.unref = jest.fn();
+      return child;
+    }
+
+    const argvCases = [
+      { name: 'strips -d', argv: ['node', 'index.js', 'start', '-d'], expectedArgs: ['start'] },
+      { name: 'strips --detach', argv: ['node', 'index.js', 'start', '--detach'], expectedArgs: ['start'] },
+      {
+        name: 'preserves other flags around the detach flag',
+        argv: ['node', 'index.js', 'start', '-d', '--foreground'],
+        expectedArgs: ['start', '--foreground'],
+      },
+      { name: 'no-op when detach flag absent', argv: ['node', 'index.js', 'start'], expectedArgs: ['start'] },
+    ];
+
+    test.each(argvCases)('$name', ({ argv, expectedArgs }) => {
+      const { dir, cleanup } = makeTmpDir();
+      const origArgv = process.argv;
+      try {
+        process.argv = argv;
+        mockSpawn.mockReturnValueOnce(fakeChild(42));
+
+        const pidFile = path.join(dir, 'daemon.pid');
+        const result = spawnDetached(dir, pidFile);
+
+        expect(mockSpawn).toHaveBeenCalledWith(
+          argv[0],
+          [argv[1], ...expectedArgs],
+          expect.objectContaining({ detached: true }),
+        );
+        expect(result.pid).toBe(42);
+        expect(result.logFile).toBe(path.join(dir, 'daemon.log'));
+      } finally {
+        process.argv = origArgv;
+        cleanup();
+      }
+    });
+
+    test('writes the child pid – not the parent – to the pidfile', () => {
+      const { dir, cleanup } = makeTmpDir();
+      const origArgv = process.argv;
+      try {
+        process.argv = ['node', 'index.js', 'start', '-d'];
+        mockSpawn.mockReturnValueOnce(fakeChild(999));
+
+        const pidFile = path.join(dir, 'daemon.pid');
+        spawnDetached(dir, pidFile);
+
+        expect(fs.readFileSync(pidFile, 'utf-8')).toBe('999');
+        expect(fs.readFileSync(pidFile, 'utf-8')).not.toBe(String(process.pid));
+      } finally {
+        process.argv = origArgv;
+        cleanup();
+      }
+    });
+
+    test('unrefs the child so the parent can exit', () => {
+      const { dir, cleanup } = makeTmpDir();
+      const origArgv = process.argv;
+      try {
+        process.argv = ['node', 'index.js', 'start', '-d'];
+        const child = fakeChild(1);
+        mockSpawn.mockReturnValueOnce(child);
+
+        spawnDetached(dir, path.join(dir, 'daemon.pid'));
+
+        expect(child.unref).toHaveBeenCalled();
+      } finally {
+        process.argv = origArgv;
+        cleanup();
+      }
+    });
+
+    test('creates configDir if missing', () => {
+      const { dir, cleanup } = makeTmpDir();
+      const origArgv = process.argv;
+      try {
+        process.argv = ['node', 'index.js', 'start', '-d'];
+        mockSpawn.mockReturnValueOnce(fakeChild(1));
+        const nested = path.join(dir, 'nested', 'config-dir');
+
+        spawnDetached(nested, path.join(nested, 'daemon.pid'));
+
+        expect(fs.existsSync(nested)).toBe(true);
+      } finally {
+        process.argv = origArgv;
+        cleanup();
+      }
+    });
+  });
+
+  describe('ConfigManager.spawnDetached', () => {
+    test('delegates to spawnDetached with its own configDir/pidFile', () => {
+      const { manager, cleanup } = makeTmpManager();
+      const origArgv = process.argv;
+      try {
+        process.argv = ['node', 'index.js', 'start', '-d'];
+        const child = new EventEmitter() as EventEmitter & { pid: number; unref: jest.Mock };
+        child.pid = 7;
+        child.unref = jest.fn();
+        mockSpawn.mockReturnValueOnce(child);
+
+        const result = manager.spawnDetached();
+
+        expect(result.pid).toBe(7);
+        expect(manager.readPidFile()).toBe(7);
+      } finally {
+        process.argv = origArgv;
         cleanup();
       }
     });

@@ -5,7 +5,12 @@ import { OpenCodeAdapter } from '../adapter/opencode';
 
 const configManager = new ConfigManager('opencode');
 
-export async function start(): Promise<void> {
+interface StartOptions {
+  foreground?: boolean;
+  detach?: boolean;
+}
+
+export async function start(options: StartOptions = {}): Promise<void> {
   if (!configManager.isRegistered()) {
     console.error('Device not registered. Run "cmdctrl-opencode register" first.');
     process.exit(1);
@@ -14,6 +19,13 @@ export async function start(): Promise<void> {
   if (configManager.isDaemonRunning()) {
     console.error('Daemon is already running. Run "cmdctrl-opencode stop" first.');
     process.exit(1);
+  }
+
+  if (options.detach) {
+    const { pid, logFile } = configManager.spawnDetached();
+    console.log(`Daemon started in background (pid ${pid}).`);
+    console.log(`Logs: ${logFile}`);
+    return;
   }
 
   const config = configManager.readConfig()!;

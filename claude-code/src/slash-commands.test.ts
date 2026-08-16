@@ -16,8 +16,16 @@ describe('filterSlashCommands', () => {
       expected: [{ name: 'rename', description: 'Rename this session', usage_hint: '<title>' }],
     },
     {
-      name: 'withholds the commands that do not survive a one-shot run',
+      name: 'withholds the commands whose setting does not survive a one-shot run',
       input: ['clear', 'model', 'color', 'effort', 'fast'],
+      expected: [],
+    },
+    {
+      name: 'withholds the commands the CLI answers as a local command',
+      input: [
+        'agents', 'autocompact', 'config', 'context', 'extra-usage', 'goal', 'heapdump',
+        'mcp', 'recap', 'reload-skills', 'usage', 'usage-credits', 'workflow-launch-exec',
+      ],
       expected: [],
     },
     {
@@ -27,10 +35,10 @@ describe('filterSlashCommands', () => {
     },
     {
       name: 'sorts alphabetically so menu order is stable',
-      input: ['zebra', 'context', 'alpha'],
+      input: ['zebra', 'insights', 'alpha'],
       expected: [
         { name: 'alpha' },
-        { name: 'context', description: 'Show context and token usage' },
+        { name: 'insights', description: 'Generate a usage insights report' },
         { name: 'zebra' },
       ],
     },

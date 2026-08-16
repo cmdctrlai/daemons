@@ -9,6 +9,7 @@ import {
   deletePidFile,
   isDaemonRunning,
   cursorDbExists,
+  spawnDetached,
 } from '../config/config';
 import { getCDPClient } from '../adapter/cdp-client';
 import { getCursorDB } from '../adapter/cursor-db';
@@ -17,6 +18,7 @@ import { getSessionWatcher } from '../session-watcher';
 
 interface StartOptions {
   foreground?: boolean;
+  detach?: boolean;
 }
 
 export async function start(options: StartOptions): Promise<void> {
@@ -38,6 +40,13 @@ export async function start(options: StartOptions): Promise<void> {
   if (isDaemonRunning()) {
     console.error('Daemon is already running. Run "cmdctrl-cursor-ide stop" first.');
     process.exit(1);
+  }
+
+  if (options.detach) {
+    const { pid, logFile } = spawnDetached();
+    console.log(`Daemon started in background (pid ${pid}).`);
+    console.log(`Logs: ${logFile}`);
+    return;
   }
 
   const config = readConfig()!;

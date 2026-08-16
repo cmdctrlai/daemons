@@ -20,7 +20,7 @@
  * ## Verified against CLI 2.1.222 (`claude -p "<cmd>" --output-format stream-json
  * --verbose --permission-mode acceptEdits`, the adapter's own invocation)
  *
- * Withheld:
+ * Withheld because the setting never survives the turn:
  *
  *   /clear     Forks a brand-new native session id instead of clearing the tracked
  *              one. The server's updateNativeSessionID only migrates sessions still
@@ -38,13 +38,31 @@
  *   _-prefixed Internal plumbing the CLI advertises but does not document
  *              (e.g. __remote-workflow).
  *
- * Verified working, and therefore offered: /compact (real compaction, session id
- * preserved), /rename (persists the CLI slug the app surfaces as cli_user_title),
- * /context, /mcp, /usage, /recap, /agents, /insights, /goal, /autocompact (writes
- * autoCompactWindow to settings.json), and explicit custom-skill invocation
- * (`/skill-name`), which dispatches as a genuine multi-turn agentic task – including
- * skills marked `disable-model-invocation`, since that flag only blocks autonomous
- * use, not explicit invocation.
+ * Withheld because the answer is written where no client can see it:
+ *
+ *   /agents /autocompact /config /context /extra-usage /goal /heapdump /mcp /recap
+ *   /reload-skills /usage /usage-credits /workflow-launch-exec
+ *
+ *              The CLI answers these itself rather than asking the model. It appends
+ *              one `{"type":"system","subtype":"local_command"}` entry holding
+ *              `<local-command-stdout>` and writes no assistant entry at all, and
+ *              SessionWatcher only reads user and assistant entries. The user gets
+ *              silence: no reply ever arrives, and when the target session is a live
+ *              background agent the adapter returns after SESSION_STARTED without a
+ *              TASK_COMPLETE, so the typing indicator never clears either. The output
+ *              is real and well formed – surfacing local_command entries as agent
+ *              messages would make this whole group work and is the way to bring them
+ *              back.
+ *
+ * Verified working, and therefore offered: /doctor, /verify, /import, /debug, /batch
+ * and /insights all dispatch to the model and stream assistant messages normally
+ * (/doctor and /verify are long agentic turns – minutes, not seconds, but they
+ * progress). /compact (real compaction, session id preserved) and /rename (persists
+ * the CLI slug the app surfaces as cli_user_title) were verified when this list was
+ * first built and were not re-run since. Explicit custom-skill invocation
+ * (`/skill-name`) dispatches as a genuine multi-turn agentic task – including skills
+ * marked `disable-model-invocation`, since that flag only blocks autonomous use, not
+ * explicit invocation.
  *
  * Anything the CLI adds in a future version flows through untouched. That is the
  * point of subtracting rather than listing: the user's own commands are the majority
@@ -56,7 +74,11 @@ import { dirname } from 'path';
 import { SlashCommandInfo, SlashCommandSet } from '@cmdctrl/daemon-sdk';
 
 /** Commands the CLI advertises that do not survive the one-shot daemon path. */
-const WITHHELD = new Set(['clear', 'model', 'color', 'effort', 'fast']);
+const WITHHELD = new Set([
+  'clear', 'model', 'color', 'effort', 'fast',
+  'agents', 'autocompact', 'config', 'context', 'extra-usage', 'goal', 'heapdump',
+  'mcp', 'recap', 'reload-skills', 'usage', 'usage-credits', 'workflow-launch-exec',
+]);
 
 /**
  * Descriptions for the built-ins worth explaining. Custom commands are offered by
@@ -65,15 +87,10 @@ const WITHHELD = new Set(['clear', 'model', 'color', 'effort', 'fast']);
  */
 const DESCRIPTIONS: Record<string, { description: string; usage_hint?: string }> = {
   compact: { description: 'Summarize the conversation to free up context' },
-  context: { description: 'Show context and token usage' },
   rename: { description: 'Rename this session', usage_hint: '<title>' },
-  mcp: { description: 'MCP server status', usage_hint: '[reconnect|enable|disable]' },
-  usage: { description: 'Show plan usage and limits' },
-  recap: { description: 'Recap the conversation so far' },
   insights: { description: 'Generate a usage insights report' },
-  goal: { description: 'Set a goal for the session', usage_hint: '<condition>' },
-  autocompact: { description: 'Set the auto-compact window', usage_hint: '<auto|tokens>' },
   init: { description: 'Create a CLAUDE.md for this project' },
+  doctor: { description: 'Check this install for configuration problems' },
 };
 
 /**

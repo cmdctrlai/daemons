@@ -29,7 +29,7 @@ program
 program
   .command('register')
   .description('Register this device with a CmdCtrl server')
-  .option('-s, --server <url>', 'CmdCtrl server URL', 'http://localhost:4000')
+  .option('-s, --server <url>', 'CmdCtrl server URL', 'https://api.cmd-ctrl.ai')
   .option('-n, --name <name>', 'Device name (defaults to hostname-copilot)')
   .action(register);
 
@@ -41,7 +41,8 @@ program
 program
   .command('start')
   .description('Start the daemon and connect to the CmdCtrl server')
-  .option('-f, --foreground', 'Run in foreground (don\'t daemonize)')
+  .option('-f, --foreground', 'Run in foreground (default)')
+  .option('-d, --detach', 'Run detached from the terminal')
   .action(start);
 
 program

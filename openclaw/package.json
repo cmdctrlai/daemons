@@ -1,7 +1,7 @@
 {
   "name": "@cmdctrl/openclaw",
-  "version": "0.1.2",
-  "description": "CmdCtrl daemon for OpenClaw – connects your workstation to the CmdCtrl orchestration server",
+  "version": "0.2.0",
+  "description": "CmdCtrl daemon for OpenClaw \u2013 connects your workstation to the CmdCtrl orchestration server",
   "main": "./dist/index.js",
   "bin": {
     "cmdctrl-openclaw": "dist/index.js"
@@ -24,7 +24,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "^1.2.0",
+    "@cmdctrl/daemon-sdk": "^1.4.0",
     "commander": "^12.1.0",
     "ws": "^8.18.0"
   },
