@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/example-daemon",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Minimal CmdCtrl daemon reference implementation built on @cmdctrl/daemon-sdk - use as a starting point for custom daemons",
   "main": "./dist/index.js",
   "bin": {
@@ -10,7 +10,8 @@
     "build": "tsc",
     "dev": "ts-node src/index.ts",
     "start": "node dist/index.js",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build && node -e \"const p=require('./package.json');const c=require('./dist/context.js');if(c.DAEMON_VERSION!==p.version){console.error('ERROR: DAEMON_VERSION '+c.DAEMON_VERSION+' does not match package.json '+p.version+'. A daemon that under-reports its version makes the server push updates it can never satisfy.');process.exit(1)}\""
   },
   "keywords": [
     "cmdctrl",
@@ -22,13 +23,13 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "^1.0.6",
+    "@cmdctrl/daemon-sdk": "^1.4.0",
     "commander": "^12.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "typescript": "^5.7.2",
-    "ts-node": "^10.9.2"
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
   },
   "engines": {
     "node": ">=18.0.0"

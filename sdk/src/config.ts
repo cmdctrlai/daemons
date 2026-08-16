@@ -10,6 +10,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { spawn } from 'child_process';
 
 export interface DaemonConfig {
   serverUrl: string;
@@ -21,6 +22,41 @@ export interface DaemonCredentials {
   refreshToken: string;
   accessToken?: string;
   expiresAt?: number;
+}
+
+export interface DetachResult {
+  pid: number;
+  logFile: string;
+}
+
+/**
+ * Re-launches the current process detached from the controlling terminal.
+ * The parent is expected to print the result and exit; the child inherits
+ * argv/env (with -d/--detach stripped, so it takes the default foreground
+ * path) and gets its own session via `detached: true` + `unref()`.
+ *
+ * stdout/stderr are redirected to a log file – a detached child that
+ * inherits a closed stdout can die on its first write.
+ */
+export function spawnDetached(configDir: string, pidFile: string): DetachResult {
+  if (!fs.existsSync(configDir)) {
+    fs.mkdirSync(configDir, { mode: 0o700, recursive: true });
+  }
+  const logFile = path.join(configDir, 'daemon.log');
+  const logFd = fs.openSync(logFile, 'a');
+
+  const args = process.argv.slice(2).filter((a) => a !== '-d' && a !== '--detach');
+  const child = spawn(process.argv[0], [process.argv[1], ...args], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+  });
+  fs.closeSync(logFd);
+  child.unref();
+
+  // The pidfile must describe the child – stop/status read it, and the
+  // parent is about to exit.
+  fs.writeFileSync(pidFile, String(child.pid), { mode: 0o600 });
+  return { pid: child.pid!, logFile };
 }
 
 /**
@@ -100,6 +136,11 @@ export class ConfigManager {
     fs.writeFileSync(this.pidFile, pid.toString(), { mode: 0o600 });
   }
 
+  /** Relaunch the current process detached; see `spawnDetached()`. */
+  spawnDetached(): DetachResult {
+    return spawnDetached(this.configDir, this.pidFile);
+  }
+
   readPidFile(): number | null {
     try {
       return parseInt(fs.readFileSync(this.pidFile, 'utf-8'), 10);
@@ -115,6 +156,9 @@ export class ConfigManager {
   isDaemonRunning(): boolean {
     const pid = this.readPidFile();
     if (pid === null) return false;
+    // A detached child sees its own pid in the pidfile (the parent wrote it
+    // before exiting) – that's this process starting up, not another instance.
+    if (pid === process.pid) return false;
     try {
       process.kill(pid, 0);
       return true;

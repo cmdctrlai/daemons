@@ -3,12 +3,14 @@ import {
   readCredentials,
   isRegistered,
   writePidFile,
-  isDaemonRunning
+  isDaemonRunning,
+  spawnDetached
 } from '../config/config';
 import { createDaemon } from '../client/daemon';
 
 interface StartOptions {
   foreground?: boolean;
+  detach?: boolean;
 }
 
 /**
@@ -25,6 +27,13 @@ export async function start(options: StartOptions): Promise<void> {
   if (isDaemonRunning()) {
     console.error('Daemon is already running. Run "cmdctrl-claude-code stop" first.');
     process.exit(1);
+  }
+
+  if (options.detach) {
+    const { pid, logFile } = spawnDetached();
+    console.log(`Daemon started in background (pid ${pid}).`);
+    console.log(`Logs: ${logFile}`);
+    return;
   }
 
   const config = readConfig()!;

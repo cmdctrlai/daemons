@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/pi",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "CmdCtrl daemon for the pi coding agent (@mariozechner/pi-coding-agent)",
   "main": "./dist/index.js",
   "bin": {
@@ -11,7 +11,7 @@
     "dev": "ts-node src/index.ts",
     "start": "node dist/index.js",
     "clean": "rm -rf dist",
-    "prepublishOnly": "node -e \"const p=require(\\\"./package.json\\\"); const bad=Object.entries(p.dependencies||{}).filter(([,v])=>v.startsWith(\\\"file:\\\")); if(bad.length){console.error(\\\"ERROR: file: dependencies are not allowed in published packages:\\\",bad.map(([k,v])=>k+\\\"=\\\"+v).join(\\\", \\\")); process.exit(1)}\""
+    "prepublishOnly": "npm run build && node -e \"const p=require('./package.json');const c=require('./dist/context.js');if(c.DAEMON_VERSION!==p.version){console.error('ERROR: DAEMON_VERSION '+c.DAEMON_VERSION+' does not match package.json '+p.version+'. A daemon that under-reports its version makes the server push updates it can never satisfy.');process.exit(1)}\" && node -e \"const p=require(\\\"./package.json\\\"); const bad=Object.entries(p.dependencies||{}).filter(([,v])=>v.startsWith(\\\"file:\\\")); if(bad.length){console.error(\\\"ERROR: file: dependencies are not allowed in published packages:\\\",bad.map(([k,v])=>k+\\\"=\\\"+v).join(\\\", \\\")); process.exit(1)}\""
   },
   "keywords": [
     "cmdctrl",
@@ -23,7 +23,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "^1.2.0",
+    "@cmdctrl/daemon-sdk": "^1.4.0",
     "@mariozechner/pi-coding-agent": "~0.67.0",
     "commander": "^12.1.0"
   },

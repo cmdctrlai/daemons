@@ -4,7 +4,7 @@
  * CmdCtrl daemon for the pi coding agent (@mariozechner/pi-coding-agent).
  *
  * Usage:
- *   cmdctrl-pi register -s http://localhost:4000
+ *   cmdctrl-pi register
  *   cmdctrl-pi start
  *   cmdctrl-pi status
  *   cmdctrl-pi stop
@@ -29,13 +29,15 @@ program
 program
   .command('register')
   .description('Register this device with a CmdCtrl server')
-  .option('-s, --server <url>', 'CmdCtrl server URL', 'http://localhost:4000')
+  .option('-s, --server <url>', 'CmdCtrl server URL', 'https://api.cmd-ctrl.ai')
   .option('-n, --name <name>', 'Device name (defaults to hostname)')
   .action(register);
 
 program
   .command('start')
   .description('Start the daemon and connect to the CmdCtrl server')
+  .option('-f, --foreground', 'Run in foreground (default)')
+  .option('-d, --detach', 'Run detached from the terminal')
   .action(start);
 
 program

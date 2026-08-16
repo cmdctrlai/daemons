@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { spawnDetached as sdkSpawnDetached } from '@cmdctrl/daemon-sdk';
 
 export interface CmdCtrlConfig {
   serverUrl: string;
@@ -165,6 +166,11 @@ export function isDaemonRunning(): boolean {
   if (pid === null) {
     return false;
   }
+  // A detached child sees its own pid in the pidfile (the parent wrote it
+  // before exiting) – that's this process starting up, not another instance.
+  if (pid === process.pid) {
+    return false;
+  }
   try {
     // Signal 0 doesn't kill, just checks if process exists
     process.kill(pid, 0);
@@ -174,6 +180,13 @@ export function isDaemonRunning(): boolean {
     deletePidFile();
     return false;
   }
+}
+
+/**
+ * Relaunch this process detached, writing the child's pid to PID_FILE.
+ */
+export function spawnDetached() {
+  return sdkSpawnDetached(CONFIG_DIR, PID_FILE);
 }
 
 /**
