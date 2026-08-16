@@ -27,8 +27,8 @@ export type {
 } from './client';
 
 // Config
-export { ConfigManager } from './config';
-export type { DaemonConfig, DaemonCredentials } from './config';
+export { ConfigManager, spawnDetached } from './config';
+export type { DaemonConfig, DaemonCredentials, DetachResult } from './config';
 
 // Registration
 export { registerDevice, unregisterDevice, requestDeviceCode, pollForToken } from './register';

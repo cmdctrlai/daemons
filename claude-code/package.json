@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/claude-code",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "CmdCtrl daemon for Claude Code - connects your workstation to the CmdCtrl orchestration server",
   "main": "./dist/index.js",
   "bin": {
@@ -25,7 +25,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "^1.3.0",
+    "@cmdctrl/daemon-sdk": "^1.4.0",
     "commander": "^12.1.0"
   },
   "devDependencies": {

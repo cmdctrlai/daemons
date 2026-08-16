@@ -47,6 +47,10 @@ export function writePidFile(pid: number): void {
   manager.writePidFile(pid);
 }
 
+export function spawnDetached() {
+  return manager.spawnDetached();
+}
+
 export function readPidFile(): number | null {
   return manager.readPidFile();
 }
