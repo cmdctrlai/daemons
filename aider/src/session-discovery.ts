@@ -18,6 +18,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { SessionInfo } from '@cmdctrl/daemon-sdk';
+import { getSessionSalt } from './config/config';
 
 const ACTIVE_THRESHOLD_MS = 30 * 1000;
 const MAX_SCAN_DEPTH = 3;
@@ -56,11 +57,24 @@ export function stableUuid(input: string): string {
   ].join('-');
 }
 
+// The salt is stable for the life of the device, so read it once and reuse it
+// rather than touching disk on every derivation.
+let cachedSalt: string | null = null;
+
+function sessionSalt(): string {
+  if (cachedSalt === null) cachedSalt = getSessionSalt();
+  return cachedSalt;
+}
+
 /**
  * Generate a session ID from file path and start time.
+ *
+ * Salted with a per-device secret so the ID cannot be brute-forced from the
+ * public (path, startTime) pair. This is the single derivation point – every
+ * session-ID computation in the daemon must route through here.
  */
-function sessionIdFor(filePath: string, startTime: string): string {
-  return stableUuid(`aider:${filePath}:${startTime}`);
+export function sessionIdFor(filePath: string, startTime: string): string {
+  return stableUuid(`${sessionSalt()}:aider:${filePath}:${startTime}`);
 }
 
 /**
