@@ -1,7 +1,8 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { DaemonClient, ConfigManager } from '@cmdctrl/daemon-sdk';
-import { OpenCodeAdapter } from '../adapter/opencode';
+import { OpenCodeAdapter, type OpenCodeCommand } from '../adapter/opencode';
+import { SlashCommandRegistry } from '../slash-commands';
 
 const configManager = new ConfigManager('opencode');
 
@@ -55,8 +56,47 @@ export async function start(options: StartOptions = {}): Promise<void> {
 
   configManager.writePidFile(process.pid);
 
+  const slashCommands = new SlashCommandRegistry(join(configManager.configDir, 'slash-commands.json'));
+
   // Session IDs started via task_start – excluded from native session discovery
   const managedSessionIds = new Set<string>();
+
+  // opencode resolves commands per directory: the global built-ins and user
+  // skills merged with whatever that project defines. A session only ever sees
+  // its own project's set, so ask opencode once per distinct session directory
+  // and record each set under that project – the API looks the set up by the
+  // session's project. Resolving only the server's own directory would key every
+  // command under wherever the daemon happens to run and match no session.
+  // Cheap and non-fatal – the daemon runs fine without a composer menu.
+  async function refreshSlashCommands(): Promise<boolean> {
+    try {
+      const projects = new Set<string>();
+      for (const session of adapter.listSessions(managedSessionIds)) {
+        if (session.project) projects.add(session.project);
+      }
+      // The server's own directory covers a daemon with no sessions discovered yet.
+      projects.add(await adapter.getProjectDirectory());
+
+      let changed = false;
+      const known = new Map<string, OpenCodeCommand>();
+      for (const project of projects) {
+        if (!project) continue;
+        const commands = await adapter.listCommands(project);
+        for (const command of commands) known.set(command.name, command);
+        if (slashCommands.record(project, commands)) changed = true;
+      }
+      // Every project's commands, so a leading-slash message from any session
+      // routes to /command and any project's expansion can be recognised again.
+      adapter.setCommands([...known.values()]);
+      return changed;
+    } catch (err) {
+      console.warn('Could not enumerate opencode slash commands:', (err as Error).message);
+      return false;
+    }
+  }
+
+  // Learn the sets before connecting; the SDK reports them on connect via the provider.
+  await refreshSlashCommands();
 
   // Track watched sessions: sessionId -> last known message count
   const watchedMessageCounts = new Map<string, number>();
@@ -82,6 +122,8 @@ export async function start(options: StartOptions = {}): Promise<void> {
   });
 
   client.setSessionsProvider(() => adapter.listSessions(managedSessionIds));
+
+  client.setSlashCommandsProvider(() => slashCommands.all());
 
   client.onWatchSession(async (sessionId) => {
     try {
@@ -133,6 +175,9 @@ export async function start(options: StartOptions = {}): Promise<void> {
     } catch (err: unknown) {
       task.error(err instanceof Error ? err.message : 'Unknown error');
     }
+    // A skill the user added since startup shows up here; re-report if so. Kept
+    // out of the task's try so a report failure can't error a completed task.
+    if (await refreshSlashCommands()) client.reportSlashCommands();
   });
 
   client.onTaskResume(async (task) => {
