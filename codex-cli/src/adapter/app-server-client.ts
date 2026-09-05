@@ -1,15 +1,21 @@
 /**
  * AppServerClient
  *
- * Owns a long-lived `codex app-server` child process and speaks JSON-RPC 2.0
- * over JSONL stdio. Responsibilities:
- *   - spawn and supervise the child (auto-restart with backoff)
- *   - do the initialize / initialized handshake
+ * Owns one `codex app-server` child process and speaks JSON-RPC 2.0 over JSONL
+ * stdio. Responsibilities:
+ *   - spawn the child and do the initialize / initialized handshake
  *   - correlate outgoing requests with incoming responses
  *   - dispatch server notifications to subscribed handlers
+ *   - report an unexpected child exit so the caller can fail its work
+ *
+ * The child's lifetime is the caller's to choose, and it is load-bearing rather
+ * than an implementation detail: codex ties a thread's writer lock to the
+ * app-server process that resumed it (~/.codex/thread-writer-locks/<id>.lock),
+ * and nothing in the protocol hands that lock back. Exiting the process is the
+ * only release, so a caller that wants a thread freed has to stop() its client.
  *
  * Intentionally agnostic about thread/turn semantics – that lives in
- * AppServerAdapter.
+ * CodexAdapter.
  */
 
 import { spawn, execFileSync, ChildProcess } from 'child_process';
@@ -31,7 +37,38 @@ import {
 } from './protocol-types';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min – long enough for turn/start
-const RESTART_BACKOFF_MS = [500, 1000, 2000, 5000, 10000];
+
+/** Per escalation step in stop(); codex exits on stdin EOF in about 500ms. */
+const STOP_GRACE_MS = 2000;
+
+/** True if the promise settled in time, false if the wait ran out. */
+async function settledWithin(p: Promise<void>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([p.then(() => true), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * A JSON-RPC error response, kept structured so callers can match on the
+ * server's own message instead of re-parsing a flattened string.
+ */
+export class AppServerError extends Error {
+  constructor(
+    readonly method: string,
+    readonly code: number,
+    readonly serverMessage: string
+  ) {
+    super(`${method}: ${code} ${serverMessage}`);
+    this.name = 'AppServerError';
+  }
+}
 
 /**
  * Where a codex binary might live, in preference order.
@@ -125,11 +162,11 @@ export type NotificationHandler = (params: unknown) => void;
 export interface AppServerClientOptions {
   clientName?: string;
   clientVersion?: string;
-  /** Invoked after a successful (re)connect and handshake. Used by the adapter
-   * to re-subscribe to live threads. */
-  onReady?: () => void | Promise<void>;
-  /** Invoked when the child process exits and cannot be restarted. */
-  onFatal?: (err: Error) => void;
+  /**
+   * Invoked when the child exits without stop() having been called. The thread
+   * this client held is gone with it, so the caller's work cannot continue.
+   */
+  onExit?: (err: Error) => void;
 }
 
 export class AppServerClient extends EventEmitter {
@@ -139,7 +176,6 @@ export class AppServerClient extends EventEmitter {
   private notificationHandlers = new Map<string, Set<NotificationHandler>>();
   private ready = false;
   private stopped = false;
-  private restartAttempt = 0;
   private initializePromise: Promise<InitializeResponse> | null = null;
 
   constructor(private options: AppServerClientOptions = {}) {
@@ -153,15 +189,41 @@ export class AppServerClient extends EventEmitter {
     return this.initializePromise;
   }
 
-  /** Stop the child. After this, start() cannot be called again. */
+  /**
+   * Stop the child, releasing the writer lock on any thread it holds. Safe to
+   * call more than once. After this, start() cannot be called again.
+   *
+   * Resolves only once the process is actually gone, because "released" is a
+   * claim about the kernel having dropped the lock descriptor, not about a
+   * signal having been sent. Closing stdin first is what codex itself treats as
+   * a shutdown -- it exits on EOF within about half a second -- and SIGTERM
+   * then SIGKILL cover a child that is wedged rather than listening.
+   */
   async stop(): Promise<void> {
     this.stopped = true;
     this.ready = false;
     const proc = this.proc;
     this.proc = null;
     this.failAllPending(new Error('AppServerClient stopped'));
-    if (proc) {
-      proc.kill('SIGTERM');
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+
+    const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
+
+    try {
+      proc.stdin?.end();
+    } catch {
+      // Already closed; the signals below still apply.
+    }
+    proc.kill('SIGTERM');
+
+    if (await settledWithin(exited, STOP_GRACE_MS)) return;
+
+    console.warn('[AppServer] Child ignored SIGTERM, sending SIGKILL');
+    proc.kill('SIGKILL');
+    if (!(await settledWithin(exited, STOP_GRACE_MS))) {
+      console.error(
+        '[AppServer] Child survived SIGKILL; a thread writer lock may still be held'
+      );
     }
   }
 
@@ -316,17 +378,9 @@ export class AppServerClient extends EventEmitter {
     this.proc!.stdin!.write(JSON.stringify(initNotif) + '\n');
 
     this.ready = true;
-    this.restartAttempt = 0;
     console.log(
       `[AppServer] Ready: ${result.userAgent} (${result.platformOs})`
     );
-
-    // Fire onReady – the adapter uses this to re-subscribe live threads.
-    try {
-      await this.options.onReady?.();
-    } catch (err) {
-      console.error('[AppServer] onReady handler threw:', err);
-    }
 
     return result;
   }
@@ -352,7 +406,7 @@ export class AppServerClient extends EventEmitter {
       if (isError(msg)) {
         const err = msg as JsonRpcErrorResponse;
         pending.reject(
-          new Error(`${pending.method}: ${err.error.code} ${err.error.message}`)
+          new AppServerError(pending.method, err.error.code, err.error.message)
         );
       } else {
         pending.resolve(msg.result);
@@ -378,27 +432,16 @@ export class AppServerClient extends EventEmitter {
   }
 
   private handleChildExit(err: Error): void {
+    const wasRunning = this.proc !== null;
     this.ready = false;
     this.proc = null;
     this.failAllPending(err);
     this.initializePromise = null;
-    if (this.stopped) return;
-
-    const delay =
-      RESTART_BACKOFF_MS[
-        Math.min(this.restartAttempt, RESTART_BACKOFF_MS.length - 1)
-      ];
-    this.restartAttempt++;
-    console.log(
-      `[AppServer] Restarting in ${delay}ms (attempt ${this.restartAttempt})`
-    );
-    setTimeout(() => {
-      if (this.stopped) return;
-      this.spawnAndInitialize().catch((e) => {
-        console.error('[AppServer] Restart failed:', e);
-        this.options.onFatal?.(e instanceof Error ? e : new Error(String(e)));
-      });
-    }, delay);
+    // A stopped client exiting is the point of stop(); only an exit we did not
+    // ask for is news. Restarting here would be pointless: the child took the
+    // thread's writer lock and its history with it, so the turn cannot resume.
+    if (this.stopped || !wasRunning) return;
+    this.options.onExit?.(err);
   }
 
   private failAllPending(err: Error): void {

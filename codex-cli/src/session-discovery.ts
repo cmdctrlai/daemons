@@ -4,21 +4,19 @@
  * Scans ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl files to discover
  * existing Codex CLI sessions and report them to the CmdCtrl server.
  *
- * Codex stores sessions as JSONL files where each line is a JSON object:
- *   { timestamp, type, payload }
- *
- * Key line types:
- *   session_meta  - payload.id (session ID), payload.cwd (project path)
- *   event_msg     - payload.type: "user_message" | "agent_message" | "task_complete" | ...
- *   response_item - payload.role: "user" | "assistant" | "developer"
+ * Line-level parsing lives in session-parser.ts, shared with the live watcher.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
+import { ParsedRollout, parseRollout } from './session-parser';
 
 const ACTIVE_THRESHOLD_MS = 30 * 1000; // 30 seconds
+
+/** Codex relocates its whole state directory with CODEX_HOME; follow it. */
+const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 
 export interface ExternalSession {
   session_id: string;
@@ -33,93 +31,32 @@ export interface ExternalSession {
   message_count: number;
 }
 
-interface ParsedMessage {
-  id: string;
-  timestamp: string;
-  role: 'user' | 'agent';
-  content: string;
-}
-
-interface ParsedSession {
-  sessionId: string;
-  project: string;
-  projectName: string;
-  startTime: string;
-  lastUpdated: string;
-  messages: ParsedMessage[];
-}
-
 // Cache: session file path → { session, fileMtime }
 const sessionCache = new Map<string, { session: ExternalSession; fileMtime: number }>();
 
 // Parsed message cache: file path → { messages, fileMtime }
-const messageCache = new Map<string, { parsed: ParsedSession; fileMtime: number }>();
+const messageCache = new Map<string, { parsed: ParsedRollout; fileMtime: number }>();
 
 /**
- * Parse a Codex CLI JSONL session file into structured data.
+ * Read and parse a Codex CLI JSONL session file.
+ * Returns null for files with no session ID or no messages – nothing to report.
  */
-function parseSessionFile(filePath: string): ParsedSession | null {
+function parseSessionFile(filePath: string): ParsedRollout | null {
+  let raw: string;
   try {
-    const raw = fs.readFileSync(filePath, 'utf-8');
-    const lines = raw.trim().split('\n');
-    if (lines.length === 0) return null;
-
-    let sessionId = '';
-    let project = '';
-    let projectName = '';
-    let startTime = '';
-    let lastUpdated = '';
-    const messages: ParsedMessage[] = [];
-    let messageIndex = 0;
-
-    for (const line of lines) {
-      let obj: { timestamp: string; type: string; payload: Record<string, unknown> };
-      try {
-        obj = JSON.parse(line);
-      } catch {
-        continue;
-      }
-
-      lastUpdated = obj.timestamp || lastUpdated;
-
-      if (obj.type === 'session_meta') {
-        sessionId = (obj.payload.id as string) || '';
-        project = (obj.payload.cwd as string) || '';
-        startTime = (obj.payload.timestamp as string) || obj.timestamp;
-        // Derive project name from the last directory component
-        if (project) {
-          projectName = path.basename(project);
-        }
-      } else if (obj.type === 'event_msg') {
-        const eventType = obj.payload.type as string;
-        if (eventType === 'user_message') {
-          messages.push({
-            id: `user-${messageIndex++}`,
-            timestamp: obj.timestamp,
-            role: 'user',
-            content: (obj.payload.message as string) || '',
-          });
-        } else if (eventType === 'agent_message') {
-          messages.push({
-            id: `agent-${messageIndex++}`,
-            timestamp: obj.timestamp,
-            role: 'agent',
-            content: (obj.payload.message as string) || '',
-          });
-        }
-      }
-    }
-
-    if (!sessionId || messages.length === 0) return null;
-
-    return { sessionId, project, projectName, startTime, lastUpdated, messages };
-  } catch {
+    raw = fs.readFileSync(filePath, 'utf-8');
+  } catch (err) {
+    console.warn(`[CodexDiscovery] Failed to read ${filePath}:`, err);
     return null;
   }
+
+  const parsed = parseRollout(raw, filePath);
+  if (!parsed.sessionId || parsed.messages.length === 0) return null;
+  return parsed;
 }
 
 /**
- * Generate a title from the first user message (first line, truncated).
+ * Generate a title from a message's first line, truncated.
  */
 function generateTitle(text: string): string {
   if (!text) return '';
@@ -138,7 +75,7 @@ function generateTitle(text: string): string {
  * session metadata for reporting to the CmdCtrl server.
  */
 export function discoverSessions(excludeSessionIDs: Set<string> = new Set()): ExternalSession[] {
-  const sessionsDir = path.join(os.homedir(), '.codex', 'sessions');
+  const sessionsDir = path.join(CODEX_HOME, 'sessions');
   const sessions: ExternalSession[] = [];
 
   if (!fs.existsSync(sessionsDir)) return sessions;
@@ -166,10 +103,12 @@ export function discoverSessions(excludeSessionIDs: Set<string> = new Set()): Ex
       const parsed = parseSessionFile(filePath);
       if (!parsed) continue;
 
-      const firstUserMsg = parsed.messages.find(m => m.role === 'user');
+      // Subagent rollouts have no user turn, so fall back to the opening agent message.
+      const firstMsg =
+        parsed.messages.find(m => m.role === 'user' && m.content) || parsed.messages.find(m => m.content);
       const lastUserMsg = [...parsed.messages].reverse().find(m => m.role === 'user');
 
-      const title = generateTitle(firstUserMsg?.content || '') || parsed.sessionId.slice(0, 8);
+      const title = generateTitle(firstMsg?.content || '') || parsed.sessionId.slice(0, 8);
       const lastMessage = lastUserMsg
         ? (lastUserMsg.content.length > 100 ? lastUserMsg.content.slice(0, 100) + '...' : lastUserMsg.content)
         : '';
@@ -248,7 +187,7 @@ export function findSessionFile(sessionId: string): string | null {
   }
 
   // Scan filesystem
-  const sessionsDir = path.join(os.homedir(), '.codex', 'sessions');
+  const sessionsDir = path.join(CODEX_HOME, 'sessions');
   if (!fs.existsSync(sessionsDir)) return null;
 
   // Session ID appears in the filename: rollout-...-<session_id>.jsonl
@@ -299,7 +238,7 @@ export function readSessionMessages(
     const fileMtime = stat.mtimeMs;
 
     // Check parsed message cache
-    let parsed: ParsedSession | null = null;
+    let parsed: ParsedRollout | null = null;
     const cached = messageCache.get(filePath);
     if (cached && cached.fileMtime === fileMtime) {
       parsed = cached.parsed;

@@ -2,8 +2,10 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { DaemonClient, ConfigManager } from '@cmdctrl/daemon-sdk';
 import { CodexAdapter } from '../adapter/codex-cli';
-import { discoverSessions, readSessionMessages } from '../session-discovery';
+import { discoverSessions, findSessionFile, readSessionMessages } from '../session-discovery';
 import { CodexSessionWatcher } from '../session-watcher';
+import { forceQuitLockHolder, isThreadId } from '../adapter/thread-lock';
+import { releaseLocalState } from '../lifecycle';
 
 const configManager = new ConfigManager('codex-cli');
 
@@ -87,6 +89,14 @@ export async function start(options: StartOptions = {}): Promise<void> {
     sendEvent(taskId, eventType, data);
   }, daemonVersion);
 
+  // Shutdown and auto-update both make way for another process, so both run
+  // this – an update that skipped it would leak every thread's writer lock.
+  const localState = {
+    unwatchAll: () => sessionWatcher.unwatchAll(),
+    stopAll: () => adapter.stopAll(),
+    deletePidFile: () => configManager.deletePidFile(),
+  };
+
   const client = new DaemonClient({
     serverUrl: config.serverUrl,
     deviceId: config.deviceId,
@@ -97,14 +107,16 @@ export async function start(options: StartOptions = {}): Promise<void> {
     autoUpdateConfig: {
       packageName: '@cmdctrl/codex-cli',
       binName: 'cmdctrl-codex-cli',
-      onBeforeUpdate: () => {
-        sessionWatcher.unwatchAll();
-        configManager.deletePidFile();
-      },
+      onBeforeUpdate: () => releaseLocalState(localState),
     },
   });
 
   client.setSessionsProvider(() => discoverSessions(managedSessionIds));
+
+  // The adapter owns task lifetime, so it is the only thing that knows when an
+  // update may interrupt. Without this the SDK's own set never drains and the
+  // update -- and the thread release that goes with it -- is deferred forever.
+  client.setRunningTasksProvider(() => adapter.getRunningTasks());
 
   sendEvent = (taskId, eventType, data) => {
     client.sendEvent(taskId, eventType, data);
@@ -142,14 +154,52 @@ export async function start(options: StartOptions = {}): Promise<void> {
     return readSessionMessages(req.sessionId, req.limit, req.beforeUuid, req.afterUuid);
   });
 
+  // Codex hands a thread's writer lock to whichever process claimed it, and no
+  // protocol method gives it back – so a session left open in a terminal is
+  // unreachable from the app until that process ends. The user asks for this
+  // explicitly; nothing here runs on its own.
+  client.onForceQuitSession(async (sessionId) => {
+    // A session we are running is never a candidate, whoever holds the lock.
+    // The alternative -- identifying our own app-server by pid -- cannot work
+    // through codex's npm wrapper, and getting it wrong means killing the
+    // user's own in-flight turn and telling them we closed their terminal.
+    // Checked again inside forceQuitLockHolder against every thread the holder
+    // owns -- one codex process can hold a parent thread and its subagents,
+    // and the signal takes all of them.
+    if (adapter.isRunning(sessionId)) {
+      console.log(`[ForceQuit] session ${sessionId.slice(-8)}: busy (ours)`);
+      return { status: 'busy' };
+    }
+    if (!isThreadId(sessionId)) {
+      return { status: 'failed', detail: 'Not a Codex session.' };
+    }
+    // The rollout is what makes this a session rather than a lock file with a
+    // plausible name. Without it we would be willing to signal the holder of
+    // any well-formed uuid under the lock directory, including threads this
+    // machine's agent never created.
+    if (!findSessionFile(sessionId)) {
+      console.log(`[ForceQuit] session ${sessionId.slice(-8)}: unknown`);
+      return { status: 'unknown_session' };
+    }
+    const outcome = await forceQuitLockHolder(
+      sessionId,
+      findSessionFile,
+      (id) => adapter.isRunning(id)
+    );
+    console.log(`[ForceQuit] session ${sessionId.slice(-8)}: ${outcome.status}`);
+    return outcome.status === 'failed'
+      ? { status: 'failed', detail: outcome.reason }
+      : { status: outcome.status };
+  });
+
   // Auto-update is handled by the SDK via autoUpdateConfig above.
 
   const shutdown = async () => {
     console.log('\nShutting down...');
-    sessionWatcher.unwatchAll();
-    await adapter.stopAll();
+    // Disconnect first: the pid file must outlive the socket, or a restart
+    // racing this shutdown would see no daemon and start a second one.
     await client.disconnect();
-    configManager.deletePidFile();
+    await releaseLocalState(localState);
     process.exit(0);
   };
 

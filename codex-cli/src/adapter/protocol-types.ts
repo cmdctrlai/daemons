@@ -59,6 +59,17 @@ export interface ThreadStartResponse {
 
 // --- thread/resume -------------------------------------------------------
 
+/**
+ * There is no closing counterpart to start/resume. Both take the thread's writer
+ * lock as an open file descriptor on ~/.codex/thread-writer-locks/<threadId>.lock
+ * held by the app-server process, and codex 0.153 offers nothing that gives it
+ * back. `thread/unsubscribe` answers {"status":"unsubscribed"} but the process
+ * keeps the descriptor, the thread stays in `thread/loaded/list`, and a second
+ * process still gets "-32600 ... already has an active writer"; no thread/close,
+ * thread/release or thread/park exists in the request enum. Exiting the
+ * app-server is the release – the kernel drops the descriptor – which is why
+ * CodexAdapter gives each task its own process.
+ */
 export interface ThreadResumeParams {
   threadId: string;
   cwd?: string | null;
