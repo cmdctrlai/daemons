@@ -46,6 +46,8 @@ import {
   TaskResumeMessage,
   TaskCancelMessage,
   GetMessagesMessage,
+  ForceQuitSessionMessage,
+  ForceQuitResultMessage,
   WatchSessionMessage,
   UnwatchSessionMessage,
   ContextRequestMessage,
@@ -182,6 +184,16 @@ export interface GetMessagesResponse {
   error?: string;
 }
 
+/**
+ * What a daemon did about a force-quit request. Every status except `released`
+ * and `not_held` means the session is still held and the user needs telling
+ * why, so `detail` carries the agent-specific reason where there is one.
+ */
+export interface ForceQuitOutcome {
+  status: ForceQuitResultMessage['status'];
+  detail?: string;
+}
+
 /** Context request for dashboard summaries. */
 export interface ContextRequest {
   requestId: string;
@@ -219,6 +231,9 @@ type TaskStartHandler = (task: TaskHandle) => Promise<void> | void;
 type TaskResumeHandler = (task: ResumeHandle) => Promise<void> | void;
 type TaskCancelHandler = (taskId: string) => void;
 type GetMessagesHandler = (req: GetMessagesRequest) => GetMessagesResponse | Promise<GetMessagesResponse>;
+type ForceQuitSessionHandler = (
+  sessionId: string
+) => ForceQuitOutcome | Promise<ForceQuitOutcome>;
 type WatchSessionHandler = (sessionId: string, filePath: string) => void;
 type UnwatchSessionHandler = (sessionId: string) => void;
 type ContextRequestHandler = (req: ContextRequest) => ContextResponse | null | Promise<ContextResponse | null>;
@@ -297,6 +312,7 @@ export class DaemonClient {
   private taskResumeHandler?: TaskResumeHandler;
   private taskCancelHandler?: TaskCancelHandler;
   private getMessagesHandler?: GetMessagesHandler;
+  private forceQuitSessionHandler?: ForceQuitSessionHandler;
   private watchSessionHandler?: WatchSessionHandler;
   private unwatchSessionHandler?: UnwatchSessionHandler;
   private contextRequestHandler?: ContextRequestHandler;
@@ -345,6 +361,17 @@ export class DaemonClient {
   /** Register handler for message history requests. Required. */
   onGetMessages(handler: GetMessagesHandler): this {
     this.getMessagesHandler = handler;
+    return this;
+  }
+
+  /**
+   * Register handler for force-quit requests. Optional: only agents whose
+   * sessions can be exclusively held by a local process need one. Without a
+   * handler the server is told the agent does not support it, rather than
+   * being left to time out.
+   */
+  onForceQuitSession(handler: ForceQuitSessionHandler): this {
+    this.forceQuitSessionHandler = handler;
     return this;
   }
 
@@ -596,6 +623,19 @@ export class DaemonClient {
   // ------------------------------------------------------------------
   // Internal: message sending
   // ------------------------------------------------------------------
+
+  private sendForceQuitResult(
+    request: ForceQuitSessionMessage,
+    outcome: ForceQuitOutcome
+  ): void {
+    this.send({
+      type: 'force_quit_result',
+      request_id: request.request_id,
+      session_id: request.session_id,
+      status: outcome.status,
+      detail: outcome.detail,
+    });
+  }
 
   private send(message: DaemonMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -934,6 +974,26 @@ export class DaemonClient {
         break;
       }
 
+      case 'force_quit_session': {
+        const m = msg as ForceQuitSessionMessage;
+        if (!this.forceQuitSessionHandler) {
+          this.sendForceQuitResult(m, {
+            status: 'failed',
+            detail: 'This agent does not support force quit.',
+          });
+          break;
+        }
+        try {
+          this.sendForceQuitResult(m, await this.forceQuitSessionHandler(m.session_id));
+        } catch (err: unknown) {
+          this.sendForceQuitResult(m, {
+            status: 'failed',
+            detail: err instanceof Error ? err.message : 'Unknown error',
+          });
+        }
+        break;
+      }
+
       case 'watch_session': {
         const m = msg as WatchSessionMessage;
         if (this.watchSessionHandler) this.watchSessionHandler(m.session_id, m.file_path);
@@ -991,6 +1051,15 @@ export class DaemonClient {
         this.handleVersionStatus(m);
         break;
       }
+
+      default:
+        // A newer server asking for something this SDK predates. Silence would
+        // leave the server waiting out its own timeout on a request nobody will
+        // ever answer.
+        if (this.options.logFrames) {
+          console.log(`[WS IN] ignoring unknown message type: ${(msg as { type: string }).type}`);
+        }
+        break;
     }
   }
 
