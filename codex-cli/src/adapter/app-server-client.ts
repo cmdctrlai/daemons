@@ -12,7 +12,7 @@
  * AppServerAdapter.
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execFileSync, ChildProcess } from 'child_process';
 import * as readline from 'readline';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -33,22 +33,83 @@ import {
 const DEFAULT_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 min – long enough for turn/start
 const RESTART_BACKOFF_MS = [500, 1000, 2000, 5000, 10000];
 
-function findCodexCli(): string {
-  if (process.env.CODEX_CLI_PATH) return process.env.CODEX_CLI_PATH;
-  const home = os.homedir();
-  const candidates = [
+/**
+ * Where a codex binary might live, in preference order.
+ *
+ * The last two are not on any PATH the npm install controls: codex now ships
+ * inside the ChatGPT app and in its own plugin directory, and a user who got
+ * codex that way has no `codex` on PATH at all.
+ */
+export function codexCandidates(home: string): string[] {
+  return [
     path.join(home, '.local', 'bin', 'codex'),
     path.join(home, '.npm-global', 'bin', 'codex'),
     '/usr/local/bin/codex',
     '/opt/homebrew/bin/codex',
+    path.join(home, '.codex', 'plugins', '.plugin-appserver', 'codex'),
+    '/Applications/ChatGPT.app/Contents/Resources/codex',
   ];
+}
+
+/**
+ * The first candidate that actually runs, or null if none does.
+ *
+ * Existing is not the same as working: an npm install whose platform package
+ * failed to unpack leaves a `codex` symlink pointing at a vendored binary that
+ * is not there, and spawning it dies with ENOENT. Picking that one and stopping
+ * takes the daemon down while a perfectly good codex sits at the next path, so
+ * a candidate has to answer before it is trusted and a broken one is skipped.
+ */
+export function selectCodexBinary(
+  candidates: string[],
+  exists: (p: string) => boolean,
+  works: (p: string) => boolean,
+): string | null {
   for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch {
-      /* ignore */
+    if (!exists(p)) continue;
+    if (!works(p)) {
+      console.warn(`[AppServer] Ignoring codex at ${p}: present but does not run`);
+      continue;
     }
+    return p;
   }
+  return null;
+}
+
+function codexBinaryRuns(bin: string): boolean {
+  try {
+    execFileSync(bin, ['--version'], { stdio: 'ignore', timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Resolved once: probing spawns a process per candidate. */
+let resolvedCodexCli: string | null = null;
+
+function findCodexCli(): string {
+  // An explicit override is the operator's business and is taken at face value.
+  if (process.env.CODEX_CLI_PATH) return process.env.CODEX_CLI_PATH;
+  if (resolvedCodexCli) return resolvedCodexCli;
+
+  const found = selectCodexBinary(
+    codexCandidates(os.homedir()),
+    (p) => {
+      try {
+        return fs.existsSync(p);
+      } catch {
+        return false;
+      }
+    },
+    codexBinaryRuns,
+  );
+  if (found) {
+    resolvedCodexCli = found;
+    return found;
+  }
+  // Nothing on disk worked. Fall back to PATH so a codex we don't know about
+  // still gets a chance, and let spawn report the failure if there isn't one.
   return 'codex';
 }
 
