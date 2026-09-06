@@ -2,19 +2,16 @@
  * Codex CLI Session Watcher
  *
  * Polls Codex CLI JSONL session files for new messages and emits typed events:
- *   - USER_MESSAGE: user_message event_msg entries
- *   - AGENT_RESPONSE: agent_message event_msg entries
+ *   - USER_MESSAGE: user turns
+ *   - AGENT_RESPONSE: agent turns
  *
- * Uses the same stable UUID scheme as readSessionMessages so IDs are consistent.
- *
- * Codex JSONL line types of interest:
- *   { timestamp, type: "event_msg", payload: { type: "user_message", message: "..." } }
- *   { timestamp, type: "event_msg", payload: { type: "agent_message", message: "..." } }
- *   { timestamp, type: "event_msg", payload: { type: "task_complete", turn_id: "..." } }
+ * Line parsing is shared with session-discovery.ts via session-parser.ts so both
+ * sides derive the same message indices, and therefore the same stable UUIDs.
  */
 
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import { ParsedMessage, parseRollout } from './session-parser';
 
 // Polling interval (500ms)
 const POLL_INTERVAL_MS = 500;
@@ -212,70 +209,14 @@ export class CodexSessionWatcher {
 
   /**
    * Parse all user/agent messages from the file.
-   * Mirrors the logic in session-discovery.ts parseSessionFile.
    */
-  private parseAllMessages(filePath: string): Array<{
-    id: string;
-    timestamp: string;
-    role: 'user' | 'agent';
-    content: string;
-    isComplete?: boolean;
-  }> {
-    const messages: Array<{
-      id: string;
-      timestamp: string;
-      role: 'user' | 'agent';
-      content: string;
-      isComplete?: boolean;
-    }> = [];
-
+  private parseAllMessages(filePath: string): ParsedMessage[] {
     try {
-      const raw = fs.readFileSync(filePath, 'utf-8');
-      const lines = raw.split('\n').filter(l => l.trim());
-      let messageIndex = 0;
-
-      for (const line of lines) {
-        try {
-          const obj = JSON.parse(line) as {
-            timestamp: string;
-            type: string;
-            payload: Record<string, unknown>;
-          };
-
-          if (obj.type !== 'event_msg') continue;
-
-          const eventType = obj.payload?.type as string;
-
-          if (eventType === 'user_message') {
-            messages.push({
-              id: `user-${messageIndex++}`,
-              timestamp: obj.timestamp,
-              role: 'user',
-              content: (obj.payload.message as string) || '',
-            });
-          } else if (eventType === 'agent_message') {
-            messages.push({
-              id: `agent-${messageIndex++}`,
-              timestamp: obj.timestamp,
-              role: 'agent',
-              content: (obj.payload.message as string) || '',
-            });
-          } else if (eventType === 'task_complete') {
-            // Mark the last agent message as a completion signal
-            const lastAgent = [...messages].reverse().find(m => m.role === 'agent');
-            if (lastAgent) {
-              lastAgent.isComplete = true;
-            }
-          }
-        } catch {
-          // skip invalid lines
-        }
-      }
+      return parseRollout(fs.readFileSync(filePath, 'utf-8'), filePath).messages;
     } catch (err) {
       console.error('[CodexWatcher] Error reading file:', err);
+      return [];
     }
-
-    return messages;
   }
 
   private startCompletionTimer(session: WatchedSession): void {
