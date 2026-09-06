@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/daemon-sdk",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "SDK for building CmdCtrl daemons - provides WebSocket client, message types, and utilities",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -22,6 +22,7 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "@cmdctrl/daemon-sdk": "^1.4.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

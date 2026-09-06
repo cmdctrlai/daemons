@@ -46,6 +46,18 @@ export interface GetMessagesMessage {
   after_uuid?: string;
 }
 
+/**
+ * Asks the daemon to end whatever local process is holding a session, so the
+ * user can drive it from CmdCtrl again. Only agents whose sessions can be
+ * exclusively claimed by a local process implement this; the rest never
+ * register a handler and the server hears nothing back.
+ */
+export interface ForceQuitSessionMessage {
+  type: 'force_quit_session';
+  request_id: string;
+  session_id: string;
+}
+
 export interface WatchSessionMessage {
   type: 'watch_session';
   session_id: string;
@@ -85,6 +97,7 @@ export type ServerMessage =
   | TaskResumeMessage
   | TaskCancelMessage
   | GetMessagesMessage
+  | ForceQuitSessionMessage
   | WatchSessionMessage
   | UnwatchSessionMessage
   | ContextRequestMessage
@@ -107,6 +120,16 @@ export interface EventMessage {
   type: 'event';
   task_id: string;
   event_type: string;
+  /**
+   * Normalized tool descriptor for VERBOSE (tool-use) events. Lets the server
+   * narrate tool actions uniformly across agents ("running the grep command")
+   * without parsing each agent's verbose text. `tool` is the raw tool name and
+   * `arg_summary` its key argument (a command, pattern, path, …) with no emoji.
+   * Populated by claude-code first; other daemons may leave these empty until
+   * they wire them through, in which case the server falls back to a generic phrase.
+   */
+  tool?: string;
+  arg_summary?: string;
   [key: string]: unknown;
 }
 
@@ -177,6 +200,27 @@ export interface MessagesResponseMessage {
   error?: string;
 }
 
+/**
+ * What became of a force_quit_session request.
+ *
+ * `released` means the holder is gone and the session is drivable now.
+ * `not_held` means nothing was holding it, which is a success from the user's
+ * point of view. `busy` means the holder is mid-turn and was deliberately left
+ * alone; `foreign` means something we could not identify as the user's own
+ * agent process holds it, and we will not signal that. `unknown_session` means
+ * the agent has no such session on this machine, so there is nothing here that
+ * force quit is entitled to touch. `shared` means one process is running this
+ * session and others besides, so ending it would close work the user did not
+ * ask about.
+ */
+export interface ForceQuitResultMessage {
+  type: 'force_quit_result';
+  request_id: string;
+  session_id: string;
+  status: 'released' | 'not_held' | 'busy' | 'foreign' | 'shared' | 'unknown_session' | 'failed';
+  detail?: string;
+}
+
 export interface SessionActivityMessage {
   type: 'session_activity';
   session_id: string;
@@ -219,6 +263,7 @@ export type DaemonMessage =
   | ReportSessionsMessage
   | ReportSlashCommandsMessage
   | MessagesResponseMessage
+  | ForceQuitResultMessage
   | SessionActivityMessage
   | ContextResponseMessage;
 

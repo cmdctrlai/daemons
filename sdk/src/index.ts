@@ -22,6 +22,7 @@ export type {
   ResumeHandle,
   GetMessagesRequest,
   GetMessagesResponse,
+  ForceQuitOutcome,
   ContextRequest,
   ContextResponse,
 } from './client';
