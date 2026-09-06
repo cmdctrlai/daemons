@@ -43,6 +43,8 @@ import {
   ErrorNotification,
   ItemCompletedNotification,
   ItemStartedNotification,
+  SkillsListEntry,
+  SkillsListResponse,
   ThreadItem,
   ThreadResumeResponse,
   ThreadStartResponse,
@@ -51,6 +53,7 @@ import {
   TurnStartedNotification,
   UserInput,
 } from './protocol-types';
+import type { SkillCatalog } from '../skills';
 
 /** Long enough to be worth waiting for, short enough not to stall a shutdown. */
 const INTERRUPT_TIMEOUT_MS = 10_000;
@@ -68,6 +71,13 @@ const DEFAULT_MAX_CONCURRENT_TASKS = 6;
  * and buys back the writer lock, which is the more valuable of the two.
  */
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * Enumerating skills is a disk scan – tens of milliseconds for forty project
+ * directories. The default five-minute request timeout is sized for a model turn
+ * and would let a wedged app-server stall the task that waited on this.
+ */
+const SKILLS_LIST_TIMEOUT_MS = 30_000;
 
 export interface AdapterLimits {
   maxConcurrentTasks: number;
@@ -220,6 +230,11 @@ export class CodexAdapter {
    */
   private releasing = new Set<string>();
 
+  /** Name -> path for the skills a slash command can invoke. Optional. */
+  private skills?: SkillCatalog;
+
+  private skillsChangedHandler?: () => void;
+
   constructor(
     private onEvent: EventCallback,
     private clientVersion?: string,
@@ -227,6 +242,58 @@ export class CodexAdapter {
       new AppServerClient(options),
     private limits: AdapterLimits = defaultLimits()
   ) {}
+
+  /**
+   * Give the adapter the catalog it consults when a turn starts. Without one
+   * every message is sent as plain text, which is the pre-skills behaviour.
+   */
+  setSkillCatalog(skills: SkillCatalog): void {
+    this.skills = skills;
+  }
+
+  /**
+   * Register interest in codex's `skills/changed` notification.
+   *
+   * Codex only watches skill files once an app-server holds a thread, so this
+   * fires during a turn and never between them – verified against 0.153.4, where
+   * adding a skill with no thread open produced nothing and adding one with a
+   * thread open produced the notification within a second. It is therefore a
+   * bonus rather than the mechanism: the caller still has to enumerate on its
+   * own schedule.
+   */
+  onSkillsChanged(handler: () => void): void {
+    this.skillsChangedHandler = handler;
+  }
+
+  /**
+   * The skills codex resolves for each of these directories.
+   *
+   * Runs on its own short-lived app-server. `skills/list` needs no thread, so
+   * this takes no writer lock and cannot collide with a task or with the user's
+   * own codex – and stopping the process immediately keeps the daemon from
+   * carrying a second ~130MB codex around for the sake of a menu.
+   */
+  async listSkills(cwds: string[]): Promise<SkillsListEntry[]> {
+    if (cwds.length === 0) return [];
+
+    const client = this.createClient({
+      clientName: 'cmdctrl-codex-cli',
+      clientVersion: this.clientVersion ?? '0.0.0',
+    });
+    try {
+      await client.start();
+      const response = await client.request<SkillsListResponse>(
+        'skills/list',
+        { cwds, forceReload: true },
+        SKILLS_LIST_TIMEOUT_MS
+      );
+      return response?.data ?? [];
+    } finally {
+      await client.stop().catch((err) => {
+        console.error('[Skills] Failed to stop the enumeration app-server:', err);
+      });
+    }
+  }
 
   async startTask(
     taskId: string,
@@ -256,7 +323,7 @@ export class CodexAdapter {
     rt.threadId = threadResp.thread.id;
     this.onEvent(taskId, 'SESSION_STARTED', { session_id: rt.threadId });
 
-    await this.startTurn(rt, instruction);
+    await this.startTurn(rt, this.turnInput(cwd, instruction, projectPath));
   }
 
   async resumeTask(
@@ -292,7 +359,7 @@ export class CodexAdapter {
       return;
     }
 
-    await this.startTurn(rt, message);
+    await this.startTurn(rt, this.turnInput(cwd, message, projectPath));
   }
 
   async cancelTask(taskId: string): Promise<void> {
@@ -424,6 +491,10 @@ export class CodexAdapter {
     on('item/completed', (p) => this.handleItemCompleted(rt, p));
     on('turn/completed', (p) => this.handleTurnCompleted(rt, p));
     on('error', (p) => this.handleErrorNotification(rt, p));
+
+    // Not thread-scoped, and not this task's business – an invalidation is worth
+    // acting on whichever app-server happened to hear it, live task or not.
+    rt.client.on('skills/changed', () => this.skillsChangedHandler?.());
   }
 
   /**
@@ -443,11 +514,41 @@ export class CodexAdapter {
     rt.idleTimer.unref?.();
   }
 
-  private async startTurn(rt: RunningTask, text: string): Promise<void> {
+  /**
+   * What the user's message becomes on the wire.
+   *
+   * A message picked from the composer's slash menu arrives as text like
+   * "/pjm add a bug". Sending that as text reaches the model as the literal
+   * characters and gets an improvised answer; only the `skill` input element
+   * runs the skill. Anything we cannot resolve to a skill this project actually
+   * has stays text, so a message that merely opens with a slash is untouched.
+   *
+   * The menu the user picked from was built for the project the task names. When
+   * that directory has gone – a worktree removed after it landed, say – the turn
+   * runs in the home directory instead, where a skill of the same name is a
+   * different file. Running that one would succeed and do something else
+   * entirely, so a cwd the caller did not ask for resolves nothing.
+   */
+  private turnInput(cwd: string, text: string, projectPath?: string): UserInput[] {
+    if (projectPath && projectPath !== cwd) return [userText(text)];
+
+    const invocation = this.skills?.resolve(cwd, text);
+    if (!invocation) return [userText(text)];
+
+    const input: UserInput[] = [
+      { type: 'skill', name: invocation.name, path: invocation.path },
+    ];
+    // Codex accepts a skill element on its own; an empty text element would only
+    // add a blank user turn.
+    if (invocation.args) input.push(userText(invocation.args));
+    return input;
+  }
+
+  private async startTurn(rt: RunningTask, input: UserInput[]): Promise<void> {
     try {
       const turnResp = await rt.client.request<TurnStartResponse>('turn/start', {
         threadId: rt.threadId,
-        input: [userText(text)],
+        input,
       });
       rt.turnId = turnResp.turn.id;
     } catch (err) {

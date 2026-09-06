@@ -1,4 +1,4 @@
-import { readFileSync } from 'fs';
+import { readFileSync, statSync } from 'fs';
 import { join } from 'path';
 import { DaemonClient, ConfigManager } from '@cmdctrl/daemon-sdk';
 import { CodexAdapter } from '../adapter/codex-cli';
@@ -6,8 +6,20 @@ import { discoverSessions, findSessionFile, readSessionMessages } from '../sessi
 import { CodexSessionWatcher } from '../session-watcher';
 import { forceQuitLockHolder, isThreadId } from '../adapter/thread-lock';
 import { releaseLocalState } from '../lifecycle';
+import { SkillCatalog, SkillRefresher } from '../skills';
 
 const configManager = new ConfigManager('codex-cli');
+
+/** Skill files change in bursts; one enumeration after the burst is enough. */
+const SKILLS_CHANGED_DEBOUNCE_MS = 1000;
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 interface StartOptions {
   foreground?: boolean;
@@ -89,6 +101,41 @@ export async function start(options: StartOptions = {}): Promise<void> {
     sendEvent(taskId, eventType, data);
   }, daemonVersion);
 
+  // Codex slash commands are skills, and a skill is scoped to the directory it
+  // was found in, so the catalog is keyed by project and rebuilt from codex
+  // rather than cached on disk – see src/skills.ts.
+  const skills = new SkillCatalog();
+  adapter.setSkillCatalog(skills);
+
+  const refresher = new SkillRefresher(skills, adapter, () => {
+    const projects = new Set<string>();
+    for (const session of discoverSessions()) {
+      if (session.project) projects.add(session.project);
+    }
+    // A project whose directory is gone still has rollouts on disk; asking codex
+    // about it wastes a scan and would key a menu no session can reach.
+    return [...projects].filter(isDirectory);
+  });
+
+  /** Enumerate a project's skills if it is new, and report if that changed anything. */
+  async function ensureProjectSkills(projectPath?: string): Promise<void> {
+    if (projectPath && !isDirectory(projectPath)) return;
+    if (await refresher.ensureProject(projectPath)) client.reportSlashCommands();
+  }
+
+  let skillsChangedTimer: NodeJS.Timeout | null = null;
+  adapter.onSkillsChanged(() => {
+    // Trailing, and never rescheduled: resetting the timer on each event would
+    // let a steady stream of them – a git checkout across a skills directory –
+    // put the refresh off indefinitely.
+    if (skillsChangedTimer) return;
+    skillsChangedTimer = setTimeout(async () => {
+      skillsChangedTimer = null;
+      if (await refresher.refresh()) client.reportSlashCommands();
+    }, SKILLS_CHANGED_DEBOUNCE_MS);
+    skillsChangedTimer.unref?.();
+  });
+
   // Shutdown and auto-update both make way for another process, so both run
   // this – an update that skipped it would leak every thread's writer lock.
   const localState = {
@@ -113,6 +160,8 @@ export async function start(options: StartOptions = {}): Promise<void> {
 
   client.setSessionsProvider(() => discoverSessions(managedSessionIds));
 
+  client.setSlashCommandsProvider(() => skills.all());
+
   // The adapter owns task lifetime, so it is the only thing that knows when an
   // update may interrupt. Without this the SDK's own set never drains and the
   // update -- and the thread release that goes with it -- is deferred forever.
@@ -132,6 +181,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
 
   client.onTaskStart(async (task) => {
     try {
+      await ensureProjectSkills(task.projectPath);
       await adapter.startTask(task.taskId, task.instruction, task.projectPath);
     } catch (err: unknown) {
       task.error(err instanceof Error ? err.message : 'Unknown error');
@@ -140,6 +190,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
 
   client.onTaskResume(async (task) => {
     try {
+      await ensureProjectSkills(task.projectPath);
       await adapter.resumeTask(task.taskId, task.sessionId, task.message, task.projectPath);
     } catch (err: unknown) {
       task.error(err instanceof Error ? err.message : 'Unknown error');
@@ -196,6 +247,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
 
   const shutdown = async () => {
     console.log('\nShutting down...');
+    if (skillsChangedTimer) clearTimeout(skillsChangedTimer);
     // Disconnect first: the pid file must outlive the socket, or a restart
     // racing this shutdown would see no daemon and start a second one.
     await client.disconnect();
@@ -205,6 +257,12 @@ export async function start(options: StartOptions = {}): Promise<void> {
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  // Learn the sets before connecting; the SDK reports them on connect via the
+  // provider. Nothing here is fatal, so the connection is never held up by more
+  // than the enumeration's own timeout.
+  await refresher.refresh();
+  console.log(`Skills enumerated for ${skills.all().length} project(s).`);
 
   client.connect().catch(() => {
     console.warn('Initial connection failed, will retry...');
