@@ -63,6 +63,23 @@ const CONTENT_TAG_VARIANTS = [
   '{"timestamp":"2026-09-05T00:00:04.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"image","image_url":"data:..."},{"type":"Text","text":"line one"},{"type":"Text","text":"line two"}],"phase":"final_answer"}}}',
 ].join('\n');
 
+/**
+ * A session driven by slash commands. Verbatim from
+ * ~/.codex/sessions/2026/09/05/rollout-...-01a07425-7c6d-....jsonl (0.153.4),
+ * paths shortened: codex records the invocation as a `skill` content part and
+ * puts only the arguments in the text part, so reading text alone renders
+ * "/echoer PINEAPPLE-42" as "PINEAPPLE-42" and "/echoer" as nothing at all.
+ */
+const SKILL_INVOCATIONS = [
+  '{"timestamp":"2026-09-05T00:00:00.000Z","type":"session_meta","payload":{"id":"01a07425-7c6d-7283-b141-4db628e368d5","cwd":"/repo","cli_version":"0.153.4"}}',
+  '{"timestamp":"2026-09-05T00:00:01.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u1","content":[{"type":"skill","name":"echoer","path":"/repo/.agents/skills/echoer/SKILL.md"},{"type":"text","text":"PINEAPPLE-42","text_elements":[]}]}}}',
+  '{"timestamp":"2026-09-05T00:00:02.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"a1","content":[{"type":"Text","text":"ECHO: PINEAPPLE-42"}],"phase":"final_answer"}}}',
+  '{"timestamp":"2026-09-05T00:00:03.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u2","content":[{"type":"skill","name":"echoer","path":"/repo/.agents/skills/echoer/SKILL.md"}]}}}',
+  '{"timestamp":"2026-09-05T00:00:04.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"a2","content":[{"type":"Text","text":"ECHO: none"}],"phase":"final_answer"}}}',
+  '{"timestamp":"2026-09-05T00:00:05.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u3","content":[{"type":"skill","name":"google-drive:google-docs","path":"/plugins/google-docs/SKILL.md"},{"type":"text","text":"open the roadmap","text_elements":[]}]}}}',
+  '{"timestamp":"2026-09-05T00:00:06.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u4","content":[{"type":"skill","path":"/repo/.agents/skills/nameless/SKILL.md"},{"type":"text","text":"still readable","text_elements":[]}]}}}',
+].join('\n');
+
 describe('parseRollout', () => {
   beforeEach(() => {
     resetRolloutWarnings();
@@ -127,6 +144,18 @@ describe('parseRollout', () => {
           { id: 'agent-1', role: 'agent', content: 'lowercase tag' },
           { id: 'agent-2', role: 'agent', content: 'response-item tag' },
           { id: 'agent-3', role: 'agent', content: 'line one\nline two' },
+        ],
+      },
+      {
+        name: 'a skill invocation reads back as the command the user typed',
+        raw: SKILL_INVOCATIONS,
+        expected: [
+          { id: 'user-0', role: 'user', content: '/echoer PINEAPPLE-42' },
+          { id: 'agent-1', role: 'agent', content: 'ECHO: PINEAPPLE-42' },
+          { id: 'user-2', role: 'user', content: '/echoer' },
+          { id: 'agent-3', role: 'agent', content: 'ECHO: none' },
+          { id: 'user-4', role: 'user', content: '/google-drive:google-docs open the roadmap' },
+          { id: 'user-5', role: 'user', content: 'still readable' },
         ],
       },
       {

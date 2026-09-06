@@ -87,7 +87,13 @@ export interface ThreadResumeResponse {
 
 export type UserInput =
   | { type: 'text'; text: string; text_elements: [] }
-  | { type: 'image'; url: string };
+  | { type: 'image'; url: string }
+  /**
+   * Runs a skill. Codex resolves it by `path`, not by `name` – a path that does
+   * not resolve is not an error, it just silently reaches the model as an
+   * ordinary turn, so only paths that came back from `skills/list` belong here.
+   */
+  | { type: 'skill'; name: string; path: string };
 
 export interface TurnStartParams {
   threadId: string;
@@ -99,6 +105,43 @@ export interface TurnStartParams {
 
 export interface TurnStartResponse {
   turn: { id: string; status: TurnStatus };
+}
+
+// --- skills/list ---------------------------------------------------------
+
+export type SkillScope = 'user' | 'repo' | 'system' | 'admin';
+
+export interface SkillMetadata {
+  name: string;
+  description: string;
+  path: string;
+  scope: SkillScope;
+  enabled: boolean;
+  /** Owning plugin, when the skill came from one. */
+  pluginId: string | null;
+}
+
+export interface SkillsListParams {
+  /** When empty, codex answers for the app-server's own working directory. */
+  cwds?: string[];
+  /**
+   * Skills are cached per app-server, and the cache does not notice a skill
+   * added or edited since the last answer – a plain re-list returns the stale
+   * set. Every enumeration here therefore forces a re-scan; the scan is disk
+   * work measured in tens of milliseconds.
+   */
+  forceReload?: boolean;
+}
+
+export interface SkillsListEntry {
+  cwd: string;
+  skills: SkillMetadata[];
+  /** Skill files codex could not parse. Reported, never fatal. */
+  errors: { path: string; message: string }[];
+}
+
+export interface SkillsListResponse {
+  data: SkillsListEntry[];
 }
 
 // --- turn/interrupt ------------------------------------------------------

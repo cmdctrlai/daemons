@@ -62,19 +62,33 @@ function str(value: unknown): string {
  * Codex tags user text "text" and agent text "Text"; response-item style
  * payloads use "input_text"/"output_text". Match on the suffix so a new
  * casing or prefix does not silently drop the message.
+ *
+ * A turn that ran a skill stores a `{"type":"skill", name, path}` part instead of
+ * the "/name" the user typed – the arguments follow in a text part, or there are
+ * none at all. Reading only the text parts would render "/pjm add a bug" as
+ * "add a bug" and "/pjm" as an empty message the watcher then drops, so the skill
+ * part is rendered back into the command it stands for.
  */
 function itemText(item: Record<string, unknown>): string {
   const content = item.content;
   if (!Array.isArray(content)) return '';
 
+  const commands: string[] = [];
   const parts: string[] = [];
   for (const entry of content) {
     if (!entry || typeof entry !== 'object') continue;
-    const part = entry as { type?: unknown; text?: unknown };
+    const part = entry as { type?: unknown; text?: unknown; name?: unknown };
+    if (str(part.type) === 'skill') {
+      if (typeof part.name === 'string' && part.name) commands.push(`/${part.name}`);
+      continue;
+    }
     if (!str(part.type).toLowerCase().endsWith('text')) continue;
     if (typeof part.text === 'string' && part.text) parts.push(part.text);
   }
-  return parts.join('\n');
+
+  const text = parts.join('\n');
+  if (commands.length === 0) return text;
+  return text ? `${commands.join(' ')} ${text}` : commands.join(' ');
 }
 
 /**
