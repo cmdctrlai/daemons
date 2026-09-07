@@ -20,6 +20,11 @@ export interface SessionEvent {
   timestamp: string;
   // For USER_MESSAGE events
   isToolResult?: boolean;
+  // Normalized tool descriptor for VERBOSE tool-use events. `tool` is the raw
+  // tool name and `argSummary` its key argument (command, pattern, path, …) with
+  // no emoji, so the server can narrate the action for voice mode.
+  tool?: string;
+  argSummary?: string;
 }
 
 interface WatchedSession {
@@ -601,12 +606,15 @@ export class SessionWatcher {
         }
 
         const formattedTool = this.formatToolUse(toolName, toolInput);
+        const descriptor = this.normalizeToolUse(toolName, toolInput);
 
         return {
           type: 'VERBOSE',
           sessionId,
           uuid,
           content: formattedTool,
+          tool: descriptor.tool,
+          argSummary: descriptor.argSummary,
           timestamp,
         };
       }
@@ -670,6 +678,38 @@ export class SessionWatcher {
         return `📋 Plan ready for approval`;
       default:
         return `🔧 ${name}`;
+    }
+  }
+
+  /**
+   * Build a normalized tool descriptor { tool, argSummary } for a tool_use block.
+   * Same argument extraction as formatToolUse, but without the emoji/display text –
+   * the server uses this to narrate the action for voice mode across agents.
+   */
+  private normalizeToolUse(name: string, input?: Record<string, unknown>): { tool: string; argSummary: string } {
+    const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+    switch (name) {
+      case 'Read':
+      case 'Write':
+      case 'Edit':
+        return { tool: name, argSummary: str(input?.file_path) };
+      case 'Bash':
+        return { tool: name, argSummary: str(input?.command).slice(0, 60) };
+      case 'Glob':
+      case 'Grep':
+        return { tool: name, argSummary: str(input?.pattern) };
+      case 'Task':
+        return { tool: name, argSummary: str(input?.description) };
+      case 'WebSearch':
+        return { tool: name, argSummary: str(input?.query) };
+      case 'WebFetch':
+        return { tool: name, argSummary: str(input?.url) };
+      case 'TodoWrite':
+      case 'EnterPlanMode':
+      case 'ExitPlanMode':
+        return { tool: name, argSummary: '' };
+      default:
+        return { tool: name, argSummary: '' };
     }
   }
 

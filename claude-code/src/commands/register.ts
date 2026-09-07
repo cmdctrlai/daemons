@@ -2,7 +2,7 @@ import * as os from 'os';
 import * as readline from 'readline';
 import { openSync } from 'fs';
 import { spawn } from 'child_process';
-import { registerDevice, unregisterDevice } from '@cmdctrl/daemon-sdk';
+import { registerDevice, unregisterDevice, displayVerification } from '@cmdctrl/daemon-sdk';
 import {
   writeConfig,
   writeCredentials,
@@ -72,11 +72,9 @@ export async function register(options: RegisterOptions): Promise<void> {
 
   console.log(`Registering device "${deviceName}" with ${serverUrl}...\n`);
 
-  const result = await registerDevice(serverUrl, deviceName, os.hostname(), 'claude_code', (url) => {
-    console.log('To complete registration, open this URL in your browser:\n');
-    console.log(`  ${url}\n`);
-    console.log('Waiting for verification...');
-  }).catch((err: Error) => {
+  const result = await registerDevice(
+    serverUrl, deviceName, os.hostname(), 'claude_code', displayVerification
+  ).catch((err: Error) => {
     console.error(`\nRegistration failed: ${err.message}`);
     process.exit(1);
   });

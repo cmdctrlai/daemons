@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/pi",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "description": "CmdCtrl daemon for the pi coding agent (@mariozechner/pi-coding-agent)",
   "main": "./dist/index.js",
   "bin": {
@@ -24,7 +24,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "^1.5.0",
+    "@cmdctrl/daemon-sdk": "^1.6.2",
     "@mariozechner/pi-coding-agent": "~0.67.0",
     "commander": "^12.1.0"
   },

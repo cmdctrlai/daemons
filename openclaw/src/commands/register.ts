@@ -2,7 +2,7 @@ import * as os from 'os';
 import * as readline from 'readline';
 import { openSync } from 'fs';
 import { spawn } from 'child_process';
-import { ConfigManager, registerDevice } from '@cmdctrl/daemon-sdk';
+import { ConfigManager, registerDevice, displayVerification } from '@cmdctrl/daemon-sdk';
 import { stop } from './stop';
 
 const configManager = new ConfigManager('openclaw');
@@ -74,11 +74,7 @@ export async function register(options: RegisterOptions): Promise<void> {
     deviceName,
     os.hostname(),
     'openclaw',
-    (url) => {
-      console.log('To complete registration, open this URL in your browser:\n');
-      console.log(`  ${url}\n`);
-      console.log('Waiting for verification...');
-    },
+    displayVerification,
   );
 
   if (!result) {

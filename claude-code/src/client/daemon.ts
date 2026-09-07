@@ -72,10 +72,15 @@ export function createDaemon(config: CmdCtrlConfig, credentials: Credentials): C
 
   const sessionWatcher = new SessionWatcher(
     (event: SessionEvent) => {
+      // `tool`/`arg_summary` are the normalized tool descriptor for VERBOSE
+      // events – undefined for every other type, so they drop out of the JSON –
+      // and let the server narrate tool actions rather than read raw output.
       client.sendEvent('', event.type, {
         session_id: event.sessionId,
         uuid: event.uuid,
         content: event.content,
+        tool: event.tool,
+        arg_summary: event.argSummary,
         timestamp: event.timestamp,
       });
     },

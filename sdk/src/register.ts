@@ -11,6 +11,7 @@
 import * as http from 'http';
 import * as https from 'https';
 import { URL } from 'url';
+import { renderQrForTerminal } from './qr';
 
 export interface RegistrationResult {
   deviceId: string;
@@ -134,6 +135,44 @@ export async function pollForToken(
   }
 
   return null; // Expired
+}
+
+const DEFAULT_COLUMNS = 80;
+
+/**
+ * Print the verification URL, user code, and (where the terminal supports
+ * it) a scannable QR block. The URL and code are always plain text – a QR
+ * is a convenience for phones with a camera, never the only path.
+ *
+ * Skips the QR itself when stdout isn't a TTY (piped output, log files) or
+ * the terminal is too narrow to render it without wrapping. No ANSI color
+ * is used for the QR, so NO_COLOR has nothing to strip.
+ *
+ * @param url - Verification URL from registerDevice()'s callback
+ * @param userCode - User code from registerDevice()'s callback
+ * @param stream - Output stream (defaults to process.stdout; override in tests)
+ */
+export function displayVerification(
+  url: string,
+  userCode: string,
+  stream: NodeJS.WriteStream = process.stdout
+): void {
+  const lines = [
+    'To complete registration, open this URL in your browser:',
+    '',
+    `  ${url}`,
+    '',
+    `Code: ${userCode}`,
+  ];
+
+  if (stream.isTTY) {
+    const { block, size } = renderQrForTerminal(url, stream.columns || DEFAULT_COLUMNS);
+    lines.push('', 'Or scan this with your phone:', '');
+    lines.push(block ?? `(terminal too narrow to show a QR code – needs ${size} columns)`);
+  }
+
+  lines.push('', 'Waiting for verification...');
+  stream.write(lines.join('\n') + '\n');
 }
 
 /**

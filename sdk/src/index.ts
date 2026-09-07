@@ -32,8 +32,12 @@ export { ConfigManager, spawnDetached } from './config';
 export type { DaemonConfig, DaemonCredentials, DetachResult } from './config';
 
 // Registration
-export { registerDevice, unregisterDevice, requestDeviceCode, pollForToken } from './register';
+export { registerDevice, unregisterDevice, requestDeviceCode, pollForToken, displayVerification } from './register';
 export type { RegistrationResult } from './register';
+
+// QR rendering (used by displayVerification; exported for direct use/testing)
+export { renderQrForTerminal, renderQrAscii } from './qr';
+export type { QrRenderResult } from './qr';
 
 // Self-update
 export { selfUpdate, fetchLatestVersion, isAutoUpdateSupported } from './update';
