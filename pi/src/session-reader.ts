@@ -14,6 +14,7 @@ import type {
 } from '@mariozechner/pi-coding-agent';
 import type { MessageEntry, SessionInfo as DaemonSessionInfo } from '@cmdctrl/daemon-sdk';
 import { piSdk } from './pi-sdk';
+import type { CommandCollapser } from './command-collapse';
 
 /** Locate the on-disk path for a pi session id. Optional cwd narrows the scan. */
 export async function resolveSessionPath(
@@ -34,7 +35,14 @@ export async function resolveSessionPath(
  */
 export async function readMessages(
   piSessionId: string,
-  opts: { cwd?: string; limit: number; beforeUuid?: string; afterUuid?: string }
+  opts: {
+    cwd?: string;
+    limit: number;
+    beforeUuid?: string;
+    afterUuid?: string;
+    /** Puts `/name args` back in place of a command pi already expanded. */
+    collapser?: CommandCollapser;
+  }
 ): Promise<{
   messages: MessageEntry[];
   hasMore: boolean;
@@ -58,7 +66,7 @@ export async function readMessages(
   let mapped = mgr
     .getEntries()
     .filter(isMessage)
-    .map(toMessageEntry)
+    .map(entry => toMessageEntry(entry, opts.collapser))
     .filter((m): m is MessageEntry => m !== null);
 
   if (opts.beforeUuid) {
@@ -80,29 +88,47 @@ export async function readMessages(
   };
 }
 
-/** SDK-shaped list of sessions for setSessionsProvider / report_sessions. */
-export async function listReportedSessions(): Promise<DaemonSessionInfo[]> {
+/**
+ * SDK-shaped list of sessions for setSessionsProvider / report_sessions.
+ *
+ * pi has no notion of a child or subtask session – its tools are read, bash, edit,
+ * write, grep, find and ls, and nothing in the daemon's path forks – so every
+ * session here is one a person started. Forks carry `parentSessionPath` and are
+ * deliberately kept: a fork is a branch the user made in the TUI, not machinery.
+ */
+export async function listReportedSessions(
+  collapser?: CommandCollapser
+): Promise<DaemonSessionInfo[]> {
   const { SessionManager } = await piSdk();
   const all = await SessionManager.listAll();
-  return all.map(info => ({
-    session_id: info.id,
-    slug: info.id.slice(0, 8),
-    title: info.name || info.firstMessage || '',
-    project: info.cwd,
-    project_name: info.cwd ? path.basename(info.cwd) : '',
-    file_path: info.path,
-    last_message: info.firstMessage || '',
-    last_activity: info.modified.toISOString(),
-    is_active: false,
-    message_count: info.messageCount,
-  }));
+  return all.map(info => {
+    // firstMessage is the raw stored text, so a session opened with a command
+    // would otherwise be titled with the command's whole expansion.
+    const first = info.firstMessage || '';
+    const preview = (first && collapser?.collapse(first)) || first;
+    return {
+      session_id: info.id,
+      slug: info.id.slice(0, 8),
+      title: info.name || preview,
+      project: info.cwd,
+      project_name: info.cwd ? path.basename(info.cwd) : '',
+      file_path: info.path,
+      last_message: preview,
+      last_activity: info.modified.toISOString(),
+      is_active: false,
+      message_count: info.messageCount,
+    };
+  });
 }
 
 function isMessage(entry: SessionEntry): entry is SessionMessageEntry {
   return entry.type === 'message';
 }
 
-function toMessageEntry(entry: SessionMessageEntry): MessageEntry | null {
+function toMessageEntry(
+  entry: SessionMessageEntry,
+  collapser?: CommandCollapser
+): MessageEntry | null {
   const msg: any = entry.message;
   const role = msg?.role;
   let mapped: 'USER' | 'AGENT';
@@ -116,7 +142,9 @@ function toMessageEntry(entry: SessionMessageEntry): MessageEntry | null {
   return {
     uuid: entry.id,
     role: mapped,
-    content: text,
+    // A user "message" that is really an expanded command reads as the command
+    // again, so the app can render it the way it renders one.
+    content: (mapped === 'USER' && collapser?.collapse(text)) || text,
     timestamp: entry.timestamp,
   };
 }

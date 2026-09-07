@@ -12,6 +12,7 @@ import type {
   SessionMessageEntry,
 } from '@mariozechner/pi-coding-agent';
 import { piSdk } from './pi-sdk';
+import type { CommandCollapser } from './command-collapse';
 
 export interface AgentResponseEvent {
   sessionId: string;
@@ -59,7 +60,11 @@ export class SessionWatcher {
   private watched: Map<string, Watched> = new Map();
   private timer: NodeJS.Timeout | null = null;
 
-  constructor(private cb: WatcherCallbacks) {}
+  /**
+   * `collapser` keeps an expanded command out of the activity preview, which is
+   * drawn from the same user text the transcript shows.
+   */
+  constructor(private cb: WatcherCallbacks, private collapser?: CommandCollapser) {}
 
   watchSession(sessionId: string, filePath: string): void {
     if (this.watched.has(sessionId)) return;
@@ -126,7 +131,7 @@ export class SessionWatcher {
     if (!w.primed) {
       for (const e of entries) w.seen.add(e.id);
       w.messageCount = entries.filter(isMessage).length;
-      w.lastMessage = extractLastMessageText(entries);
+      w.lastMessage = extractLastMessageText(entries, this.collapser);
       w.primed = true;
       return;
     }
@@ -167,7 +172,7 @@ export class SessionWatcher {
       } else if (msg?.role === 'user') {
         lastUserMessageUuid = entry.id;
         const text = extractText(msg.content);
-        if (text.trim()) w.lastMessage = text;
+        if (text.trim()) w.lastMessage = this.collapser?.collapse(text) || text;
       }
     }
 
@@ -212,14 +217,15 @@ function firstToolCallName(content: unknown): string | undefined {
   return undefined;
 }
 
-function extractLastMessageText(entries: SessionEntry[]): string {
+function extractLastMessageText(entries: SessionEntry[], collapser?: CommandCollapser): string {
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
     if (!isMessage(e)) continue;
     const msg: any = (e as SessionMessageEntry).message;
     if (msg?.role !== 'user' && msg?.role !== 'assistant') continue;
     const text = extractText(msg.content);
-    if (text.trim()) return text;
+    if (!text.trim()) continue;
+    return (msg.role === 'user' && collapser?.collapse(text)) || text;
   }
   return '';
 }
