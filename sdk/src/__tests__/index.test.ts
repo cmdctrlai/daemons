@@ -16,5 +16,11 @@ describe('SDK exports', () => {
     expect(typeof sdk.unregisterDevice).toBe('function');
     expect(typeof sdk.requestDeviceCode).toBe('function');
     expect(typeof sdk.pollForToken).toBe('function');
+    expect(typeof sdk.displayVerification).toBe('function');
+  });
+
+  test('exports QR rendering functions', () => {
+    expect(typeof sdk.renderQrForTerminal).toBe('function');
+    expect(typeof sdk.renderQrAscii).toBe('function');
   });
 });

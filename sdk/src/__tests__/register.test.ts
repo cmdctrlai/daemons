@@ -60,7 +60,7 @@ jest.mock('https', () => {
   };
 });
 
-import { requestDeviceCode, pollForToken, unregisterDevice } from '../register';
+import { requestDeviceCode, pollForToken, unregisterDevice, displayVerification } from '../register';
 
 function setMockResponse(status: number, body: object, shouldError = false) {
   mockStatus = status;
@@ -152,5 +152,53 @@ describe('unregisterDevice', () => {
     setMockResponse(200, {}, true);
     const result = await unregisterDevice('https://app.cmd-ctrl.ai', 'dev-1', 'rt-abc');
     expect(result).toBe(false);
+  });
+});
+
+describe('displayVerification', () => {
+  function fakeStream(isTTY: boolean, columns?: number) {
+    const write = jest.fn();
+    return { write, isTTY, columns } as unknown as NodeJS.WriteStream & { write: jest.Mock };
+  }
+
+  const url = 'https://app.cmd-ctrl.ai/verify?code=ABCD-1234';
+
+  test('always prints the URL and user code as plain text', () => {
+    const stream = fakeStream(false);
+    displayVerification(url, 'ABCD-1234', stream);
+    const output = stream.write.mock.calls[0][0] as string;
+    expect(output).toContain(url);
+    expect(output).toContain('Code: ABCD-1234');
+    expect(output).toContain('Waiting for verification...');
+  });
+
+  test('skips the QR block when stdout is not a TTY (piped output)', () => {
+    const stream = fakeStream(false);
+    displayVerification(url, 'ABCD-1234', stream);
+    const output = stream.write.mock.calls[0][0] as string;
+    expect(output).not.toMatch(/[█▀▄]/);
+  });
+
+  test('renders the QR block on a wide TTY', () => {
+    const stream = fakeStream(true, 80);
+    displayVerification(url, 'ABCD-1234', stream);
+    const output = stream.write.mock.calls[0][0] as string;
+    expect(output).toMatch(/[█▀▄]/);
+  });
+
+  test('falls back to a note when the TTY is too narrow for the QR', () => {
+    const stream = fakeStream(true, 10);
+    displayVerification(url, 'ABCD-1234', stream);
+    const output = stream.write.mock.calls[0][0] as string;
+    expect(output).not.toMatch(/[█▀▄]/);
+    expect(output).toContain('terminal too narrow');
+    expect(output).toContain(url); // still usable without the QR
+  });
+
+  test('falls back to 80 columns when the TTY reports no width', () => {
+    const stream = fakeStream(true, undefined);
+    displayVerification(url, 'ABCD-1234', stream);
+    const output = stream.write.mock.calls[0][0] as string;
+    expect(output).toMatch(/[█▀▄]/);
   });
 });

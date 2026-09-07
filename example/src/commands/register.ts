@@ -4,13 +4,13 @@
  * Uses the SDK's `registerDevice()` helper, which implements the full
  * device authorization flow (similar to GitHub CLI):
  *   1. Request a verification code from the server
- *   2. User opens URL in browser and enters the code
+ *   2. User opens URL in browser (or scans the QR) and enters the code
  *   3. SDK polls for the token
  *   4. Store config and credentials locally via ConfigManager
  */
 
 import * as os from 'os';
-import { registerDevice } from '@cmdctrl/daemon-sdk';
+import { registerDevice, displayVerification } from '@cmdctrl/daemon-sdk';
 import { AGENT_TYPE, config } from '../context';
 
 interface RegisterOptions {
@@ -38,11 +38,7 @@ export async function register(options: RegisterOptions): Promise<void> {
       deviceName,
       os.hostname(),
       AGENT_TYPE,
-      (verificationUrl) => {
-        console.log('Open this URL in your browser to complete registration:\n');
-        console.log(`  ${verificationUrl}\n`);
-        console.log('Waiting for verification...');
-      }
+      displayVerification
     );
   } catch (err) {
     console.error('\nRegistration failed:', err instanceof Error ? err.message : err);

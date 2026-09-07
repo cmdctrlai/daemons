@@ -314,6 +314,41 @@ describe('SessionWatcher', () => {
   });
 });
 
+describe('SessionWatcher.normalizeToolUse', () => {
+  // Access the private method for unit testing the normalized tool descriptor.
+  const normalize = (name: string, input?: Record<string, unknown>) =>
+    (new SessionWatcher(() => {}) as unknown as {
+      normalizeToolUse(n: string, i?: Record<string, unknown>): { tool: string; argSummary: string };
+    }).normalizeToolUse(name, input);
+
+  const cases: Array<{
+    name: string;
+    tool: string;
+    input?: Record<string, unknown>;
+    want: { tool: string; argSummary: string };
+  }> = [
+    { name: 'Read uses file_path', tool: 'Read', input: { file_path: '/a/b/main.go' }, want: { tool: 'Read', argSummary: '/a/b/main.go' } },
+    { name: 'Write uses file_path', tool: 'Write', input: { file_path: 'x.ts' }, want: { tool: 'Write', argSummary: 'x.ts' } },
+    { name: 'Edit uses file_path', tool: 'Edit', input: { file_path: 'y.ts' }, want: { tool: 'Edit', argSummary: 'y.ts' } },
+    { name: 'Bash uses command truncated to 60', tool: 'Bash', input: { command: 'a'.repeat(80) }, want: { tool: 'Bash', argSummary: 'a'.repeat(60) } },
+    { name: 'Grep uses pattern', tool: 'Grep', input: { pattern: 'func main' }, want: { tool: 'Grep', argSummary: 'func main' } },
+    { name: 'Glob uses pattern', tool: 'Glob', input: { pattern: '**/*.ts' }, want: { tool: 'Glob', argSummary: '**/*.ts' } },
+    { name: 'Task uses description', tool: 'Task', input: { description: 'fix the bug' }, want: { tool: 'Task', argSummary: 'fix the bug' } },
+    { name: 'WebSearch uses query', tool: 'WebSearch', input: { query: 'pgx pooling' }, want: { tool: 'WebSearch', argSummary: 'pgx pooling' } },
+    { name: 'WebFetch uses url', tool: 'WebFetch', input: { url: 'https://x.dev' }, want: { tool: 'WebFetch', argSummary: 'https://x.dev' } },
+    { name: 'TodoWrite has empty arg', tool: 'TodoWrite', input: {}, want: { tool: 'TodoWrite', argSummary: '' } },
+    { name: 'missing input yields empty arg', tool: 'Read', input: undefined, want: { tool: 'Read', argSummary: '' } },
+    { name: 'non-string input yields empty arg', tool: 'Bash', input: { command: 123 }, want: { tool: 'Bash', argSummary: '' } },
+    { name: 'unknown tool passes name with empty arg', tool: 'CustomThing', input: { foo: 'bar' }, want: { tool: 'CustomThing', argSummary: '' } },
+  ];
+
+  for (const c of cases) {
+    it(c.name, () => {
+      expect(normalize(c.tool, c.input)).toEqual(c.want);
+    });
+  }
+});
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
