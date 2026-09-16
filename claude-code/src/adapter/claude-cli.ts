@@ -1,8 +1,5 @@
-import { spawn, ChildProcess } from 'child_process';
-import * as readline from 'readline';
 import * as fs from 'fs';
 import * as os from 'os';
-import * as path from 'path';
 import {
   StreamEvent,
   AskUserInput,
@@ -13,112 +10,11 @@ import { findSessionFile } from '../message-reader';
 import { rewriteSdkCliEntrypoint } from './entrypoint-rewrite';
 import { KeyedMutex } from './keyed-mutex';
 import { deliverToBgSession } from './claude-daemon';
+import { AgentSession } from './agent-session';
 
 const DEFAULT_TIMEOUT = 10 * 60 * 1000; // 10 minutes
-const IMAGE_TMP_DIR = path.join(os.tmpdir(), 'cmdctrl-images');
-
-/**
- * Save base64 data URL images to local temp files and build a message
- * with file path references for Claude to read.
- */
-function saveImagesAndBuildMessage(taskId: string, text: string, images?: string[]): string {
-  if (!images || images.length === 0) {
-    return text;
-  }
-
-  // Ensure temp directory exists
-  fs.mkdirSync(IMAGE_TMP_DIR, { recursive: true });
-
-  const filePaths: string[] = [];
-  for (let i = 0; i < images.length; i++) {
-    const dataUrl = images[i];
-    const parts = dataUrl.split(',', 2);
-    if (parts.length !== 2) {
-      console.log(`[${taskId}] Skipping image ${i + 1}: invalid data URL`);
-      continue;
-    }
-
-    // Determine extension from MIME type
-    let ext = '.png';
-    const header = parts[0];
-    if (header.includes('jpeg') || header.includes('jpg')) ext = '.jpg';
-    else if (header.includes('gif')) ext = '.gif';
-    else if (header.includes('webp')) ext = '.webp';
-
-    // Decode and write to temp file
-    try {
-      const data = Buffer.from(parts[1], 'base64');
-      const filePath = path.join(IMAGE_TMP_DIR, `image_${Date.now()}_${i}${ext}`);
-      fs.writeFileSync(filePath, data);
-      filePaths.push(filePath);
-      console.log(`[${taskId}] Saved image ${i + 1} (${data.length} bytes) to ${filePath}`);
-    } catch (err) {
-      console.error(`[${taskId}] Failed to save image ${i + 1}:`, err);
-    }
-  }
-
-  if (filePaths.length === 0) {
-    return text;
-  }
-
-  // Build message with file path references
-  let result = text;
-  if (text) result += '\n\n';
-  result += 'The user has attached the following image(s). Please read them using your Read tool:\n';
-  for (let i = 0; i < filePaths.length; i++) {
-    result += `\n- Image ${i + 1}: ${filePaths[i]}\n`;
-  }
-
-  return result;
-}
-
-// Find claude CLI in common locations
-function findClaudeCli(): string {
-  if (process.env.CLAUDE_CODE_CLI_PATH) {
-    return process.env.CLAUDE_CODE_CLI_PATH;
-  }
-
-  const home = os.homedir();
-  const commonPaths = [
-    path.join(home, '.local', 'bin', 'claude'),        // New standalone installer
-    path.join(home, '.npm-global', 'bin', 'claude'),    // Legacy npm global
-    path.join(home, '.nvm', 'versions', 'node', 'v20.18.0', 'bin', 'claude'),
-    '/usr/local/bin/claude',
-    '/opt/homebrew/bin/claude',
-    'claude' // Fall back to PATH
-  ];
-
-  for (const p of commonPaths) {
-    if (p === 'claude') return p; // PATH fallback
-    try {
-      if (fs.existsSync(p)) {
-        return p;
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return 'claude'; // Fall back to PATH
-}
-
-// Resolve on each use so path changes (reinstalls) are picked up without daemon restart
-function getClaudeCli(): string {
-  const p = findClaudeCli();
-  return p;
-}
-
-// Build a clean environment for spawned Claude CLI processes.
-// Strips CLAUDECODE to avoid the "nested session" guard that was
-// added in recent Claude Code versions. Sets CLAUDE_CODE_ENTRYPOINT
-// to "cli" so sessions appear in `claude --resume` picker (v2.1.90+
-// filters out "sdk-cli" sessions).
-function cleanEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  delete env.CLAUDECODE;
-  env.CLAUDE_CODE_ENTRYPOINT = 'cli';
-  return env;
-}
+/** An unanswered question holds a turn open no longer than this. */
+const QUESTION_TIMEOUT = 60 * 60 * 1000; // 1 hour
 
 /**
  * Read the last user message UUID from a session JSONL file
@@ -135,69 +31,32 @@ function getLastUserMessageUuid(sessionId: string): string | undefined {
     const content = fs.readFileSync(filePath, 'utf-8');
     const lines = content.split('\n').filter(l => l.trim());
 
-    // Count user messages for debugging
-    let userMessageCount = 0;
     let lastUserUuid: string | undefined;
-    let lastUserContent: string | undefined;
-
-    // Find the last user message UUID (iterate backwards)
-    for (let i = lines.length - 1; i >= 0; i--) {
+    for (const line of lines) {
       try {
-        const entry = JSON.parse(lines[i]);
-        if (entry.type === 'user' && entry.uuid) {
-          userMessageCount++;
-          if (!lastUserUuid) {
-            lastUserUuid = entry.uuid;
-            // Get first 50 chars of message content for debugging
-            if (entry.message?.content) {
-              const msgContent = typeof entry.message.content === 'string'
-                ? entry.message.content
-                : JSON.stringify(entry.message.content);
-              lastUserContent = msgContent.substring(0, 50);
-            }
-          }
+        const entry = JSON.parse(line) as Record<string, unknown>;
+        if (entry.type === 'user' && typeof entry.uuid === 'string') {
+          lastUserUuid = entry.uuid;
         }
       } catch {
         continue;
       }
     }
-
-    console.log(`[getLastUserMessageUuid] Found ${userMessageCount} user messages, last UUID: ${lastUserUuid}, content: "${lastUserContent}"`);
     return lastUserUuid;
   } catch (err) {
-    console.log(`[getLastUserMessageUuid] File read error:`, err);
+    console.error(`[getLastUserMessageUuid] Failed to read ${filePath}:`, err);
+    return undefined;
   }
-
-  return undefined;
 }
 
-// Allowed tools for Claude CLI
-const ALLOWED_TOOLS = [
-  'Read',
-  'Glob',
-  'Grep',
-  'WebSearch',
-  'WebFetch',
-  'LSP',
-  'Task',
-  'TodoWrite',
-  'Bash',
-  'Edit',
-  'Write',
-  'NotebookEdit',
-  'AskUserQuestion'  // Required for pause/resume workflow
-].join(',');
-
-interface RunningTask {
-  taskId: string;
-  sessionId: string;
+/** Per-turn state accumulated from the agent's stream. */
+interface TurnState {
   question: string;
   options: QuestionOption[];
   context: string;
-  process: ChildProcess | null;
   timeoutHandle: NodeJS.Timeout | null;
-  userMessageUuid?: string; // UUID of the triggering user message (for verbose output positioning)
-  planContent?: string; // Stored plan content from ExitPlanMode for WAIT_FOR_USER emission
+  userMessageUuid?: string;
+  planContent?: string;
 }
 
 type EventCallback = (
@@ -212,13 +71,32 @@ type EventCallback = (
  */
 type SlashCommandsCallback = (project: string, commands: string[]) => void;
 
+/** Resolve the project path, falling back to home when it no longer exists. */
+function resolveCwd(taskId: string, projectPath: string | undefined, onEvent?: EventCallback): string | undefined {
+  if (!projectPath) return undefined;
+  if (fs.existsSync(projectPath)) return projectPath;
+
+  console.log(`[${taskId}] Warning: project path does not exist: ${projectPath}, using home dir`);
+  onEvent?.(taskId, 'WARNING', {
+    warning: `Project path "${projectPath}" does not exist. Running in home directory instead.`
+  });
+  return os.homedir();
+}
+
 export class ClaudeAdapter {
-  private running: Map<string, RunningTask> = new Map();
+  /** One live agent per session id, once the agent has reported one. */
+  private sessions: Map<string, AgentSession> = new Map();
+  /** Every live agent, including one that has not reported its id yet. */
+  private live: Set<AgentSession> = new Set();
+  /** Turn state, keyed by task id. */
+  private turns: Map<string, TurnState> = new Map();
   private onEvent: EventCallback;
   private onSlashCommands?: SlashCommandsCallback;
-  // Serializes resumes per session: only one `claude --resume` runs at a time
-  // for a given session id. See resumeTask.
-  private resumeLock = new KeyedMutex();
+  /**
+   * Serializes session creation per session id. Two agents on one transcript
+   * fork it and silently orphan a turn.
+   */
+  private createLock = new KeyedMutex();
 
   constructor(onEvent: EventCallback, onSlashCommands?: SlashCommandsCallback) {
     this.onEvent = onEvent;
@@ -236,68 +114,19 @@ export class ClaudeAdapter {
   ): Promise<void> {
     console.log(`[${taskId}] Starting task: ${instruction.substring(0, 50)}...`);
 
-    const rt: RunningTask = {
-      taskId,
-      sessionId: '',
-      question: '',
-      options: [],
-      context: '',
-      process: null,
-      timeoutHandle: null
-    };
+    const cwd = resolveCwd(taskId, projectPath, this.onEvent);
+    const session = this.createSession(taskId, cwd);
 
-    this.running.set(taskId, rt);
-
-    // Validate cwd exists
-    let cwd: string | undefined = undefined;
-    if (projectPath && fs.existsSync(projectPath)) {
-      cwd = projectPath;
-    } else if (projectPath) {
-      console.log(`[${taskId}] Warning: project path does not exist: ${projectPath}, using home dir`);
-      cwd = os.homedir();
-      // Notify user that the path doesn't exist
-      this.onEvent(taskId, 'WARNING', {
-        warning: `Project path "${projectPath}" does not exist. Running in home directory instead.`
-      });
-    }
-
-    // Save images locally and build the message with file path references
-    const messageWithImages = saveImagesAndBuildMessage(taskId, instruction, images);
-
-    // Build command arguments
-    const args = [
-      '-p', messageWithImages,
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--permission-mode', 'acceptEdits',
-      '--allowedTools', ALLOWED_TOOLS
-    ];
-
-    console.log(`[${taskId}] Spawning: ${getClaudeCli()} with cwd: ${cwd || 'default'}`);
-
-    // Spawn Claude CLI (no shell - direct execution preserves arguments correctly)
-    const proc = spawn(getClaudeCli(), args, {
-      cwd,
-      env: cleanEnv(),
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    rt.process = proc;
-
-    // Set timeout
-    rt.timeoutHandle = setTimeout(() => {
-      console.log(`[${taskId}] Task timed out`);
-      proc.kill('SIGKILL');
-      this.onEvent(taskId, 'ERROR', { error: 'execution timeout' });
-    }, DEFAULT_TIMEOUT);
-
-    // Handle process events
-    this.handleProcessOutput(taskId, proc, rt);
+    this.beginTurn(taskId);
+    session.send(taskId, instruction, images);
   }
 
   /**
-   * Resume a task with user's reply
-   * Falls back to startTask if session doesn't exist
+   * Resume a task with user's reply.
+   *
+   * A session we already hold takes the message directly – mid-turn if one is
+   * running, or as the answer to an open question. Otherwise we adopt the
+   * session by resuming it.
    */
   async resumeTask(
     taskId: string,
@@ -309,192 +138,81 @@ export class ClaudeAdapter {
     console.log(`[${taskId}] ===== RESUME TASK START =====`);
     console.log(`[${taskId}] Session: ${sessionId.slice(-8)}, Message: "${message.slice(0, 50)}..."`);
 
-    const rt: RunningTask = {
-      taskId,
-      sessionId,
-      question: '',
-      options: [],
-      context: '',
-      process: null,
-      timeoutHandle: null,
-      userMessageUuid: undefined
-    };
+    const live = this.sessions.get(sessionId);
+    if (live && !live.isClosed) {
+      // The turn this session was already serving hands its watchdog over to the
+      // new task. Left running it would fire on a task nothing is serving any
+      // more and report a bogus execution timeout on a healthy session.
+      if (live.taskId && live.taskId !== taskId) {
+        this.endTurn(live.taskId);
+      }
 
-    // Note: userMessageUuid starts as undefined - will be read from JSONL on first assistant event
-    console.log(`[${taskId}] Initial state: sessionId=${sessionId.slice(-8)}, userMessageUuid=none`);
-
-    this.running.set(taskId, rt);
-
-    // Serialize resumes of the same session. Hold this lock from here until the
-    // child process exits, so a second resume of this session can't spawn
-    // before the current turn is committed. Two `claude --resume` processes
-    // writing the same JSONL at once fork it and silently orphan a turn.
-    const releaseLock = await this.resumeLock.acquire(sessionId);
-    // task_id is per-session, so a later message for this session overwrites
-    // our entry in `running` while we wait here. That's fine – every queued
-    // message still runs, in arrival order; we never drop one. The close/error
-    // handlers below guard their map cleanup with an identity check so a prior
-    // task's exit can't delete a newer task's entry.
-
-    let messageWithImages: string;
-    try {
-      // Save images locally and build the message with file path references.
-      messageWithImages = saveImagesAndBuildMessage(taskId, message, images);
-
-      // If the target session is running as a live background agent, `claude
-      // --resume` refuses it ("is currently running as a background agent").
-      // Deliver through the supervisor control socket instead – the same transport
-      // agent view uses to reply to a running session. On success the bg agent
-      // writes the user turn and its response to the session JSONL, which
-      // SessionWatcher streams to the app; we just need to make sure it's watched.
-      const outcome = await deliverToBgSession(sessionId, messageWithImages);
-      if (outcome.delivered) {
-        console.log(`[${taskId}] Delivered to live background agent via control socket`);
-        if (this.running.get(taskId) === rt) {
-          this.running.delete(taskId);
+      // An open question consumes the reply as its answer, so the agent
+      // resumes inside the tool call instead of being told again afterwards.
+      // Anything that is not an answer releases the question instead, so the
+      // turn unparks and the message is delivered as the user meant it.
+      if (live.hasOpenQuestion()) {
+        if (live.isAnswer(message, images)) {
+          live.answerQuestion(taskId, message);
+          console.log(`[${taskId}] Answered open question on session ${sessionId.slice(-8)}`);
+          this.beginTurn(taskId);
+          return;
         }
-        this.onEvent(taskId, 'SESSION_STARTED', { session_id: sessionId });
-        releaseLock();
+        live.cancelQuestion('The user sent a new message instead of answering.');
+        console.log(`[${taskId}] Released open question on session ${sessionId.slice(-8)}`);
+      }
+      console.log(`[${taskId}] Delivered to live session ${sessionId.slice(-8)}`);
+      this.beginTurn(taskId);
+      live.send(taskId, message, images);
+      return;
+    }
+
+    // Sessions held by a supervised background agent are not ours to resume –
+    // the control socket is the only way in.
+    const outcome = await deliverToBgSession(sessionId, message);
+    if (outcome.delivered) {
+      console.log(`[${taskId}] Delivered to live background agent via control socket`);
+      this.onEvent(taskId, 'SESSION_STARTED', { session_id: sessionId });
+      return;
+    }
+    if (outcome.reason !== 'not-bg') {
+      console.log(`[${taskId}] Background delivery unavailable (${outcome.reason}${outcome.code ? `: ${outcome.code}` : ''}), resuming directly`);
+    }
+
+    const releaseLock = await this.createLock.acquire(sessionId);
+    try {
+      const existing = this.sessions.get(sessionId);
+      if (existing && !existing.isClosed) {
+        this.beginTurn(taskId);
+        existing.send(taskId, message, images);
         return;
       }
-      if (outcome.reason !== 'not-bg') {
-        console.log(`[${taskId}] Background delivery unavailable (${outcome.reason}${outcome.code ? `: ${outcome.code}` : ''}), falling back to --resume`);
-      }
-    } catch (err) {
-      // Setup failed before a process exists – don't leak the lock.
-      if (this.running.get(taskId) === rt) {
-        this.running.delete(taskId);
-      }
+
+      const cwd = resolveCwd(taskId, projectPath, this.onEvent);
+      const session = this.createSession(taskId, cwd, sessionId);
+      this.beginTurn(taskId);
+      session.send(taskId, message, images);
+    } finally {
       releaseLock();
-      throw err;
     }
-
-    // Validate cwd exists (same logic as startTask)
-    let cwd: string | undefined = undefined;
-    if (projectPath && fs.existsSync(projectPath)) {
-      cwd = projectPath;
-    } else if (projectPath) {
-      console.log(`[${taskId}] Warning: project path does not exist: ${projectPath}, using home dir`);
-      cwd = os.homedir();
-    }
-
-    let proc: ChildProcess;
-    try {
-      // Build command arguments with --resume
-      const args = [
-        '-p', messageWithImages,
-        '--resume', sessionId,
-        '--output-format', 'stream-json',
-        '--verbose',
-        '--permission-mode', 'acceptEdits',
-        '--allowedTools', ALLOWED_TOOLS
-      ];
-
-      console.log(`[${taskId}] Spawning resume: ${getClaudeCli()} --resume ${sessionId} with cwd: ${cwd || 'default'}`);
-
-      // Spawn Claude CLI with same cwd as original task (no shell - direct execution)
-      proc = spawn(getClaudeCli(), args, {
-        cwd,
-        env: cleanEnv(),
-        stdio: ['ignore', 'pipe', 'pipe']
-      });
-    } catch (err) {
-      // Setup/spawn failed before a process exists – don't leak the lock.
-      this.running.delete(taskId);
-      releaseLock();
-      throw err;
-    }
-
-    rt.process = proc;
-
-    // Hold the per-session lock until this resume is fully done. The close
-    // handler below releases it *after* the post-exit entrypoint rewrite, so the
-    // next resume can't append while that rewrite's atomic replace is in flight
-    // (which would clobber the appended lines). The error path has no rewrite
-    // and releases directly. Release is idempotent.
-    proc.once('error', releaseLock);
-
-    // Track if we've seen the "no conversation found" error
-    let sessionNotFound = false;
-    let stderrBuffer = '';
-
-    // Check stderr for session not found error
-    proc.stderr?.on('data', (data) => {
-      const text = data.toString();
-      stderrBuffer += text;
-      console.log(`[${taskId}] stderr: ${text}`);
-      if (text.includes('No conversation found')) {
-        sessionNotFound = true;
-      }
-    });
-
-    // Handle quick exit with session not found - fall back to new session
-    proc.on('close', (code) => {
-      if (code !== 0 && sessionNotFound) {
-        console.log(`[${taskId}] Session ${sessionId} not found, falling back to new session`);
-        // Clean up this attempt
-        if (rt.timeoutHandle) {
-          clearTimeout(rt.timeoutHandle);
-        }
-        // Only clear the map entry if it's still ours – a newer message for
-        // this session may have replaced it (task_id is per-session).
-        if (this.running.get(taskId) === rt) {
-          this.running.delete(taskId);
-        }
-        // The resumed session didn't exist, so there's nothing to fork – free
-        // the lock before falling back to a fresh (new-session) start.
-        releaseLock();
-        // Start fresh instead
-        this.startTask(taskId, message, projectPath);
-        return;
-      }
-      // Normal exit handling
-      console.log(`[${taskId}] Process exited with code ${code}`);
-      if (rt.timeoutHandle) {
-        clearTimeout(rt.timeoutHandle);
-      }
-      // Only clear the map entry if it's still ours – a newer message for this
-      // session may have replaced it while we ran (task_id is per-session).
-      if (this.running.get(taskId) === rt) {
-        this.running.delete(taskId);
-      }
-      // Rewrite entrypoint:"sdk-cli" → "cli" so the session
-      // shows up correctly when resumed from `claude --resume` later.
-      rewriteSdkCliEntrypoint(rt.sessionId);
-      // Release only after the rewrite, so the next queued resume of this
-      // session starts from a fully-settled file.
-      releaseLock();
-    });
-
-    // Set timeout
-    rt.timeoutHandle = setTimeout(() => {
-      console.log(`[${taskId}] Task timed out`);
-      proc.kill('SIGKILL');
-      this.onEvent(taskId, 'ERROR', { error: 'execution timeout' });
-    }, DEFAULT_TIMEOUT);
-
-    // Handle process events (but skip the close handler since we handle it above)
-    this.handleProcessOutputWithoutClose(taskId, proc, rt);
   }
 
   /**
    * Cancel a running task
    */
   async cancelTask(taskId: string): Promise<void> {
-    const rt = this.running.get(taskId);
-    if (!rt) {
+    const turn = this.turns.get(taskId);
+    if (!turn) {
       console.log(`[${taskId}] Task not found for cancellation`);
       return;
     }
 
-    if (rt.process) {
-      rt.process.kill('SIGTERM');
-    }
-    if (rt.timeoutHandle) {
-      clearTimeout(rt.timeoutHandle);
-    }
+    this.endTurn(taskId);
 
-    this.running.delete(taskId);
+    const session = this.sessionForTask(taskId);
+    if (session) {
+      await session.interrupt();
+    }
     console.log(`[${taskId}] Task cancelled`);
   }
 
@@ -502,137 +220,147 @@ export class ClaudeAdapter {
    * Stop all running tasks
    */
   async stopAll(): Promise<void> {
-    for (const [taskId, rt] of this.running) {
+    for (const taskId of Array.from(this.turns.keys())) {
       console.log(`[${taskId}] Stopping task`);
-      if (rt.process) {
-        rt.process.kill('SIGTERM');
-      }
-      if (rt.timeoutHandle) {
-        clearTimeout(rt.timeoutHandle);
-      }
+      this.endTurn(taskId);
     }
-    this.running.clear();
+    for (const session of this.live) {
+      session.close();
+    }
+    this.live.clear();
+    this.sessions.clear();
+    this.turns.clear();
   }
 
   /**
    * Get list of running task IDs
    */
   getRunningTasks(): string[] {
-    return Array.from(this.running.keys());
+    return Array.from(this.turns.keys());
+  }
+
+  /** Stand up an agent and wire its output back to the daemon's events. */
+  private createSession(taskId: string, cwd?: string, resume?: string): AgentSession {
+    console.log(`[${taskId}] Starting agent${resume ? ` (resume ${resume.slice(-8)})` : ''} with cwd: ${cwd || 'default'}`);
+
+    const session = new AgentSession({
+      taskId,
+      cwd,
+      resume,
+      questionTimeoutMs: QUESTION_TIMEOUT,
+      onStreamEvent: (tid, event) => this.handleStreamEvent(tid, event, session),
+      onQuestion: (tid, sessionId, input) => this.emitQuestion(tid, sessionId, input),
+      onError: (tid, err) => {
+        console.error(`[${tid}] Agent error:`, err);
+        this.endTurn(tid);
+        this.onEvent(tid, 'ERROR', { error: err.message });
+      },
+      onClosed: (sessionId) => {
+        this.live.delete(session);
+        if (this.sessions.get(sessionId) === session) {
+          this.sessions.delete(sessionId);
+        }
+        // Sessions the SDK wrote are stamped entrypoint:"sdk-cli"; rewrite so
+        // they appear in the user's own `claude --resume` picker.
+        if (sessionId) rewriteSdkCliEntrypoint(sessionId);
+      },
+    });
+
+    this.live.add(session);
+    if (resume) {
+      this.sessions.set(resume, session);
+    }
+    return session;
+  }
+
+  /** Find the session currently serving a task. */
+  private sessionForTask(taskId: string): AgentSession | undefined {
+    for (const session of this.live) {
+      if (session.taskId === taskId) return session;
+    }
+    return undefined;
+  }
+
+  /** Start the clock on a turn. */
+  private beginTurn(taskId: string): void {
+    this.endTurn(taskId);
+
+    const turn: TurnState = {
+      question: '',
+      options: [],
+      context: '',
+      timeoutHandle: null,
+      userMessageUuid: undefined,
+    };
+
+    this.armTurnTimer(taskId, turn, DEFAULT_TIMEOUT);
+    this.turns.set(taskId, turn);
+  }
+
+  /** (Re)start a turn's watchdog. Replaces any timer already on the turn. */
+  private armTurnTimer(taskId: string, turn: TurnState, timeoutMs: number): void {
+    if (turn.timeoutHandle) clearTimeout(turn.timeoutHandle);
+    turn.timeoutHandle = setTimeout(() => {
+      console.log(`[${taskId}] Task timed out`);
+      const session = this.sessionForTask(taskId);
+      void session?.interrupt();
+      this.turns.delete(taskId);
+      this.onEvent(taskId, 'ERROR', { error: 'execution timeout' });
+    }, timeoutMs);
+  }
+
+  /** Clear a turn's timer and forget it. */
+  private endTurn(taskId: string): void {
+    const turn = this.turns.get(taskId);
+    if (!turn) return;
+    if (turn.timeoutHandle) clearTimeout(turn.timeoutHandle);
+    this.turns.delete(taskId);
   }
 
   /**
-   * Handle process stdout/stderr and emit events
+   * Surface an AskUserQuestion to the app. The tool call stays open until the
+   * answer comes back, so this is a prompt rather than a completed turn.
    */
-  private handleProcessOutput(
-    taskId: string,
-    proc: ChildProcess,
-    rt: RunningTask
-  ): void {
-    // Create readline interface for NDJSON parsing
-    const rl = readline.createInterface({
-      input: proc.stdout!,
-      crlfDelay: Infinity
-    });
+  private emitQuestion(taskId: string, sessionId: string, input: AskUserInput): void {
+    const q = input.questions?.[0];
+    if (!q) return;
 
-    // Parse each line as JSON to track state (userMessageUuid)
-    // NOTE: Verbose output is now handled by SessionWatcher via JSONL-based VERBOSE events
-    // We still parse stream events here to track userMessageUuid for TASK_COMPLETE
-    rl.on('line', (line) => {
-      try {
-        const event = JSON.parse(line) as StreamEvent;
-        this.handleStreamEvent(taskId, event, rt);
-      } catch {
-        // Not valid JSON, skip
-      }
-    });
+    const turn = this.turns.get(taskId);
+    if (turn) {
+      turn.question = q.question;
+      turn.options = q.options || [];
+      // A parked question emits nothing until the user answers, so the ordinary
+      // turn watchdog would interrupt the session and deny the tool call while
+      // the question is still sitting on someone's phone. Hand the turn the
+      // question's own budget instead; answering starts a fresh normal turn.
+      this.armTurnTimer(taskId, turn, QUESTION_TIMEOUT);
+    }
+    console.log(`[${taskId}] Question detected: ${q.question}`);
 
-    // Log stderr
-    proc.stderr?.on('data', (data) => {
-      console.log(`[${taskId}] stderr: ${data.toString()}`);
-    });
-
-    // Handle process exit
-    proc.on('close', (code) => {
-      console.log(`[${taskId}] Process exited with code ${code}`);
-
-      if (rt.timeoutHandle) {
-        clearTimeout(rt.timeoutHandle);
-      }
-      this.running.delete(taskId);
-      // Rewrite entrypoint:"sdk-cli" → "cli" so the session
-      // shows up correctly when resumed from `claude --resume` later.
-      rewriteSdkCliEntrypoint(rt.sessionId);
-    });
-
-    proc.on('error', (err) => {
-      console.error(`[${taskId}] Process error:`, err);
-      this.onEvent(taskId, 'ERROR', { error: err.message });
-
-      if (rt.timeoutHandle) {
-        clearTimeout(rt.timeoutHandle);
-      }
-      this.running.delete(taskId);
+    this.onEvent(taskId, 'WAIT_FOR_USER', {
+      session_id: sessionId,
+      prompt: q.question,
+      options: q.options || [],
+      context: turn?.context ?? '',
+      user_message_uuid: turn?.userMessageUuid,
+      permission_tool: 'AskUserQuestion',
     });
   }
 
   /**
-   * Handle process stdout and emit events (without close handler - for resumeTask fallback)
-   */
-  private handleProcessOutputWithoutClose(
-    taskId: string,
-    proc: ChildProcess,
-    rt: RunningTask
-  ): void {
-    // Create readline interface for NDJSON parsing
-    const rl = readline.createInterface({
-      input: proc.stdout!,
-      crlfDelay: Infinity
-    });
-
-    // Parse each line as JSON to track state (userMessageUuid)
-    // NOTE: Verbose output is now handled by SessionWatcher via JSONL-based VERBOSE events
-    // We still parse stream events here to track userMessageUuid for TASK_COMPLETE
-    rl.on('line', (line) => {
-      try {
-        const event = JSON.parse(line) as StreamEvent;
-        this.handleStreamEvent(taskId, event, rt);
-      } catch {
-        // Not valid JSON, skip
-      }
-    });
-
-    // Note: stderr is handled by resumeTask caller
-    // Note: close is handled by resumeTask caller
-
-    proc.on('error', (err) => {
-      console.error(`[${taskId}] Process error:`, err);
-      this.onEvent(taskId, 'ERROR', { error: err.message });
-
-      if (rt.timeoutHandle) {
-        clearTimeout(rt.timeoutHandle);
-      }
-      // Only clear if still ours (task_id is per-session; a newer message may
-      // have replaced this entry).
-      if (this.running.get(taskId) === rt) {
-        this.running.delete(taskId);
-      }
-    });
-  }
-
-  /**
-   * Handle a parsed stream event from Claude CLI
+   * Handle a parsed stream event from the agent
    */
   private handleStreamEvent(
     taskId: string,
     event: StreamEvent,
-    rt: RunningTask
+    session: AgentSession
   ): void {
-    // Debug logging for all events
     console.log(`[${taskId}] Event: type=${event.type}, subtype=${event.subtype || 'none'}`);
     if (event.permission_denials?.length) {
       console.log(`[${taskId}] Permission denials:`, JSON.stringify(event.permission_denials));
     }
+
+    const turn = this.turns.get(taskId);
 
     switch (event.type) {
       case 'system':
@@ -642,12 +370,8 @@ export class ClaudeAdapter {
           this.onSlashCommands?.(event.cwd, event.slash_commands);
         }
         if (event.subtype === 'init' && event.session_id) {
-          rt.sessionId = event.session_id;
           console.log(`[${taskId}] Session initialized: ${event.session_id}`);
-          // DON'T read UUID here - Claude CLI hasn't written the new user message yet
-          // The frontend has the correct UUID from when the user sent the message
-          // By not setting UUID here, frontend will use its verboseOutputUserUuid fallback
-          // Emit SESSION_STARTED to trigger file watching for unified notifications
+          this.sessions.set(event.session_id, session);
           this.onEvent(taskId, 'SESSION_STARTED', {
             session_id: event.session_id
           });
@@ -655,14 +379,8 @@ export class ClaudeAdapter {
         break;
 
       case 'assistant':
-        // DON'T read UUID here - Claude may not have written the new user message to JSONL yet
-        // Reading now would get the PREVIOUS message's UUID, causing wrong positioning
-        // The frontend has the correct UUID from when the user sent the message
-        // We only read UUID at TASK_COMPLETE where we need it for the final message
-        console.log(`[${taskId}] assistant event: currentUuid=${rt.userMessageUuid?.slice(-8) || 'none'}, sessionId=${rt.sessionId?.slice(-8) || 'none'}`);
         if (event.message?.content) {
           for (const block of event.message.content) {
-            // Skip thinking blocks if they come as separate type
             if (block.type === 'thinking') {
               continue;
             }
@@ -671,11 +389,11 @@ export class ClaudeAdapter {
             if (block.type === 'text' && block.text) {
               // Strip <thinking>...</thinking> tags (may be embedded in text)
               const text = block.text.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trim();
-              if (text) {
-                if (rt.context) {
-                  rt.context += '\n\n';
+              if (text && turn) {
+                if (turn.context) {
+                  turn.context += '\n\n';
                 }
-                rt.context += text;
+                turn.context += text;
               }
             }
 
@@ -692,48 +410,36 @@ export class ClaudeAdapter {
                 });
               }
 
-              // Check for AskUserQuestion
-              if (block.name === 'AskUserQuestion' && block.input) {
-                const input = block.input as AskUserInput;
-                if (input.questions?.length > 0) {
-                  const q = input.questions[0];
-                  rt.question = q.question;
-                  rt.options = q.options || [];
-                  console.log(`[${taskId}] Question detected: ${q.question}`);
-                }
-              }
-
-              // Check for ExitPlanMode — store plan content for WAIT_FOR_USER emission
-              if (block.name === 'ExitPlanMode' && block.input) {
+              // Store plan content for the WAIT_FOR_USER emission below
+              if (block.name === 'ExitPlanMode' && block.input && turn) {
                 const planInput = block.input as Record<string, unknown>;
-                rt.planContent = (planInput.plan as string) || (planInput.content as string) || '';
-                console.log(`[${taskId}] Plan mode detected, plan content length: ${rt.planContent.length}`);
+                turn.planContent = (planInput.plan as string) || (planInput.content as string) || '';
+                console.log(`[${taskId}] Plan mode detected, plan content length: ${turn.planContent.length}`);
               }
             }
           }
         }
         break;
 
-      case 'result':
-        // Check for permission denials (user input needed)
-        if (event.permission_denials?.length) {
-          // Any permission denial means the task is waiting for user input
-          const denials = event.permission_denials;
+      case 'result': {
+        // A denial means the agent needs approval it could not get on its own.
+        // An AskUserQuestion denial is the exception: it is this adapter's own
+        // doing – a question released or timed out – and the tool exists to ask
+        // the user something, so there is no permission for them to grant.
+        const denials = (event.permission_denials ?? []).filter(
+          (denial) => denial.tool_name !== 'AskUserQuestion'
+        );
+        if (denials.length) {
           const firstDenial = denials[0];
 
-          // Build a descriptive prompt based on the denied tool
-          let prompt = rt.question; // Use AskUserQuestion prompt if available
-          let options = rt.options;
+          let prompt = turn?.question ?? '';
+          const options = turn?.options ?? [];
 
           if (!prompt) {
-            // Construct prompt from permission denial info
             const toolName = firstDenial.tool_name;
-            if (toolName === 'AskUserQuestion') {
-              prompt = 'Agent is asking a question';
-            } else if (toolName === 'ExitPlanMode') {
+            if (toolName === 'ExitPlanMode') {
               prompt = 'Plan ready for approval';
             } else {
-              // Permission request for file/bash operations
               prompt = `Permission required for: ${toolName}`;
               if (denials.length > 1) {
                 prompt += ` (and ${denials.length - 1} more)`;
@@ -741,47 +447,43 @@ export class ClaudeAdapter {
             }
           }
 
-          // Use plan content as context if available (from ExitPlanMode detection)
-          if (rt.planContent && firstDenial.tool_name === 'ExitPlanMode') {
-            rt.context = rt.planContent;
+          if (turn?.planContent && firstDenial.tool_name === 'ExitPlanMode') {
+            turn.context = turn.planContent;
           }
 
           console.log(`[${taskId}] Task waiting for user input - tool: ${firstDenial.tool_name}, prompt: ${prompt}`);
 
           this.onEvent(taskId, 'WAIT_FOR_USER', {
-            session_id: rt.sessionId,
+            session_id: session.sessionId,
             prompt: prompt,
             options: options,
-            context: rt.context,
-            user_message_uuid: rt.userMessageUuid,
+            context: turn?.context ?? '',
+            user_message_uuid: turn?.userMessageUuid,
             permission_tool: firstDenial.tool_name
           });
           return;
         }
 
-        // Task completed - re-read the UUID to ensure we have the correct one
-        // (the first assistant event may arrive before the JSONL is fully written)
-        console.log(`[${taskId}] TASK_COMPLETE: checking UUID. Current=${rt.userMessageUuid?.slice(-8) || 'none'}`);
-        if (rt.sessionId) {
-          console.log(`[${taskId}] Re-reading UUID from JSONL at completion...`);
-          const freshUuid = getLastUserMessageUuid(rt.sessionId);
-          console.log(`[${taskId}] Fresh UUID from JSONL: ${freshUuid?.slice(-8) || 'none'}`);
-          if (freshUuid && freshUuid !== rt.userMessageUuid) {
-            console.log(`[${taskId}] UUID UPDATED at completion: ${rt.userMessageUuid?.slice(-8) || 'none'} -> ${freshUuid.slice(-8)}`);
-            rt.userMessageUuid = freshUuid;
-          } else if (freshUuid === rt.userMessageUuid) {
-            console.log(`[${taskId}] UUID unchanged at completion: ${freshUuid?.slice(-8) || 'none'}`);
+        // Re-read the UUID at completion: the first assistant event can arrive
+        // before the triggering user message is on disk.
+        if (session.sessionId && turn) {
+          const freshUuid = getLastUserMessageUuid(session.sessionId);
+          if (freshUuid) {
+            turn.userMessageUuid = freshUuid;
           }
         }
-        console.log(`[${taskId}] EMITTING TASK_COMPLETE with uuid=${rt.userMessageUuid?.slice(-8) || 'none'}`);
-        // Use accumulated context as result, fall back to event.result
-        const finalResult = rt.context || event.result || '';
+        console.log(`[${taskId}] EMITTING TASK_COMPLETE with uuid=${turn?.userMessageUuid?.slice(-8) || 'none'}`);
+
+        const finalResult = turn?.context || event.result || '';
+        const userMessageUuid = turn?.userMessageUuid;
+        this.endTurn(taskId);
         this.onEvent(taskId, 'TASK_COMPLETE', {
-          session_id: rt.sessionId,
+          session_id: session.sessionId,
           result: finalResult,
-          user_message_uuid: rt.userMessageUuid
+          user_message_uuid: userMessageUuid
         });
         break;
+      }
     }
   }
 }
