@@ -8,6 +8,26 @@ import * as path from 'path';
 import * as os from 'os';
 import { MessageEntry } from '@cmdctrl/daemon-sdk';
 
+/** One tappable choice the agent offered. */
+export interface MessageQuestionOption {
+  label: string;
+  description?: string;
+}
+
+/**
+ * An AskUserQuestion the agent asked, carried alongside the message text so
+ * clients can render the choices instead of a bare tool chip.
+ */
+export interface MessageQuestion {
+  question: string;
+  header?: string;
+  multi_select?: boolean;
+  options: MessageQuestionOption[];
+}
+
+/** A message plus the structured extras we lift out of the transcript. */
+export type ReadMessageEntry = MessageEntry & { question?: MessageQuestion };
+
 // Size of chunks to read when scanning for messages
 const CHUNK_SIZE = 64 * 1024; // 64KB
 
@@ -32,6 +52,36 @@ interface JournalEntry {
 }
 
 /**
+ * The CLI's two ways of reporting answers back to the agent. Which one it uses
+ * turns on whether every answer was an exact option label, so both have to be
+ * recognised or free text goes unrecorded.
+ */
+const ANSWER_PREFIXES = [
+  'Your questions have been answered:',
+  'The user answered:',
+];
+
+/**
+ * The chosen labels from an AskUserQuestion tool result, or '' for any other
+ * result.
+ *
+ * A tapped answer is consumed by the tool call, so the only record of it is
+ * the result the tool writes back. Reading the labels out gives the answer a
+ * message of its own; without one the agent's question stays the newest entry
+ * and a reload offers the same options again.
+ */
+function askUserAnswers(content: unknown): string {
+  if (typeof content !== 'string') return '';
+  const trimmed = content.trimStart();
+  if (!ANSWER_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) return '';
+
+  // The labels are interpolated raw, so an answer may contain quotes of its
+  // own. A pair ends only where the next one starts or the sentence does.
+  const answers = [...trimmed.matchAll(/"="([\s\S]*?)"(?=,\s*"|\.|$)/g)];
+  return answers.map((m) => m[1]).join(', ');
+}
+
+/**
  * Extract readable text from message content (handles string or array of content blocks)
  */
 function extractReadableText(content: unknown): string {
@@ -51,7 +101,13 @@ function extractReadableText(content: unknown): string {
         if (block.type === 'text' && typeof block.text === 'string') {
           textParts.push(block.text);
         }
-        // Skip tool_use, tool_result, image blocks etc.
+        // An answered question is the one tool result worth showing: it is the
+        // user's own words, and nothing else carries them.
+        else if (block.type === 'tool_result') {
+          const answers = askUserAnswers(block.content);
+          if (answers) textParts.push(answers);
+        }
+        // Skip tool_use, image blocks etc.
         // Tool calls are shown as verbose output during execution, not as permanent messages
       }
     }
@@ -156,11 +212,55 @@ export function findSessionFile(sessionId: string): string | null {
 }
 
 /**
+ * Pull the first question out of an AskUserQuestion tool input.
+ *
+ * The tool takes an array, but only the first question is ever surfaced – the
+ * agent blocks on it, so a second one could not be answered independently.
+ */
+function parseAskUserQuestion(input: unknown): MessageQuestion | null {
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+  const questions = (input as Record<string, unknown>).questions;
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return null;
+  }
+  const first = questions[0] as Record<string, unknown>;
+  const text = typeof first?.question === 'string' ? first.question.trim() : '';
+  if (!text) {
+    return null;
+  }
+  const options: MessageQuestionOption[] = [];
+  if (Array.isArray(first.options)) {
+    for (const option of first.options as Record<string, unknown>[]) {
+      const label = typeof option?.label === 'string' ? option.label.trim() : '';
+      if (!label) {
+        continue;
+      }
+      const description =
+        typeof option?.description === 'string' ? option.description.trim() : '';
+      options.push(description ? { label, description } : { label });
+    }
+  }
+  if (options.length === 0) {
+    return null;
+  }
+  return {
+    question: text,
+    ...(typeof first.header === 'string' && first.header.trim()
+      ? { header: first.header.trim() }
+      : {}),
+    ...(first.multiSelect === true ? { multi_select: true } : {}),
+    options,
+  };
+}
+
+/**
  * Parse a JSONL line into a MessageEntry if it's a displayable message
  * For truncated lines (marked with TRUNCATED_LINE_MARKER), we extract UUID via regex
  * and return a placeholder message instead of the full content
  */
-function parseLineToMessage(line: string, index: number): MessageEntry | null {
+function parseLineToMessage(line: string, index: number): ReadMessageEntry | null {
   try {
     // Check if this line was truncated by the streaming reader
     const isTruncated = line.endsWith(TRUNCATED_LINE_MARKER);
@@ -289,6 +389,25 @@ function parseLineToMessage(line: string, index: number): MessageEntry | null {
               role: 'AGENT',
               content: planContent,
               timestamp: entry.timestamp || '',
+            };
+          }
+        }
+      }
+    }
+
+    // AskUserQuestion carries the question and its choices in input.questions,
+    // not in text blocks. Surface them so clients can render tappable options.
+    if (entry.type === 'assistant' && Array.isArray(entry.message?.content)) {
+      for (const block of entry.message.content as Record<string, unknown>[]) {
+        if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
+          const question = parseAskUserQuestion(block.input);
+          if (question) {
+            return {
+              uuid: entry.uuid || `generated-${index}`,
+              role: 'AGENT',
+              content: question.question,
+              timestamp: entry.timestamp || '',
+              question,
             };
           }
         }
@@ -564,7 +683,7 @@ function readAllLinesSafe(filePath: string): string[] {
  * When a queued message is processed by Claude Code, both a queue-operation/enqueue
  * and a type:"user" entry exist in the JSONL. We prefer the type:"user" entry.
  */
-function deduplicateQueueMessages(messages: MessageEntry[]): MessageEntry[] {
+function deduplicateQueueMessages(messages: ReadMessageEntry[]): ReadMessageEntry[] {
   // Collect content from non-queue user messages
   const realUserContent = new Set<string>();
   for (const msg of messages) {
@@ -587,7 +706,7 @@ function deduplicateQueueMessages(messages: MessageEntry[]): MessageEntry[] {
  * Truncated lines may fail to extract timestamps; use the next message's
  * timestamp as fallback, or the previous message's if there is no next.
  */
-function interpolateTimestamps(messages: MessageEntry[]): void {
+function interpolateTimestamps(messages: ReadMessageEntry[]): void {
   for (let i = 0; i < messages.length; i++) {
     if (messages[i].timestamp) continue;
 
@@ -624,7 +743,7 @@ export function readMessages(
   limit: number,
   beforeUuid?: string,
   afterUuid?: string
-): { messages: MessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
+): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
   const filePath = findSessionFile(sessionId);
 
   if (!filePath) {
@@ -645,11 +764,11 @@ export function readMessagesFromFile(
   limit: number,
   beforeUuid?: string,
   afterUuid?: string
-): { messages: MessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
+): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
   // Fast path: no cursor – use backward reader for efficiency on large files
   if (!beforeUuid && !afterUuid) {
     const lines = readLastLines(filePath, limit);
-    const messages: MessageEntry[] = [];
+    const messages: ReadMessageEntry[] = [];
     for (let i = 0; i < lines.length; i++) {
       const msg = parseLineToMessage(lines[i], i);
       if (msg) messages.push(msg);
@@ -670,7 +789,7 @@ export function readMessagesFromFile(
   const lines = readAllLinesSafe(filePath);
 
   // Parse all message entries and deduplicate queue messages
-  const rawMessages: MessageEntry[] = [];
+  const rawMessages: ReadMessageEntry[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const msg = parseLineToMessage(lines[i], i);

@@ -1,54 +1,24 @@
 /**
- * The CLI's `system`/`init` event is the daemon's only free source of the
- * project's slash commands. These tests drive a fake CLI process and assert the
+ * The agent's `system`/`init` event is the daemon's only free source of the
+ * project's slash commands. These tests drive a fake agent and assert the
  * adapter hands that list on, and stays silent when the event can't supply one.
  */
 
-import { EventEmitter } from 'events';
-import { Readable } from 'stream';
-
-jest.mock('child_process', () => ({
-  ...jest.requireActual('child_process'),
-  spawn: jest.fn(),
-}));
+jest.mock('@anthropic-ai/claude-agent-sdk', () => require('./__mocks__/fake-agent-sdk'));
 jest.mock('./entrypoint-rewrite', () => ({
   rewriteSdkCliEntrypoint: jest.fn(),
 }));
 
-import { spawn } from 'child_process';
 import { ClaudeAdapter } from './claude-cli';
-
-const spawnMock = spawn as unknown as jest.Mock;
-
-interface FakeProc extends EventEmitter {
-  stdout: Readable;
-  stderr: Readable;
-  kill: jest.Mock;
-}
-
-function makeFakeProc(): FakeProc {
-  const proc = new EventEmitter() as FakeProc;
-  proc.stdout = new Readable({ read() {} });
-  proc.stderr = new Readable({ read() {} });
-  proc.kill = jest.fn();
-  return proc;
-}
-
-/** Feed one stream-json line to a task's CLI process and let readline drain. */
-async function emit(proc: FakeProc, event: Record<string, unknown>): Promise<void> {
-  proc.stdout.push(`${JSON.stringify(event)}\n`);
-  await new Promise<void>((r) => setImmediate(r));
-}
+import { fakeAgents, resetFakeAgents, flush } from './__mocks__/fake-agent-sdk';
 
 describe('slash commands from the init event', () => {
-  let proc: FakeProc;
   let reported: Array<[string, string[]]>;
   let adapter: ClaudeAdapter;
 
   beforeEach(async () => {
     jest.spyOn(console, 'log').mockImplementation(() => {});
-    proc = makeFakeProc();
-    spawnMock.mockReturnValue(proc);
+    resetFakeAgents();
     reported = [];
     adapter = new ClaudeAdapter(
       () => {},
@@ -69,7 +39,7 @@ describe('slash commands from the init event', () => {
       expected: [['/repo', ['compact', 'model']]],
     },
     {
-      name: 'stays silent when the CLI advertised nothing',
+      name: 'stays silent when the agent advertised nothing',
       event: { type: 'system', subtype: 'init', session_id: 's1', cwd: '/repo', slash_commands: [] },
       expected: [],
     },
@@ -79,7 +49,7 @@ describe('slash commands from the init event', () => {
       expected: [],
     },
     {
-      name: 'stays silent for an older CLI that omits the field',
+      name: 'stays silent for an older agent that omits the field',
       event: { type: 'system', subtype: 'init', session_id: 's1', cwd: '/repo' },
       expected: [],
     },
@@ -91,19 +61,17 @@ describe('slash commands from the init event', () => {
   ];
 
   test.each(cases)('$name', async ({ event, expected }) => {
-    await emit(proc, event);
+    fakeAgents[0].emit(event);
+    await flush();
     expect(reported).toEqual(expected);
   });
 
   test('an adapter with no callback still handles init', async () => {
     const bare = new ClaudeAdapter(() => {});
-    const bareProc = makeFakeProc();
-    spawnMock.mockReturnValue(bareProc);
     await bare.startTask('task-2', 'hello', undefined);
 
-    await expect(
-      emit(bareProc, { type: 'system', subtype: 'init', session_id: 's2', cwd: '/repo', slash_commands: ['compact'] }),
-    ).resolves.toBeUndefined();
+    fakeAgents[1].emit({ type: 'system', subtype: 'init', session_id: 's2', cwd: '/repo', slash_commands: ['compact'] });
+    await expect(flush()).resolves.toBeUndefined();
 
     await bare.stopAll();
   });
