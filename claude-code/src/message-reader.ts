@@ -8,6 +8,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { MessageEntry } from '@cmdctrl/daemon-sdk';
+import {
+  TranscriptEntryFlags,
+  hasHarnessFlagInRawLine,
+  isHarnessEntry,
+  isHarnessText,
+} from './transcript-filter';
 
 /** One tappable choice the agent offered. */
 export interface MessageQuestionOption {
@@ -52,7 +58,7 @@ const LINE_TAIL_SIZE = 1024; // 1KB - also capture tail of long lines (uuid, tim
 const TRUNCATED_LINE_MARKER = '\x00TRUNCATED\x00'; // Marker added to truncated lines
 const TRUNCATED_MID_MARKER = '\x00MID\x00'; // Separator between head and tail of truncated lines
 
-interface JournalEntry {
+interface JournalEntry extends TranscriptEntryFlags {
   type: string;
   uuid?: string;
   sessionId?: string;
@@ -140,28 +146,6 @@ function extractReadableText(content: unknown): string {
 }
 
 /**
- * Detect Claude Code compaction/summary messages and system notifications
- * Note: Most bash-notification entries are type:"queue-operation" (filtered by type),
- * but some appear as type:"user" with <bash-notification> content
- */
-function isSystemMessage(content: string): boolean {
-  const systemPrefixes = [
-    'This session is being continued from a previous conversation',
-    'This conversation is being continued from a previous session',
-    '<system-reminder>',
-    '<bash-notification>',
-    '<task-notification>',
-    'Base directory for this skill:',
-  ];
-  for (const prefix of systemPrefixes) {
-    if (content.startsWith(prefix)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
  * Detect agent no-op responses that Claude emits when it has nothing to say.
  * These are boilerplate completions, not meaningful content for the user.
  *
@@ -179,25 +163,6 @@ const NO_OP_RESPONSES = new Set([
 function isNoOpAgentMessage(content: string): boolean {
   const trimmed = content.trim();
   return NO_OP_RESPONSES.has(trimmed);
-}
-
-/**
- * Detect non-user content: structured data (JSON objects/arrays), XML-like tags,
- * or other machine-generated content that should not be displayed as user messages.
- * This is a safety net – rather than blocklisting known bad patterns, we reject
- * anything that doesn't look like plain text typed by a human.
- */
-function isNonUserContent(content: string): boolean {
-  const trimmed = content.trim();
-  // JSON objects or arrays (e.g., task spawn notifications, tool results)
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    return true;
-  }
-  // XML/HTML-like tags not already caught by isSystemMessage
-  if (trimmed.startsWith('<') && trimmed.length > 1 && trimmed[1] !== ' ') {
-    return true;
-  }
-  return false;
 }
 
 /**
@@ -281,6 +246,12 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
 
     let entry: JournalEntry;
     if (isTruncated) {
+      // The flags survive truncation in one half or the other, so match them on
+      // the raw line rather than losing them with the unparsed body.
+      if (hasHarnessFlagInRawLine(line)) {
+        return null;
+      }
+
       // Truncated line format: {head}TRUNCATED_MID_MARKER{tail}TRUNCATED_LINE_MARKER
       // - head contains: type (near start)
       // - tail contains: uuid, timestamp (at end of original line)
@@ -318,8 +289,7 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
         const contentMatch = headPart.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         if (opMatch && contentMatch) {
           const queueContent = contentMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
-          // Skip system messages and non-user content (JSON, tags, etc.)
-          if (isSystemMessage(queueContent) || isNonUserContent(queueContent)) {
+          if (isHarnessText(queueContent)) {
             return null;
           }
           const ts = timestampMatch ? timestampMatch[1] : '';
@@ -342,8 +312,7 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
       const textBlockMatch = headPart.match(/"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
       let content = textBlockMatch ? textBlockMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"') : '';
 
-      // Skip system messages and non-user content (JSON, tags, etc.)
-      if (content && (isSystemMessage(content) || isNonUserContent(content))) {
+      if (content && isHarnessText(content)) {
         content = '';
       }
 
@@ -367,10 +336,14 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
 
     entry = JSON.parse(line);
 
+    // Harness-generated entries are never conversation, whatever their type.
+    if (isHarnessEntry(entry)) {
+      return null;
+    }
+
     // Handle queue-operation/enqueue entries (user messages sent via CmdCtrl UI)
     if (entry.type === 'queue-operation' && entry.operation === 'enqueue' && entry.content) {
-      // Skip system messages and non-user content (JSON, tags, etc.)
-      if (isSystemMessage(entry.content) || isNonUserContent(entry.content)) {
+      if (isHarnessText(entry.content)) {
         return null;
       }
       // Use timestamp-based UUID so the ID is stable across both the fast path
@@ -441,8 +414,7 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
     // Determine role
     let role: 'USER' | 'AGENT' | 'SYSTEM' = entry.type === 'user' ? 'USER' : 'AGENT';
 
-    // Detect system messages and non-user content (JSON, tags, etc.)
-    if (role === 'USER' && (isSystemMessage(text) || isNonUserContent(text))) {
+    if (role === 'USER' && isHarnessText(text)) {
       return null;
     }
 
@@ -743,6 +715,24 @@ function readLatest(
 }
 
 /**
+ * Does this raw line carry the cursor? Filtered and unrenderable entries never
+ * become messages, but a client can still be holding one as its oldest or
+ * newest uuid. Matching the raw line keeps such a cursor resolvable, instead of
+ * reading as a conversation with nothing before it.
+ */
+function cursorMatcher(
+  cursorUuid: string
+): (line: ScannedLine, message: ReadMessageEntry | null) => boolean {
+  if (cursorUuid.startsWith('generated-')) {
+    return (line, message) =>
+      message ? message.uuid === cursorUuid : cursorUuid === `generated-${line.offset}`;
+  }
+  const escaped = cursorUuid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`"uuid"\\s*:\\s*"${escaped}"`);
+  return (line, message) => (message ? message.uuid === cursorUuid : pattern.test(line.text));
+}
+
+/**
  * The `limit` messages immediately before a cursor - the "load older" page.
  *
  * Stops once the page is full instead of reading the file, so the cost tracks
@@ -757,6 +747,7 @@ function readBeforeCursor(
   try {
     const recentUsers = new RecentUserContent();
     const olderNewestFirst: ReadMessageEntry[] = [];
+    const isCursor = cursorMatcher(beforeUuid);
     let found = false;
 
     scan: while (true) {
@@ -765,14 +756,14 @@ function readBeforeCursor(
 
       for (const line of batch) {
         const message = parseLineToMessage(line.text, line.offset);
-        if (!message) continue;
-        if (message.role === 'USER' && !message.uuid.startsWith('queue-')) {
+        if (message && message.role === 'USER' && !message.uuid.startsWith('queue-')) {
           recentUsers.add(message.content);
         }
         if (!found) {
-          found = message.uuid === beforeUuid;
+          found = isCursor(line, message);
           continue;
         }
+        if (!message) continue;
         if (message.uuid.startsWith('queue-') && recentUsers.has(message.content)) continue;
 
         olderNewestFirst.push(message);
@@ -781,9 +772,11 @@ function readBeforeCursor(
       }
     }
 
-    // A cursor the scan never met was most likely compacted away. The client's
-    // view is stale; it reconciles on its next full reload.
-    if (!found) return { messages: [], hasMore: false };
+    // A cursor the scan never met was most likely compacted away. Only claim the
+    // conversation has nothing older when the whole file was searched - a scan
+    // that stopped at its budget knows nothing about what lies beyond it, and
+    // "no more" there draws the beginning-of-conversation marker mid-session.
+    if (!found) return { messages: [], hasMore: !scanner.reachedStart };
 
     const older = olderNewestFirst.slice().reverse();
     interpolateTimestamps(older);
@@ -808,6 +801,7 @@ function readAfterCursor(
   try {
     const recentUsers = new RecentUserContent();
     const nearestCursor: ReadMessageEntry[] = [];
+    const isCursor = cursorMatcher(afterUuid);
     let newerThanCursor = 0;
     let found = false;
 
@@ -817,11 +811,11 @@ function readAfterCursor(
 
       for (const line of batch) {
         const message = parseLineToMessage(line.text, line.offset);
-        if (!message) continue;
-        if (message.uuid === afterUuid) {
+        if (isCursor(line, message)) {
           found = true;
           break scan;
         }
+        if (!message) continue;
         if (message.role === 'USER' && !message.uuid.startsWith('queue-')) {
           recentUsers.add(message.content);
         }
