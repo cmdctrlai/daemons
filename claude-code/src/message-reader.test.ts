@@ -471,4 +471,56 @@ describe('readMessagesFromFile', () => {
       expect(readMessagesFromFile(tempFile, 10).messages.map((m) => m.uuid)).toEqual(['u1']);
     });
   });
+  describe('cursors that name a filtered entry', () => {
+    /** A relayed message: written as a user entry, never shown to anyone. */
+    function metaLine(uuid: string, timestamp: string): string {
+      return JSON.stringify({
+        uuid,
+        type: 'user',
+        isMeta: true,
+        message: { content: 'Another Claude session sent a message:' },
+        timestamp,
+      });
+    }
+
+    it('pages older messages from a cursor the filter hides', () => {
+      const lines = [
+        ...['a', 'b', 'c'].map((u, i) => userLine(u, `message ${u}`, `2026-07-04T20:0${i}:00.000Z`)),
+        metaLine('relay-1', '2026-07-04T20:03:00.000Z'),
+        ...['d', 'e'].map((u, i) => userLine(u, `message ${u}`, `2026-07-04T20:0${i + 4}:00.000Z`)),
+      ];
+      fs.writeFileSync(tempFile, lines.join('\n') + '\n');
+
+      // A client that rendered the relay before it was filtered still holds its
+      // uuid. It must resolve, or the view claims the conversation starts here.
+      const result = readMessagesFromFile(tempFile, 10, 'relay-1');
+
+      expect(result.messages.map((m) => m.uuid)).toEqual(['a', 'b', 'c']);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('does not report the beginning when the cursor is simply absent', () => {
+      writeSession(['a', 'b', 'c']);
+
+      const result = readMessagesFromFile(tempFile, 10, 'never-written');
+
+      expect(result.messages).toEqual([]);
+      // The whole file was searched, so nothing older genuinely remains.
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('resolves a filtered cursor on the incremental page too', () => {
+      const lines = [
+        userLine('a', 'message a', '2026-07-04T20:00:00.000Z'),
+        metaLine('relay-2', '2026-07-04T20:01:00.000Z'),
+        ...['b', 'c'].map((u, i) => userLine(u, `message ${u}`, `2026-07-04T20:0${i + 2}:00.000Z`)),
+      ];
+      fs.writeFileSync(tempFile, lines.join('\n') + '\n');
+
+      const result = readMessagesFromFile(tempFile, 10, undefined, 'relay-2');
+
+      expect(result.messages.map((m) => m.uuid)).toEqual(['b', 'c']);
+    });
+  });
+
 });

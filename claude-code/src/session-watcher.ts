@@ -10,6 +10,7 @@
  */
 
 import * as fs from 'fs';
+import { isHarnessEntry, isHarnessText } from './transcript-filter';
 
 // Event types emitted by SessionWatcher
 export interface SessionEvent {
@@ -404,20 +405,13 @@ export class SessionWatcher {
     const message = entry.message as Record<string, unknown> | undefined;
     const content = message?.content;
 
+    // Harness-generated entries are never conversation, whatever their type.
+    if (isHarnessEntry(entry)) {
+      return null;
+    }
+
     // Handle user entries
     if (entryType === 'user') {
-      // Skip non-user entries: compaction summaries, transcript-only content, etc.
-      // These are system-generated entries that Claude Code marks with special flags.
-      if (entry.isCompactSummary || entry.isVisibleInTranscriptOnly) {
-        return null;
-      }
-
-      // Skip subagent internal messages – these are part of a sidechain
-      // conversation and should never be shown in the main UI.
-      if (entry.isSidechain) {
-        return null;
-      }
-
       // Entries with sourceToolAssistantUUID or toolUseResult are tool-result
       // wrappers, not real user messages. The JSONL stores tool results as
       // type:"user" entries (required by the Claude API format), but they should
@@ -496,18 +490,9 @@ export class SessionWatcher {
         return null;
       }
 
-      // Skip non-user content: system messages, JSON data, and XML-like tags.
-      const trimmed = textContent.trim();
-      if (trimmed.startsWith('<') || trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        return null;
-      }
-
-      // Skip known system message prefixes (continuation prompts, etc.)
-      const systemPrefixes = [
-        'This session is being continued from a previous conversation',
-        'This conversation is being continued from a previous session',
-      ];
-      if (systemPrefixes.some(prefix => trimmed.startsWith(prefix))) {
+      // Fallback for entries carrying no harness flag: structured data,
+      // XML-like wrappers and known harness preambles.
+      if (isHarnessText(textContent)) {
         return null;
       }
 
@@ -522,12 +507,6 @@ export class SessionWatcher {
 
     // Handle assistant entries
     if (entryType === 'assistant') {
-
-      // Skip subagent internal messages
-      if (entry.isSidechain) {
-        return null;
-      }
-
       if (!Array.isArray(content)) {
         console.log(`[SessionWatcher] Assistant entry ${uuid?.slice(-8)} has non-array content:`, typeof content);
         return null;
