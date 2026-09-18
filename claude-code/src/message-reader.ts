@@ -3,6 +3,7 @@
  * Reads messages from Claude Code session files
  */
 
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -32,8 +33,21 @@ export type ReadMessageEntry = MessageEntry & { question?: MessageQuestion };
 const CHUNK_SIZE = 64 * 1024; // 64KB
 
 // Safety limits to prevent memory exhaustion from bloated sessions (e.g., sessions with many large images)
-const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB - warn threshold for large files
 const MAX_LINE_SIZE = 100 * 1024; // 100KB - truncate lines larger than this (likely contain base64 images)
+const NEWLINE_BYTE = 0x0a;
+// How far back an uncursored first page will scan. Transcripts with embedded
+// images run to hundreds of MB, and every session open takes this path, so the
+// ceiling keeps it cheap; stopping short only leaves has_more true, which is honest.
+const MAX_TAIL_SCAN_LINES = 100_000;
+const MAX_TAIL_SCAN_BYTES = 32 * 1024 * 1024;
+// A cursor page is a deliberate "load older" and may sit deep in the file, so it
+// gets a larger budget than a session open. The scan still stops well short of
+// the handler's timeout rather than blocking the event loop on a whole file.
+const MAX_CURSOR_SCAN_BYTES = 256 * 1024 * 1024;
+// How many USER messages stay eligible for queue de-duplication. Digests, not
+// content, so a transcript of pasted logs costs the same as one of one-liners
+// and the window stays far longer than any queue entry waits to be processed.
+const DEDUPE_HISTORY_ENTRIES = 50_000;
 const LINE_TAIL_SIZE = 1024; // 1KB - also capture tail of long lines (uuid, timestamp are at the end)
 const TRUNCATED_LINE_MARKER = '\x00TRUNCATED\x00'; // Marker added to truncated lines
 const TRUNCATED_MID_MARKER = '\x00MID\x00'; // Separator between head and tail of truncated lines
@@ -448,257 +462,155 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
   }
 }
 
-/**
- * Truncate a line, keeping both head (for type) and tail (for uuid, timestamp)
- * Format: {head}TRUNCATED_MID_MARKER{tail}TRUNCATED_LINE_MARKER
- */
-function truncateLine(line: string): string {
-  const head = line.substring(0, MAX_LINE_SIZE);
-  const tail = line.substring(Math.max(MAX_LINE_SIZE, line.length - LINE_TAIL_SIZE));
-  return head + TRUNCATED_MID_MARKER + tail + TRUNCATED_LINE_MARKER;
+/** A JSONL line and the byte offset it starts at. The offset is the stable
+ *  identity for entries whose JSON carries no uuid, so the same entry keeps the
+ *  same generated id on every page that reaches it. */
+interface ScannedLine {
+  text: string;
+  offset: number;
 }
 
 /**
- * Read the first few lines from a file using forward reading.
- * Uses the same sliding-window approach as readAllLinesSafe to correctly
- * capture head+tail for large lines (e.g. base64 image messages).
- * Called by readLastLines to recover oversized early-file lines that the
- * backward reader cannot reconstruct accurately from contaminated buffer remnants.
+ * Streams a JSONL file backwards, newest line first, in bounded memory.
+ *
+ * Every read path goes through this one scanner, so a given entry yields the
+ * same line and the same generated id whichever page reaches it. The scan stops
+ * at a byte budget rather than always running to the start of the file;
+ * `reachedStart` is how a caller tells "this is the beginning of the
+ * conversation" apart from "my scan ran out", which a line count cannot express.
  */
-function readFirstLines(fd: number, fileSize: number): string[] {
-  // Read up to 3× MAX_LINE_SIZE (300KB) — enough to cover a few large lines
-  const readBound = Math.min(fileSize, MAX_LINE_SIZE * 3);
-  const lines: string[] = [];
-  let position = 0;
-  let currentLineHead = '';
-  let currentLineTail = '';
-  let lineOverflowed = false;
+class BackwardScanner {
+  private readonly fd: number;
+  private readonly fileSize: number;
+  private position: number;
+  private pendingHead: Buffer = Buffer.alloc(0);
+  private pendingTail: Buffer | null = null;
+  private pendingLen = 0;
+  private flushedFirstLine = false;
 
-  while (position < readBound) {
-    const chunkSize = Math.min(CHUNK_SIZE, readBound - position);
-    const chunk = Buffer.alloc(chunkSize);
-    const bytesRead = fs.readSync(fd, chunk, 0, chunkSize, position);
-    if (bytesRead === 0) break;
-    position += bytesRead;
+  constructor(filePath: string, private readonly byteBudget: number) {
+    this.fd = fs.openSync(filePath, 'r');
+    this.fileSize = fs.fstatSync(this.fd).size;
+    this.position = this.fileSize;
+  }
 
-    const text = chunk.slice(0, bytesRead).toString('utf-8');
-    for (let i = 0; i < text.length; i++) {
-      const char = text[i];
-      if (char === '\n') {
-        const trimmedHead = currentLineHead.trim();
-        if (trimmedHead) {
-          if (lineOverflowed) {
-            lines.push(trimmedHead + TRUNCATED_MID_MARKER + currentLineTail.trim() + TRUNCATED_LINE_MARKER);
-          } else {
-            lines.push(trimmedHead);
-          }
-        }
-        currentLineHead = '';
-        currentLineTail = '';
-        lineOverflowed = false;
-      } else {
-        if (currentLineHead.length < MAX_LINE_SIZE) {
-          currentLineHead += char;
-        } else {
-          lineOverflowed = true;
-          currentLineTail += char;
-          if (currentLineTail.length > LINE_TAIL_SIZE) {
-            currentLineTail = currentLineTail.slice(-LINE_TAIL_SIZE);
-          }
-        }
+  /** True once the scan has consumed and emitted the first line of the file. */
+  get reachedStart(): boolean {
+    return this.position === 0 && this.flushedFirstLine;
+  }
+
+  close(): void {
+    fs.closeSync(this.fd);
+  }
+
+  /** The next lines, newest first. An empty array means the scan is over. */
+  next(): ScannedLine[] {
+    const out: ScannedLine[] = [];
+
+    while (out.length === 0) {
+      if (this.position === 0) {
+        if (this.flushedFirstLine) break;
+        this.flushedFirstLine = true;
+        const first = this.finishLine(0);
+        if (first) out.push(first);
+        break;
       }
-    }
-  }
+      if (this.fileSize - this.position >= this.byteBudget) break;
 
-  // Capture any partial line at the readBound boundary
-  const trimmedHead = currentLineHead.trim();
-  if (trimmedHead) {
-    if (lineOverflowed) {
-      lines.push(trimmedHead + TRUNCATED_MID_MARKER + currentLineTail.trim() + TRUNCATED_LINE_MARKER);
-    } else {
-      lines.push(trimmedHead);
-    }
-  }
-
-  return lines;
-}
-
-/**
- * Read the last N lines from a file using backward reading (tail-like)
- * This is much faster than reading the entire file for large files
- */
-function readLastLines(filePath: string, maxLines: number): string[] {
-  const fd = fs.openSync(filePath, 'r');
-  const stats = fs.fstatSync(fd);
-  const fileSize = stats.size;
-
-  if (fileSize === 0) {
-    fs.closeSync(fd);
-    return [];
-  }
-
-  const lines: string[] = [];
-  let position = fileSize;
-  let buffer = '';
-
-  // We need to read more lines than requested because many JSONL entries
-  // won't be displayable messages (tool_use, system events, etc.)
-  // Multiplier of 10x accounts for ~10% of entries being actual messages
-  const targetLines = maxLines * 10;
-
-  while (position > 0 && lines.length < targetLines) {
-    // Read in chunks from the end
-    const chunkSize = Math.min(CHUNK_SIZE, position);
-    position -= chunkSize;
-
-    const chunk = Buffer.alloc(chunkSize);
-    fs.readSync(fd, chunk, 0, chunkSize, position);
-    buffer = chunk.toString('utf-8') + buffer;
-
-    // Extract complete lines from buffer
-    const newlineIndex = buffer.lastIndexOf('\n');
-    if (newlineIndex !== -1) {
-      // Split into lines, keeping the incomplete first line in buffer
-      const completeLines = buffer.substring(0, newlineIndex).split('\n');
-      buffer = buffer.substring(newlineIndex + 1);
-
-      // Add lines in reverse order (we're reading backward)
-      for (let i = completeLines.length - 1; i >= 0; i--) {
-        const line = completeLines[i].trim();
-        if (line) {
-          // For oversized lines, keep both head and tail
-          if (line.length > MAX_LINE_SIZE) {
-            lines.unshift(truncateLine(line));
-          } else {
-            lines.unshift(line);
-          }
-        }
-      }
-    }
-  }
-
-  // Instead of using the potentially contaminated buffer remnant from backward reading,
-  // do a bounded forward read from position 0 to correctly reconstruct any large lines
-  // (e.g. base64 image messages) that span multiple chunks at the start of the file.
-  const knownUuids = new Set<string>();
-  for (const line of lines) {
-    // Skip incomplete tail fragments from the backward reader – they start mid-line
-    // (e.g. mid-base64) and don't begin with '{', but may still contain a uuid field
-    if (!line.startsWith('{')) continue;
-    const m = line.match(/"uuid"\s*:\s*"([^"]+)"/);
-    if (m) knownUuids.add(m[1]);
-  }
-  const firstLines = readFirstLines(fd, fileSize);
-  for (const line of firstLines) {
-    const m = line.match(/"uuid"\s*:\s*"([^"]+)"/);
-    if (m && !knownUuids.has(m[1])) {
-      lines.unshift(line);
-    }
-  }
-
-  fs.closeSync(fd);
-  return lines;
-}
-
-/**
- * Read all lines from a file (streaming approach)
- * For oversized lines, keeps both head (for type) and tail (for uuid, timestamp)
- * Format for truncated: {head}TRUNCATED_MID_MARKER{tail}TRUNCATED_LINE_MARKER
- * Safer than fs.readFileSync for files with potentially huge lines
- */
-function readAllLinesSafe(filePath: string): string[] {
-  const stats = fs.statSync(filePath);
-
-  // For very large files, warn but still try to process
-  if (stats.size > MAX_FILE_SIZE) {
-    console.warn(`[MessageReader] File ${filePath} is ${(stats.size / 1024 / 1024).toFixed(1)}MB, exceeds ${MAX_FILE_SIZE / 1024 / 1024}MB limit. Processing may be slow.`);
-  }
-
-  const lines: string[] = [];
-  const fd = fs.openSync(filePath, 'r');
-  let position = 0;
-  let currentLineHead = '';  // First MAX_LINE_SIZE chars
-  let currentLineTail = '';  // Last LINE_TAIL_SIZE chars (sliding window)
-  let lineOverflowed = false;
-
-  try {
-    while (position < stats.size) {
-      const chunkSize = Math.min(CHUNK_SIZE, stats.size - position);
+      const chunkSize = Math.min(CHUNK_SIZE, this.position);
+      this.position -= chunkSize;
       const chunk = Buffer.alloc(chunkSize);
-      fs.readSync(fd, chunk, 0, chunkSize, position);
-      position += chunkSize;
+      fs.readSync(this.fd, chunk, 0, chunkSize, this.position);
 
-      const text = chunk.toString('utf-8');
-
-      for (let i = 0; i < text.length; i++) {
-        const char = text[i];
-        if (char === '\n') {
-          const trimmedHead = currentLineHead.trim();
-          if (trimmedHead) {
-            // For truncated lines, include both head and tail with markers
-            if (lineOverflowed) {
-              lines.push(trimmedHead + TRUNCATED_MID_MARKER + currentLineTail.trim() + TRUNCATED_LINE_MARKER);
-            } else {
-              lines.push(trimmedHead);
-            }
-          }
-          currentLineHead = '';
-          currentLineTail = '';
-          lineOverflowed = false;
-        } else {
-          // Keep building head up to MAX_LINE_SIZE
-          if (currentLineHead.length < MAX_LINE_SIZE) {
-            currentLineHead += char;
-          } else {
-            // Once overflowed, start tracking the tail (sliding window)
-            lineOverflowed = true;
-            currentLineTail += char;
-            // Keep only the last LINE_TAIL_SIZE chars
-            if (currentLineTail.length > LINE_TAIL_SIZE) {
-              currentLineTail = currentLineTail.slice(-LINE_TAIL_SIZE);
-            }
-          }
-        }
+      // Walk the chunk's newlines from the end. The bytes after the last one
+      // complete the line whose remainder we already hold; the bytes before the
+      // first one open a line that continues into the chunk we have not read yet.
+      let end = chunkSize;
+      while (end > 0) {
+        const newline = chunk.lastIndexOf(NEWLINE_BYTE, end - 1);
+        if (newline < 0) break;
+        this.prepend(chunk.subarray(newline + 1, end));
+        const line = this.finishLine(this.position + newline + 1);
+        if (line) out.push(line);
+        end = newline;
       }
+      if (end > 0) this.prepend(chunk.subarray(0, end));
     }
 
-    // Handle final line without newline
-    const trimmedHead = currentLineHead.trim();
-    if (trimmedHead) {
-      if (lineOverflowed) {
-        lines.push(trimmedHead + TRUNCATED_MID_MARKER + currentLineTail.trim() + TRUNCATED_LINE_MARKER);
-      } else {
-        lines.push(trimmedHead);
-      }
-    }
-  } finally {
-    fs.closeSync(fd);
+    return out;
   }
 
-  return lines;
+  /** Attach bytes that sit in front of the line being assembled. */
+  private prepend(part: Buffer): void {
+    if (part.length === 0) return;
+
+    const combined = Buffer.concat([part, this.pendingHead]);
+    const newLen = this.pendingLen + part.length;
+
+    // uuid and timestamp live at the end of the line, which backward reading
+    // hands us first. Capture it before an oversized line pushes it out of range.
+    if (this.pendingTail === null && newLen > MAX_LINE_SIZE) {
+      this.pendingTail = Buffer.from(combined.subarray(Math.max(0, combined.length - LINE_TAIL_SIZE)));
+    }
+
+    this.pendingHead = newLen > MAX_LINE_SIZE
+      ? Buffer.from(combined.subarray(0, MAX_LINE_SIZE))
+      : combined;
+    this.pendingLen = newLen;
+  }
+
+  /** Close off the assembled line, which starts at `offset`. */
+  private finishLine(offset: number): ScannedLine | null {
+    if (this.pendingLen === 0) return null;
+
+    const head = this.pendingHead.toString('utf-8').trim();
+    const tail = this.pendingTail;
+    this.pendingHead = Buffer.alloc(0);
+    this.pendingTail = null;
+    this.pendingLen = 0;
+
+    if (!head) return null;
+    const text = tail === null
+      ? head
+      : head + TRUNCATED_MID_MARKER + tail.toString('utf-8').trim() + TRUNCATED_LINE_MARKER;
+    return { text, offset };
+  }
 }
 
 /**
- * Remove queue-sourced USER messages that have a matching type:"user" entry.
- * When a queued message is processed by Claude Code, both a queue-operation/enqueue
- * and a type:"user" entry exist in the JSONL. We prefer the type:"user" entry.
+ * Digests of real USER entries the scan has passed, so their queued twins can be
+ * dropped. Backward reading meets the real entry before the queue entry it
+ * supersedes, which is the order this relies on.
  */
-function deduplicateQueueMessages(messages: ReadMessageEntry[]): ReadMessageEntry[] {
-  // Collect content from non-queue user messages
-  const realUserContent = new Set<string>();
-  for (const msg of messages) {
-    if (msg.role === 'USER' && !msg.uuid.startsWith('queue-')) {
-      realUserContent.add(msg.content);
+class RecentUserContent {
+  private readonly seen = new Set<string>();
+  private order: string[] = [];
+  // Eviction advances a read index and compacts in bulk. Shifting the array per
+  // entry is linear in the window, which at this size dominates the whole scan.
+  private head = 0;
+
+  add(content: string): void {
+    const digest = RecentUserContent.digest(content);
+    if (this.seen.has(digest)) return;
+    this.seen.add(digest);
+    this.order.push(digest);
+    if (this.seen.size > DEDUPE_HISTORY_ENTRIES) {
+      this.seen.delete(this.order[this.head++]);
+      if (this.head >= DEDUPE_HISTORY_ENTRIES) {
+        this.order = this.order.slice(this.head);
+        this.head = 0;
+      }
     }
   }
 
-  // Filter out queue messages whose content matches a real user entry
-  return messages.filter(msg => {
-    if (msg.uuid.startsWith('queue-') && realUserContent.has(msg.content)) {
-      return false;
-    }
-    return true;
-  });
+  has(content: string): boolean {
+    return this.seen.has(RecentUserContent.digest(content));
+  }
+
+  /** Queue entries carry the text as typed; the real entry's is trimmed. */
+  private static digest(content: string): string {
+    return crypto.createHash('sha1').update(content.trim()).digest('base64');
+  }
 }
 
 /**
@@ -727,6 +639,19 @@ function interpolateTimestamps(messages: ReadMessageEntry[]): void {
       }
     }
   }
+}
+
+/** Shape every read path returns. */
+function page(
+  messages: ReadMessageEntry[],
+  hasMore: boolean
+): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
+  return {
+    messages,
+    hasMore,
+    oldestUuid: messages.length > 0 ? messages[0].uuid : undefined,
+    newestUuid: messages.length > 0 ? messages[messages.length - 1].uuid : undefined,
+  };
 }
 
 /**
@@ -765,92 +690,157 @@ export function readMessagesFromFile(
   beforeUuid?: string,
   afterUuid?: string
 ): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
-  // Fast path: no cursor – use backward reader for efficiency on large files
-  if (!beforeUuid && !afterUuid) {
-    const lines = readLastLines(filePath, limit);
-    const messages: ReadMessageEntry[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      const msg = parseLineToMessage(lines[i], i);
-      if (msg) messages.push(msg);
+  if (afterUuid) return readAfterCursor(filePath, limit, afterUuid);
+  if (beforeUuid) return readBeforeCursor(filePath, limit, beforeUuid);
+  return readLatest(filePath, limit);
+}
+
+/**
+ * The newest `limit` messages.
+ *
+ * Only a fraction of JSONL entries are displayable messages, and that fraction
+ * swings from a few percent in a tool-heavy session to most of the file. So the
+ * scan runs until it has more messages than the page needs or the file runs out,
+ * rather than betting the page on a fixed-size window - counting inside a window
+ * reports "no older messages" on any transcript sparser than the guess.
+ */
+function readLatest(
+  filePath: string,
+  limit: number
+): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
+  const scanner = new BackwardScanner(filePath, MAX_TAIL_SCAN_BYTES);
+  try {
+    const recentUsers = new RecentUserContent();
+    const newestFirst: ReadMessageEntry[] = [];
+    let lineCount = 0;
+
+    while (lineCount < MAX_TAIL_SCAN_LINES) {
+      const batch = scanner.next();
+      if (batch.length === 0) break;
+
+      for (const line of batch) {
+        lineCount++;
+        const message = parseLineToMessage(line.text, line.offset);
+        if (!message) continue;
+        if (message.role === 'USER' && !message.uuid.startsWith('queue-')) {
+          recentUsers.add(message.content);
+        }
+        if (message.uuid.startsWith('queue-') && recentUsers.has(message.content)) continue;
+        newestFirst.push(message);
+      }
+
+      if (newestFirst.length > limit) break;
     }
-    const dedupedMessages = deduplicateQueueMessages(messages);
-    interpolateTimestamps(dedupedMessages);
-    const resultMessages = dedupedMessages.slice(-limit);
-    const hasMore = dedupedMessages.length > limit;
-    return {
-      messages: resultMessages,
-      hasMore,
-      oldestUuid: resultMessages.length > 0 ? resultMessages[0].uuid : undefined,
-      newestUuid: resultMessages.length > 0 ? resultMessages[resultMessages.length - 1].uuid : undefined,
-    };
+
+    const messages = newestFirst.slice().reverse();
+    interpolateTimestamps(messages);
+    // Older messages exist if the scan found more than fit on this page, or if
+    // it gave up before reaching the start of the file.
+    return page(messages.slice(-limit), messages.length > limit || !scanner.reachedStart);
+  } finally {
+    scanner.close();
   }
+}
 
-  // Cursor paths – need access to all messages in the file
-  const lines = readAllLinesSafe(filePath);
+/**
+ * The `limit` messages immediately before a cursor - the "load older" page.
+ *
+ * Stops once the page is full instead of reading the file, so the cost tracks
+ * how far back the cursor sits rather than how large the transcript is.
+ */
+function readBeforeCursor(
+  filePath: string,
+  limit: number,
+  beforeUuid: string
+): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
+  const scanner = new BackwardScanner(filePath, MAX_CURSOR_SCAN_BYTES);
+  try {
+    const recentUsers = new RecentUserContent();
+    const olderNewestFirst: ReadMessageEntry[] = [];
+    let found = false;
 
-  // Parse all message entries and deduplicate queue messages
-  const rawMessages: ReadMessageEntry[] = [];
+    scan: while (true) {
+      const batch = scanner.next();
+      if (batch.length === 0) break;
 
-  for (let i = 0; i < lines.length; i++) {
-    const msg = parseLineToMessage(lines[i], i);
-    if (msg) {
-      rawMessages.push(msg);
+      for (const line of batch) {
+        const message = parseLineToMessage(line.text, line.offset);
+        if (!message) continue;
+        if (message.role === 'USER' && !message.uuid.startsWith('queue-')) {
+          recentUsers.add(message.content);
+        }
+        if (!found) {
+          found = message.uuid === beforeUuid;
+          continue;
+        }
+        if (message.uuid.startsWith('queue-') && recentUsers.has(message.content)) continue;
+
+        olderNewestFirst.push(message);
+        // One past the page tells us whether anything older remains.
+        if (olderNewestFirst.length > limit) break scan;
+      }
     }
+
+    // A cursor the scan never met was most likely compacted away. The client's
+    // view is stale; it reconciles on its next full reload.
+    if (!found) return { messages: [], hasMore: false };
+
+    const older = olderNewestFirst.slice().reverse();
+    interpolateTimestamps(older);
+    return page(older.slice(-limit), olderNewestFirst.length > limit || !scanner.reachedStart);
+  } finally {
+    scanner.close();
   }
+}
 
-  const allMessages = deduplicateQueueMessages(rawMessages);
-  interpolateTimestamps(allMessages);
+/**
+ * The `limit` messages immediately after a cursor - the incremental fetch.
+ *
+ * Holds only the messages nearest the cursor as it scans, so a cursor left far
+ * behind costs time but not memory.
+ */
+function readAfterCursor(
+  filePath: string,
+  limit: number,
+  afterUuid: string
+): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
+  const scanner = new BackwardScanner(filePath, MAX_CURSOR_SCAN_BYTES);
+  try {
+    const recentUsers = new RecentUserContent();
+    const nearestCursor: ReadMessageEntry[] = [];
+    let newerThanCursor = 0;
+    let found = false;
 
-  // Handle afterUuid - return messages AFTER the given UUID (for incremental updates)
-  if (afterUuid) {
-    const cursorIndex = allMessages.findIndex(m => m.uuid === afterUuid);
-    if (cursorIndex >= 0) {
-      // Get messages after the cursor
-      const startIndex = cursorIndex + 1;
-      const endIndex = Math.min(startIndex + limit, allMessages.length);
-      const resultMessages = allMessages.slice(startIndex, endIndex);
-      const hasMore = endIndex < allMessages.length;
+    scan: while (true) {
+      const batch = scanner.next();
+      if (batch.length === 0) break;
 
-      return {
-        messages: resultMessages,
-        hasMore,
-        oldestUuid: resultMessages.length > 0 ? resultMessages[0].uuid : undefined,
-        newestUuid: resultMessages.length > 0 ? resultMessages[resultMessages.length - 1].uuid : undefined,
-      };
+      for (const line of batch) {
+        const message = parseLineToMessage(line.text, line.offset);
+        if (!message) continue;
+        if (message.uuid === afterUuid) {
+          found = true;
+          break scan;
+        }
+        if (message.role === 'USER' && !message.uuid.startsWith('queue-')) {
+          recentUsers.add(message.content);
+        }
+        if (message.uuid.startsWith('queue-') && recentUsers.has(message.content)) continue;
+
+        newerThanCursor++;
+        nearestCursor.push(message);
+        if (nearestCursor.length > limit) nearestCursor.shift();
+      }
     }
-    // Stale cursor (likely compacted away) - return empty, mirroring the
-    // beforeUuid path below. "After this cursor" is unanswerable once the cursor
-    // no longer exists in the file, so returning the file tail here made clients
-    // append already-seen messages to the bottom of the live view – old messages
-    // resurfacing under their original timestamps after an overnight compaction.
-    // The client reconciles via its periodic full reload (no cursor) instead.
-    return { messages: [], hasMore: false };
+
+    // Stale cursor - "after this" is unanswerable once the entry is gone, and
+    // returning the file tail made clients append messages they already had.
+    if (!found) return { messages: [], hasMore: false };
+
+    const messages = nearestCursor.slice().reverse();
+    interpolateTimestamps(messages);
+    return page(messages, newerThanCursor > limit);
+  } finally {
+    scanner.close();
   }
-
-  // Handle beforeUuid - return messages BEFORE the given UUID (for loading older)
-  let startIndex = allMessages.length;
-  if (beforeUuid) {
-    const cursorIndex = allMessages.findIndex(m => m.uuid === beforeUuid);
-    if (cursorIndex >= 0) {
-      startIndex = cursorIndex;
-    } else {
-      // Stale cursor (likely compacted away) - return empty for "load older"
-      // User's current view may be outdated; they should refresh to get current messages
-      return { messages: [], hasMore: false };
-    }
-  }
-
-  // Get messages before the cursor (or from end if no cursor)
-  const endIndex = startIndex;
-  const beginIndex = Math.max(0, endIndex - limit);
-
-  const resultMessages = allMessages.slice(beginIndex, endIndex);
-  const hasMore = beginIndex > 0;
-
-  return {
-    messages: resultMessages,
-    hasMore,
-    oldestUuid: resultMessages.length > 0 ? resultMessages[0].uuid : undefined,
-    newestUuid: resultMessages.length > 0 ? resultMessages[resultMessages.length - 1].uuid : undefined,
-  };
 }
