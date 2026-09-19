@@ -13,6 +13,7 @@ import {
   hasHarnessFlagInRawLine,
   isHarnessEntry,
   isHarnessText,
+  unwrapPastedContent,
 } from './transcript-filter';
 
 /** One tappable choice the agent offered. */
@@ -288,15 +289,15 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
         const opMatch = headPart.match(/"operation"\s*:\s*"enqueue"/);
         const contentMatch = headPart.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         if (opMatch && contentMatch) {
-          const queueContent = contentMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
-          if (isHarnessText(queueContent)) {
+          const rawQueue = contentMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+          if (isHarnessText(rawQueue)) {
             return null;
           }
           const ts = timestampMatch ? timestampMatch[1] : '';
           return {
             uuid: ts ? `queue-${ts}` : `queue-${index}`,
             role: 'USER',
-            content: queueContent,
+            content: unwrapPastedContent(rawQueue),
             timestamp: ts,
           };
         }
@@ -310,11 +311,14 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
       // Try to extract the first text block from the head (user's actual text is near the start)
       // Pattern: {"type":"text","text":"..."} — extract the text value
       const textBlockMatch = headPart.match(/"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-      let content = textBlockMatch ? textBlockMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"') : '';
+      let content = textBlockMatch
+        ? textBlockMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"')
+        : '';
 
       if (content && isHarnessText(content)) {
         content = '';
       }
+      content = unwrapPastedContent(content);
 
       // Skip truncated user entries with no text (tool_result blocks, not real messages)
       if (!content && type === 'user') {
@@ -354,7 +358,7 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
       return {
         uuid: ts ? `queue-${ts}` : `queue-${index}`,
         role: 'USER',
-        content: entry.content,
+        content: unwrapPastedContent(entry.content),
         timestamp: ts || '',
       };
     }
@@ -402,7 +406,7 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
     }
 
     // Extract content
-    const text = entry.message?.content
+    let text = entry.message?.content
       ? extractReadableText(entry.message.content)
       : '';
 
@@ -414,8 +418,11 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
     // Determine role
     let role: 'USER' | 'AGENT' | 'SYSTEM' = entry.type === 'user' ? 'USER' : 'AGENT';
 
-    if (role === 'USER' && isHarnessText(text)) {
-      return null;
+    if (role === 'USER') {
+      if (isHarnessText(text)) {
+        return null;
+      }
+      text = unwrapPastedContent(text);
     }
 
     // Filter agent no-op responses ("No response requested." etc.)

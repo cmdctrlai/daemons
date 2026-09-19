@@ -15,6 +15,7 @@ import {
   hasHarnessFlagInRawLine,
   isHarnessEntry,
   isHarnessText,
+  unwrapPastedContent,
 } from './transcript-filter';
 import { readMessagesFromFile } from './message-reader';
 import { SessionWatcher, SessionEvent } from './session-watcher';
@@ -101,7 +102,12 @@ describe('hasHarnessFlagInRawLine', () => {
  * Entries shared by the two end-to-end suites below. Each path must reach the
  * same verdict on every one.
  */
-const SHARED_ENTRIES: Array<{ name: string; entry: Record<string, unknown>; visible: boolean }> = [
+const SHARED_ENTRIES: Array<{
+  name: string;
+  entry: Record<string, unknown>;
+  visible: boolean;
+  content?: string;
+}> = [
   {
     name: 'relayed message from another Claude session',
     entry: {
@@ -188,6 +194,39 @@ const SHARED_ENTRIES: Array<{ name: string; entry: Record<string, unknown>; visi
       timestamp: '2026-09-17T04:00:06.000Z',
     },
     visible: true,
+    content: 'please fix the login bug',
+  },
+  {
+    name: 'a pasted message reaches the app as its inner text',
+    entry: {
+      uuid: 'paste-1',
+      type: 'user',
+      isMeta: false,
+      isSidechain: false,
+      message: {
+        role: 'user',
+        content: '\n\n<pasted_content id="1c43">\nWe need to refire all the background agents\n</pasted_content id="1c43">\n',
+      },
+      timestamp: '2026-09-17T04:00:07.000Z',
+    },
+    visible: true,
+    content: 'We need to refire all the background agents',
+  },
+  {
+    name: 'a pasted JSON payload survives the structured-data rule',
+    entry: {
+      uuid: 'paste-2',
+      type: 'user',
+      isMeta: false,
+      isSidechain: false,
+      message: {
+        role: 'user',
+        content: '<pasted_content id="1c43">\n{"error":"boom","code":500}\n</pasted_content id="1c43">',
+      },
+      timestamp: '2026-09-17T04:00:08.000Z',
+    },
+    visible: true,
+    content: '{"error":"boom","code":500}',
   },
 ];
 
@@ -204,10 +243,13 @@ describe('history path drops harness entries', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it.each(SHARED_ENTRIES)('$name', ({ entry, visible }) => {
+  it.each(SHARED_ENTRIES)('$name', ({ entry, visible, content }) => {
     fs.writeFileSync(tempFile, JSON.stringify(entry) + '\n');
-    const uuids = readMessagesFromFile(tempFile, 50).messages.map((m) => m.uuid);
-    expect(uuids).toEqual(visible ? [entry.uuid] : []);
+    const messages = readMessagesFromFile(tempFile, 50).messages;
+    expect(messages.map((m) => m.uuid)).toEqual(visible ? [entry.uuid] : []);
+    if (visible) {
+      expect(messages[0].content).toBe(content);
+    }
   });
 
   /**
@@ -238,14 +280,15 @@ describe('history path drops harness entries', () => {
     expect(readMessagesFromFile(tempFile, 50).messages.map((m) => m.uuid)).toEqual(['big-plain']);
   });
 
-  it('keeps only the real message when every entry is in one file', () => {
+  it('keeps only the user messages when every entry is in one file', () => {
     fs.writeFileSync(
       tempFile,
       SHARED_ENTRIES.map((c) => JSON.stringify(c.entry)).join('\n') + '\n'
     );
+    const visible = SHARED_ENTRIES.filter((c) => c.visible);
     const messages = readMessagesFromFile(tempFile, 50).messages;
-    expect(messages.map((m) => m.uuid)).toEqual(['real-1']);
-    expect(messages[0].content).toBe('please fix the login bug');
+    expect(messages.map((m) => m.uuid)).toEqual(visible.map((c) => c.entry.uuid));
+    expect(messages.map((m) => m.content)).toEqual(visible.map((c) => c.content));
   });
 });
 
@@ -269,7 +312,7 @@ describe('live path drops harness entries', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('emits USER_MESSAGE only for the real message', async () => {
+  it('emits USER_MESSAGE for the real and pasted messages only', async () => {
     watcher.watchSession('filter-session', tempFile);
     await new Promise((r) => setTimeout(r, 150));
 
@@ -279,8 +322,84 @@ describe('live path drops harness entries', () => {
     );
     await new Promise((r) => setTimeout(r, 2000));
 
+    const visible = SHARED_ENTRIES.filter((c) => c.visible);
     const userEvents = events.filter((e) => e.type === 'USER_MESSAGE');
-    expect(userEvents.map((e) => e.uuid)).toEqual(['real-1']);
-    expect(userEvents[0].content).toBe('please fix the login bug');
+    expect(userEvents.map((e) => e.uuid)).toEqual(visible.map((c) => c.entry.uuid));
+    expect(userEvents.map((e) => e.content)).toEqual(visible.map((c) => c.content));
+  });
+});
+
+describe('unwrapPastedContent', () => {
+  const cases: Array<{ name: string; input: string; unwrapped: string; harness: boolean }> = [
+    {
+      name: 'a message the user pasted whole',
+      input: '\n\n<pasted_content id="1c43">\nSleep for 20 seconds and then send me 200 words\n</pasted_content id="1c43">\n',
+      unwrapped: 'Sleep for 20 seconds and then send me 200 words',
+      harness: false,
+    },
+    {
+      name: 'a paste sitting inside typed text',
+      input: 'look at this:\n<pasted_content id="ab">\nstack trace line\n</pasted_content id="ab">\nwhat do you think?',
+      unwrapped: 'look at this:\nstack trace line\nwhat do you think?',
+      harness: false,
+    },
+    {
+      name: 'two pastes in one message',
+      input: '<pasted_content id="a">\nfirst\n</pasted_content id="a">\n<pasted_content id="b">\nsecond\n</pasted_content id="b">',
+      unwrapped: 'first\nsecond',
+      harness: false,
+    },
+    {
+      name: 'a paste whose own text starts with a tag',
+      input: '<pasted_content id="x">\n<html>\n</pasted_content id="x">',
+      unwrapped: '<html>',
+      harness: false,
+    },
+    {
+      name: 'a pasted JSON payload',
+      input: '<pasted_content id="x">\n{"error":"boom","code":500}\n</pasted_content id="x">',
+      unwrapped: '{"error":"boom","code":500}',
+      harness: false,
+    },
+    {
+      name: 'a pasted JSON array',
+      input: '<pasted_content id="x">\n[1,2,3]\n</pasted_content id="x">',
+      unwrapped: '[1,2,3]',
+      harness: false,
+    },
+    {
+      name: 'a pasted merge conflict',
+      input: '<pasted_content id="x">\n<<<<<<< HEAD\n</pasted_content id="x">',
+      unwrapped: '<<<<<<< HEAD',
+      harness: false,
+    },
+    {
+      name: 'a harness tag that happens to contain a paste is still harness',
+      input: '<local-command-stdout><pasted_content id="x">ok</pasted_content id="x"></local-command-stdout>',
+      unwrapped: '<local-command-stdout>ok</local-command-stdout>',
+      harness: true,
+    },
+    {
+      name: 'bare JSON that was never pasted is still harness',
+      input: '{"type":"tool_result"}',
+      unwrapped: '{"type":"tool_result"}',
+      harness: true,
+    },
+    { name: 'a task notification', input: '<task-notification>\n<task-id>bc5</task-id>\n</task-notification>', unwrapped: '<task-notification>\n<task-id>bc5</task-id>\n</task-notification>', harness: true },
+    { name: 'a system reminder', input: '<system-reminder>be brief</system-reminder>', unwrapped: '<system-reminder>be brief</system-reminder>', harness: true },
+    { name: 'a slash-command name', input: '<command-name>/pjm</command-name>', unwrapped: '<command-name>/pjm</command-name>', harness: true },
+    { name: 'a command message', input: '<command-message>pjm is running…</command-message>', unwrapped: '<command-message>pjm is running…</command-message>', harness: true },
+    { name: 'local command stdout', input: '<local-command-stdout>ok</local-command-stdout>', unwrapped: '<local-command-stdout>ok</local-command-stdout>', harness: true },
+    { name: 'bash input', input: '<bash-input>ls</bash-input>', unwrapped: '<bash-input>ls</bash-input>', harness: true },
+    { name: 'bash stdout', input: '<bash-stdout>file.txt</bash-stdout>', unwrapped: '<bash-stdout>file.txt</bash-stdout>', harness: true },
+    { name: 'ordinary prose', input: 'Again, please', unwrapped: 'Again, please', harness: false },
+    { name: 'prose that opens with a comparison', input: '< 5ms is the target', unwrapped: '< 5ms is the target', harness: false },
+  ];
+
+  // Mirrors production order: the filter decides on the raw text, because the wrapper is
+  // what marks the payload as the user's; the unwrap only produces what gets displayed.
+  it.each(cases)('$name', ({ input, unwrapped, harness }) => {
+    expect(isHarnessText(input)).toBe(harness);
+    expect(unwrapPastedContent(input)).toBe(unwrapped);
   });
 });

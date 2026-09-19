@@ -5,6 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { findSessionFile } from '../message-reader';
+import { unwrapPastedContent } from '../transcript-filter';
 import { SessionStatus } from '@cmdctrl/daemon-sdk';
 
 interface JournalEntry {
@@ -163,7 +164,10 @@ export function extractSessionContext(
         if (entry.type === 'user' || entry.type === 'assistant') {
           messageCount++;
 
-          const text = extractReadableText(entry.message?.content);
+          const text =
+            entry.type === 'user'
+              ? unwrapPastedContent(extractReadableText(entry.message?.content))
+              : extractReadableText(entry.message?.content);
           if (text) {
             const role: 'USER' | 'AGENT' = entry.type === 'user' ? 'USER' : 'AGENT';
             allMessages.push({ role, content: text, timestamp: entry.timestamp });
