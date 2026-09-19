@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { discoverCliUserTitles } from './session-discovery';
+import { discoverCliUserTitles, generateTitle } from './session-discovery';
 
 describe('discoverCliUserTitles', () => {
   let tempDir: string;
@@ -119,5 +119,53 @@ describe('discoverCliUserTitles', () => {
   test('returns empty map when directory does not exist', () => {
     const result = discoverCliUserTitles(path.join(tempDir, 'does-not-exist'));
     expect(result.size).toBe(0);
+  });
+});
+
+describe('generateTitle', () => {
+  type Case = { name: string; message: string; expected: string };
+
+  const cases: Case[] = [
+    {
+      name: 'ordinary first message becomes the title',
+      message: 'Fix the login redirect',
+      expected: 'Fix the login redirect',
+    },
+    {
+      name: 'a pasted first message titles on its text, not the wrapper',
+      message:
+        '\n\n<pasted_content id="c261">\nThis is the first message and I dictated it\n</pasted_content id="c261">\n',
+      expected: 'This is the first message and I dictated it',
+    },
+    {
+      name: 'typed text around a paste keeps the typed lead',
+      message: 'look at this <pasted_content id="d81e">\nstack trace\n</pasted_content id="d81e">',
+      expected: 'look at this stack trace',
+    },
+    {
+      name: 'only the first line is used',
+      message: 'first line\nsecond line',
+      expected: 'first line',
+    },
+    {
+      name: 'a long line truncates at a word boundary',
+      message:
+        'This first line runs well past the fifty character limit that titles are held to',
+      expected: 'This first line runs well past the fifty...',
+    },
+    {
+      name: 'empty message yields no title',
+      message: '',
+      expected: '',
+    },
+    {
+      name: 'whitespace-only message yields no title',
+      message: '   \n  ',
+      expected: '',
+    },
+  ];
+
+  it.each(cases)('$name', ({ message, expected }) => {
+    expect(generateTitle(message)).toBe(expected);
   });
 });

@@ -56,6 +56,22 @@ export function isHarnessEntry(entry: TranscriptEntryFlags): boolean {
 }
 
 /**
+ * Claude Code rewrites pasted input into `<pasted_content id="...">...</pasted_content id="...">`
+ * before writing the entry, so a message the user pasted arrives looking exactly like a
+ * harness tag wrapper. Replacing each wrapper with the text inside it is what lets the
+ * leading-`<` rule below stay as blunt as it is: by the time that rule sees the string,
+ * a paste is ordinary prose again.
+ *
+ * A message can hold several pastes mixed with typed text, and the closing tag repeats
+ * the id rather than being bare, so every wrapper is matched and unwrapped in place.
+ */
+export function unwrapPastedContent(content: string): string {
+  return content
+    .replace(/<pasted_content\b[^>]*>\n?([\s\S]*?)\n?<\/pasted_content\b[^>]*>/g, '$1')
+    .trim();
+}
+
+/**
  * True for text that is machine-generated rather than typed by a human.
  *
  * A safety net for entries with no usable flag: structured data, XML-like
@@ -66,6 +82,12 @@ export function isHarnessEntry(entry: TranscriptEntryFlags): boolean {
 export function isHarnessText(content: string): boolean {
   const trimmed = content.trim();
 
+  // A paste wrapper is proof the text came from the person: the harness never wraps its
+  // own tags in one. Whatever is inside -- JSON, HTML, a diff -- is theirs, so exempt it
+  // before the blunt rules below, which would otherwise read the payload as harness noise.
+  if (trimmed.startsWith('<pasted_content')) {
+    return false;
+  }
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     return true;
   }

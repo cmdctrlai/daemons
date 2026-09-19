@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as readline from 'readline';
+import { unwrapPastedContent } from './transcript-filter';
 
 const ACTIVE_THRESHOLD_MS = 30 * 1000; // 30 seconds
 const TAIL_BYTES = 65536; // 64KB - only used as fallback
@@ -118,9 +119,10 @@ interface SessionIndexEntry {
 /**
  * Generate a title from message content (first line, truncated)
  */
-function generateTitle(message: string): string {
+export function generateTitle(message: string): string {
   if (!message) return '';
-  const firstLine = message.split('\n')[0].trim();
+  // A pasted first message arrives wrapped, and the wrapper would otherwise become the title.
+  const firstLine = unwrapPastedContent(message).split('\n')[0].trim();
   if (firstLine.length === 0) return '';
   if (firstLine.length <= 50) return firstLine;
 
@@ -515,7 +517,9 @@ async function parseSessionFile(filePath: string, projectPath: string, projectNa
 
         // Track first and last user messages (extract readable text only)
         if (entry.type === 'user' && entry.message?.content) {
-          const text = extractReadableText(entry.message.content);
+          // Unwrap here so both the title and the list preview show the pasted text,
+          // not the wrapper -- truncating the preview mid-tag is how it surfaced.
+          const text = unwrapPastedContent(extractReadableText(entry.message.content));
           if (text) {
             if (!firstUserMessage) {
               firstUserMessage = text;
