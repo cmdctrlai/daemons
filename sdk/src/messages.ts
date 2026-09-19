@@ -187,6 +187,17 @@ export interface MessageEntry {
   role: 'USER' | 'AGENT' | 'SYSTEM';
   content: string;
   timestamp: string;
+  /**
+   * Formatted tool-activity lines for the turn that produced this message,
+   * oldest call first – the same lines the verbose stream sends while a turn
+   * runs, replayed for a client that arrived after the work.
+   *
+   * Only the newest message of the newest page ever carries it, and only from
+   * an agent whose backing store can reconstruct the turn. Most cannot, so
+   * nothing here is required: clients render what they get and nothing when
+   * the field is absent.
+   */
+  verbose?: string[];
 }
 
 export interface MessagesResponseMessage {
