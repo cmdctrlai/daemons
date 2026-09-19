@@ -11,6 +11,7 @@
 
 import * as fs from 'fs';
 import { isHarnessEntry, isHarnessText, unwrapPastedContent } from './transcript-filter';
+import { formatToolUse, normalizeToolUse } from './tool-format';
 
 // Event types emitted by SessionWatcher
 export interface SessionEvent {
@@ -587,8 +588,8 @@ export class SessionWatcher {
           }
         }
 
-        const formattedTool = this.formatToolUse(toolName, toolInput);
-        const descriptor = this.normalizeToolUse(toolName, toolInput);
+        const formattedTool = formatToolUse(toolName, toolInput);
+        const descriptor = normalizeToolUse(toolName, toolInput);
 
         return {
           type: 'VERBOSE',
@@ -626,73 +627,6 @@ export class SessionWatcher {
     }
 
     return null;
-  }
-
-  /**
-   * Format a tool_use block for verbose display
-   */
-  private formatToolUse(name: string, input?: Record<string, unknown>): string {
-    switch (name) {
-      case 'Read':
-        return `📖 Reading ${input?.file_path || 'file'}`;
-      case 'Write':
-        return `✏️ Writing ${input?.file_path || 'file'}`;
-      case 'Edit':
-        return `🔧 Editing ${input?.file_path || 'file'}`;
-      case 'Bash':
-        const cmd = ((input?.command as string) || '').slice(0, 60);
-        return `⚡ Running: ${cmd}`;
-      case 'Glob':
-        return `🔍 Searching: ${input?.pattern || ''}`;
-      case 'Grep':
-        return `🔎 Grepping: ${input?.pattern || ''}`;
-      case 'Task':
-        return `📋 Spawning task: ${input?.description || 'subagent'}`;
-      case 'TodoWrite':
-        return `📝 Updating todos`;
-      case 'WebSearch':
-        return `🌐 Searching: ${input?.query || ''}`;
-      case 'WebFetch':
-        return `🌐 Fetching: ${input?.url || ''}`;
-      case 'EnterPlanMode':
-        return `📋 Entered plan mode`;
-      case 'ExitPlanMode':
-        return `📋 Plan ready for approval`;
-      default:
-        return `🔧 ${name}`;
-    }
-  }
-
-  /**
-   * Build a normalized tool descriptor { tool, argSummary } for a tool_use block.
-   * Same argument extraction as formatToolUse, but without the emoji/display text –
-   * the server uses this to narrate the action for voice mode across agents.
-   */
-  private normalizeToolUse(name: string, input?: Record<string, unknown>): { tool: string; argSummary: string } {
-    const str = (v: unknown): string => (typeof v === 'string' ? v : '');
-    switch (name) {
-      case 'Read':
-      case 'Write':
-      case 'Edit':
-        return { tool: name, argSummary: str(input?.file_path) };
-      case 'Bash':
-        return { tool: name, argSummary: str(input?.command).slice(0, 60) };
-      case 'Glob':
-      case 'Grep':
-        return { tool: name, argSummary: str(input?.pattern) };
-      case 'Task':
-        return { tool: name, argSummary: str(input?.description) };
-      case 'WebSearch':
-        return { tool: name, argSummary: str(input?.query) };
-      case 'WebFetch':
-        return { tool: name, argSummary: str(input?.url) };
-      case 'TodoWrite':
-      case 'EnterPlanMode':
-      case 'ExitPlanMode':
-        return { tool: name, argSummary: '' };
-      default:
-        return { tool: name, argSummary: '' };
-    }
   }
 
   get watchCount(): number {
