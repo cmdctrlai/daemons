@@ -15,6 +15,7 @@ import {
   isHarnessText,
   unwrapPastedContent,
 } from './transcript-filter';
+import { formatToolUse } from './tool-format';
 
 /** One tappable choice the agent offered. */
 export interface MessageQuestionOption {
@@ -34,7 +35,14 @@ export interface MessageQuestion {
 }
 
 /** A message plus the structured extras we lift out of the transcript. */
-export type ReadMessageEntry = MessageEntry & { question?: MessageQuestion };
+export type ReadMessageEntry = MessageEntry & {
+  question?: MessageQuestion;
+  /**
+   * Also declared on the SDK's MessageEntry. Repeated here so the daemon builds
+   * against the published SDK ahead of the release that carries the field.
+   */
+  verbose?: string[];
+};
 
 // Size of chunks to read when scanning for messages
 const CHUNK_SIZE = 64 * 1024; // 64KB
@@ -55,6 +63,12 @@ const MAX_CURSOR_SCAN_BYTES = 256 * 1024 * 1024;
 // content, so a transcript of pasted logs costs the same as one of one-liners
 // and the window stays far longer than any queue entry waits to be processed.
 const DEDUPE_HISTORY_ENTRIES = 50_000;
+// The tail message's turn is replayed as verbose lines, so a client arriving
+// after the work sees what produced the answer. A typical turn formats to a few
+// hundred bytes, and a verbose pane only ever shows its tail, so the newest
+// lines are kept and anything beyond them dropped.
+const MAX_VERBOSE_LINES = 50;
+const MAX_VERBOSE_LINE_CHARS = 200;
 const LINE_TAIL_SIZE = 1024; // 1KB - also capture tail of long lines (uuid, timestamp are at the end)
 const TRUNCATED_LINE_MARKER = '\x00TRUNCATED\x00'; // Marker added to truncated lines
 const TRUNCATED_MID_MARKER = '\x00MID\x00'; // Separator between head and tail of truncated lines
@@ -441,6 +455,93 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
   }
 }
 
+/**
+ * The formatted tool calls in one raw JSONL line, oldest call first.
+ *
+ * Empty for anything that is not an assistant entry running tools. A line the
+ * scanner truncated no longer parses as JSON and lands here too – a turn whose
+ * verbose is short reads better than one that shows a fragment of an argument.
+ */
+function toolUseLines(rawLine: string): string[] {
+  let entry: JournalEntry;
+  try {
+    entry = JSON.parse(rawLine);
+  } catch {
+    return [];
+  }
+
+  if (!entry || entry.type !== 'assistant' || isHarnessEntry(entry)) return [];
+  if (!Array.isArray(entry.message?.content)) return [];
+
+  const lines: string[] = [];
+  for (const block of entry.message.content as Record<string, unknown>[]) {
+    if (block?.type !== 'tool_use' || typeof block.name !== 'string') continue;
+    lines.push(clip(formatToolUse(block.name, block.input as Record<string, unknown> | undefined)));
+  }
+  return lines;
+}
+
+/** Cut an over-long line to the display cap without splitting a surrogate pair. */
+function clip(text: string): string {
+  if (text.length <= MAX_VERBOSE_LINE_CHARS) return text;
+  let end = MAX_VERBOSE_LINE_CHARS;
+  const lastCode = text.charCodeAt(end - 1);
+  if (lastCode >= 0xd800 && lastCode <= 0xdbff) end--;
+  return text.slice(0, end) + '…';
+}
+
+/**
+ * The tool activity behind the newest message.
+ *
+ * Tool calls are dropped from every message, which is right for a transcript –
+ * they are shown as verbose output while the turn runs, not kept as chat. But a
+ * client re-entering the session afterwards then sees a final answer with no
+ * sign of the work that produced it. Backward reading meets the newest message
+ * first and its turn immediately after, so the lines are gathered there and
+ * nowhere else; history stays exactly as slim as it was.
+ *
+ * The turn ends where the person last spoke. An agent that narrates as it works
+ * writes several messages inside one turn, and cutting at the previous message
+ * would hand back the last of them – one chip for an hour of work.
+ */
+class TailVerbose {
+  private done = false;
+  private newestFirst: string[] = [];
+
+  /** Every scanned line, before it is known to be a message. An entry that
+   *  carries both text and a tool call is a message and part of the turn. */
+  consider(rawLine: string): void {
+    if (this.done) return;
+
+    const lines = toolUseLines(rawLine);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (this.newestFirst.length >= MAX_VERBOSE_LINES) {
+        this.done = true;
+        return;
+      }
+      this.newestFirst.push(lines[i]);
+    }
+  }
+
+  /** Every message the scan keeps, newest first. */
+  sawMessage(role: ReadMessageEntry['role']): void {
+    if (role === 'USER') this.done = true;
+  }
+
+  /**
+   * Hang the turn's lines, oldest first, on the message they produced.
+   *
+   * Only an agent's answer gets them. A user message is last when they replied
+   * mid-turn, and tool chips under their own bubble would credit them with work
+   * they did not do.
+   */
+  attachTo(messages: ReadMessageEntry[]): void {
+    const last = messages[messages.length - 1];
+    if (!last || last.role !== 'AGENT' || this.newestFirst.length === 0) return;
+    last.verbose = this.newestFirst.slice().reverse();
+  }
+}
+
 /** A JSONL line and the byte offset it starts at. The offset is the stable
  *  identity for entries whose JSON carries no uuid, so the same entry keeps the
  *  same generated id on every page that reaches it. */
@@ -691,6 +792,7 @@ function readLatest(
   try {
     const recentUsers = new RecentUserContent();
     const newestFirst: ReadMessageEntry[] = [];
+    const tailVerbose = new TailVerbose();
     let lineCount = 0;
 
     while (lineCount < MAX_TAIL_SCAN_LINES) {
@@ -700,12 +802,14 @@ function readLatest(
       for (const line of batch) {
         lineCount++;
         const message = parseLineToMessage(line.text, line.offset);
+        tailVerbose.consider(line.text);
         if (!message) continue;
         if (message.role === 'USER' && !message.uuid.startsWith('queue-')) {
           recentUsers.add(message.content);
         }
         if (message.uuid.startsWith('queue-') && recentUsers.has(message.content)) continue;
         newestFirst.push(message);
+        tailVerbose.sawMessage(message.role);
       }
 
       if (newestFirst.length > limit) break;
@@ -713,9 +817,11 @@ function readLatest(
 
     const messages = newestFirst.slice().reverse();
     interpolateTimestamps(messages);
+    const pageMessages = messages.slice(-limit);
+    tailVerbose.attachTo(pageMessages);
     // Older messages exist if the scan found more than fit on this page, or if
     // it gave up before reaching the start of the file.
-    return page(messages.slice(-limit), messages.length > limit || !scanner.reachedStart);
+    return page(pageMessages, messages.length > limit || !scanner.reachedStart);
   } finally {
     scanner.close();
   }
