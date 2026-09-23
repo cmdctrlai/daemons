@@ -51,6 +51,26 @@ export interface QuestionOption {
   description?: string;
 }
 
+/**
+ * The first usable question in an AskUserQuestion input, or null.
+ *
+ * `questions` is not always the array the type promises: a malformed tool call
+ * can deliver it as the raw JSON string, and indexing that yields "[", which is
+ * truthy and carries no question text. `options` can arrive the same way.
+ */
+export function firstQuestion(input: AskUserInput | undefined): Question | null {
+  const questions = input?.questions;
+  if (!Array.isArray(questions)) return null;
+  const first = questions[0] as Question | undefined;
+  if (!first || typeof first.question !== 'string' || !first.question.trim()) return null;
+  // The answer path matches replies against option labels, so a question
+  // without real options can be shown but never answered.
+  const options: unknown = first.options;
+  if (!Array.isArray(options) || options.length === 0) return null;
+  if (!options.every((o) => typeof o?.label === 'string' && o.label.trim())) return null;
+  return first;
+}
+
 export interface ProgressInfo {
   action: string;
   target: string;

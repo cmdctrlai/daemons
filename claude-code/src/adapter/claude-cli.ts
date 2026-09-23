@@ -4,7 +4,8 @@ import {
   StreamEvent,
   AskUserInput,
   QuestionOption,
-  extractProgressFromToolUse
+  extractProgressFromToolUse,
+  firstQuestion
 } from './events';
 import { findSessionFile } from '../message-reader';
 import { rewriteSdkCliEntrypoint } from './entrypoint-rewrite';
@@ -322,13 +323,13 @@ export class ClaudeAdapter {
    * answer comes back, so this is a prompt rather than a completed turn.
    */
   private emitQuestion(taskId: string, sessionId: string, input: AskUserInput): void {
-    const q = input.questions?.[0];
+    const q = firstQuestion(input);
     if (!q) return;
 
     const turn = this.turns.get(taskId);
     if (turn) {
       turn.question = q.question;
-      turn.options = q.options || [];
+      turn.options = q.options;
       // A parked question emits nothing until the user answers, so the ordinary
       // turn watchdog would interrupt the session and deny the tool call while
       // the question is still sitting on someone's phone. Hand the turn the
@@ -340,7 +341,7 @@ export class ClaudeAdapter {
     this.onEvent(taskId, 'WAIT_FOR_USER', {
       session_id: sessionId,
       prompt: q.question,
-      options: q.options || [],
+      options: q.options,
       context: turn?.context ?? '',
       user_message_uuid: turn?.userMessageUuid,
       permission_tool: 'AskUserQuestion',

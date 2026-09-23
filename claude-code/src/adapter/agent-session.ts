@@ -2,7 +2,7 @@ import { query, type Query, type SDKUserMessage, type PermissionResult } from '@
 import { MessageQueue } from './message-queue';
 import { PendingQuestions } from './pending-questions';
 import { buildUserMessage } from './user-message';
-import type { AskUserInput, StreamEvent } from './events';
+import { firstQuestion, type AskUserInput, type StreamEvent } from './events';
 
 /**
  * Tools the agent may use without asking. AskUserQuestion is deliberately
@@ -161,6 +161,14 @@ export class AgentSession {
     }
 
     const askInput = input as unknown as AskUserInput;
+    // Parking a question nobody can be shown hangs the tool call until the
+    // question budget runs out. Deny it now so the agent can call again.
+    if (!firstQuestion(askInput)) {
+      return Promise.resolve({
+        behavior: 'deny',
+        message: 'AskUserQuestion needs a questions array whose first question has text and labelled options.',
+      });
+    }
     this.opts.onQuestion(this.taskId, this.sessionId, askInput);
     return this.pending.park(this.sessionId, askInput, this.opts.questionTimeoutMs);
   }
