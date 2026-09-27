@@ -7,12 +7,13 @@ import { stop } from './stop';
 
 const configManager = new ConfigManager('copilot-cli');
 
-function confirm(question: string): Promise<boolean> {
+function confirm(question: string, defaultYes = false): Promise<boolean> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
-    rl.question(`${question} [y/N] `, (answer) => {
+    rl.question(`${question} ${defaultYes ? '[Y/n]' : '[y/N]'} `, (answer) => {
       rl.close();
-      resolve(answer.trim().toLowerCase() === 'y');
+      const reply = answer.trim().toLowerCase();
+      resolve(reply === '' ? defaultYes : reply === 'y' || reply === 'yes');
     });
   });
 }
@@ -97,8 +98,9 @@ export async function register(options: RegisterOptions): Promise<void> {
   console.log('\n\nRegistration complete!');
   console.log(`Device ID: ${result.deviceId}`);
 
-  if (process.stdin.isTTY) {
-    const startNow = await confirm('\nStart daemon in background now?');
+  // install.sh starts the daemon itself once registration returns.
+  if (process.stdin.isTTY && !process.env.CMDCTRL_INSTALLER) {
+    const startNow = await confirm('\nStart daemon in background now?', true);
     if (startNow) {
       const logFile = '/tmp/cmdctrl-daemon-copilot-cli.log';
       const logFd = openSync(logFile, 'a');

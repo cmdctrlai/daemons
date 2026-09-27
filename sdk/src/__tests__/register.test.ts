@@ -176,29 +176,63 @@ describe('displayVerification', () => {
     const stream = fakeStream(false);
     displayVerification(url, 'ABCD-1234', stream);
     const output = stream.write.mock.calls[0][0] as string;
-    expect(output).not.toMatch(/[█▀▄]/);
+    expect(output).not.toMatch(/[▘▝▀▖▌▞▛▗▚▐▜▄▙▟█]/);
   });
 
   test('renders the QR block on a wide TTY', () => {
     const stream = fakeStream(true, 80);
     displayVerification(url, 'ABCD-1234', stream);
     const output = stream.write.mock.calls[0][0] as string;
-    expect(output).toMatch(/[█▀▄]/);
+    expect(output).toMatch(/[▘▝▀▖▌▞▛▗▚▐▜▄▙▟█]/);
   });
 
   test('falls back to a note when the TTY is too narrow for the QR', () => {
     const stream = fakeStream(true, 10);
     displayVerification(url, 'ABCD-1234', stream);
     const output = stream.write.mock.calls[0][0] as string;
-    expect(output).not.toMatch(/[█▀▄]/);
+    expect(output).not.toMatch(/[▘▝▀▖▌▞▛▗▚▐▜▄▙▟█]/);
     expect(output).toContain('terminal too narrow');
     expect(output).toContain(url); // still usable without the QR
+  });
+
+  test('shows the QR before the URL and code on a TTY', () => {
+    const stream = fakeStream(true, 80);
+    displayVerification(url, 'ABCD-1234', stream);
+    const output = stream.write.mock.calls[0][0] as string;
+    const qrAt = output.search(/[▘▝▀▖▌▞▛▗▚▐▜▄▙▟█]/);
+    expect(qrAt).toBeGreaterThan(-1);
+    expect(qrAt).toBeLessThan(output.indexOf(url));
+    expect(qrAt).toBeLessThan(output.indexOf('Code: ABCD-1234'));
+  });
+
+  test.each([
+    ['NO_COLOR unset', undefined, true],
+    ['NO_COLOR set', '1', false],
+  ])('draws the QR light grey on black on a TTY: %s', (_name, noColor, colored) => {
+    const saved = process.env.NO_COLOR;
+    if (noColor === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = noColor;
+    try {
+      const stream = fakeStream(true, 80);
+      displayVerification(url, 'ABCD-1234', stream);
+      const output = stream.write.mock.calls[0][0] as string;
+      expect(output.includes('\x1b[')).toBe(colored);
+      if (colored) {
+        // Every QR line is wrapped, so the black background never bleeds past a line end.
+        const qrLines = output.split('\n').filter((line) => /[▀▄█]/.test(line));
+        expect(qrLines.length).toBeGreaterThan(0);
+        expect(qrLines.every((line) => line.startsWith('\x1b[38;5;249;48;5;16m') && line.endsWith('\x1b[0m'))).toBe(true);
+      }
+    } finally {
+      if (saved === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = saved;
+    }
   });
 
   test('falls back to 80 columns when the TTY reports no width', () => {
     const stream = fakeStream(true, undefined);
     displayVerification(url, 'ABCD-1234', stream);
     const output = stream.write.mock.calls[0][0] as string;
-    expect(output).toMatch(/[█▀▄]/);
+    expect(output).toMatch(/[▘▝▀▖▌▞▛▗▚▐▜▄▙▟█]/);
   });
 });

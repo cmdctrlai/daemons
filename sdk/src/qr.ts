@@ -1,10 +1,8 @@
 /**
  * Terminal QR rendering for the device verification URL.
  *
- * Renders using half-block Unicode glyphs (2 modules per character row), which
- * halves the vertical footprint versus one-module-per-character rendering and
- * is what every terminal QR tool (gh, wrangler, doctl) converged on. No ANSI
- * color is used, so NO_COLOR is a non-issue by construction.
+ * Renders using half-block Unicode glyphs: one module per column, two per row.
+ * Terminal cells are about twice as tall as wide, so modules come out square.
  */
 
 import qrcodegen from 'qrcode-generator';
@@ -12,7 +10,7 @@ import qrcodegen from 'qrcode-generator';
 const QUIET_ZONE = 2; // modules of blank border on each side
 
 /** Build the boolean module matrix for `data` at a given error-correction level. */
-function buildMatrix(data: string, ecLevel: 'L' | 'M' | 'Q' | 'H' = 'M'): boolean[][] {
+function buildMatrix(data: string, ecLevel: 'L' | 'M' | 'Q' | 'H' = 'L'): boolean[][] {
   const qr = qrcodegen(0, ecLevel); // 0 = auto-select the smallest version that fits
   qr.addData(data);
   qr.make();
@@ -39,22 +37,15 @@ function withQuietZone(matrix: boolean[][]): boolean[][] {
   return padded;
 }
 
-/**
- * Render a module matrix as half-block Unicode text: each character cell
- * covers two module rows (top via foreground, bottom via background), so a
- * QR that is N modules tall prints in roughly N/2 terminal lines.
- */
+/** Render a module matrix as half-block glyphs: each character covers two module rows. */
 function renderHalfBlock(matrix: boolean[][]): string {
   const lines: string[] = [];
   for (let row = 0; row < matrix.length; row += 2) {
     let line = '';
     for (let col = 0; col < matrix.length; col++) {
       const top = matrix[row][col];
-      const bottom = row + 1 < matrix.length ? matrix[row + 1][col] : false;
-      if (top && bottom) line += '█';
-      else if (top && !bottom) line += '▀';
-      else if (!top && bottom) line += '▄';
-      else line += ' ';
+      const bottom = row + 1 < matrix.length && matrix[row + 1][col];
+      line += top ? (bottom ? '█' : '▀') : bottom ? '▄' : ' ';
     }
     lines.push(line);
   }
@@ -76,7 +67,7 @@ function renderAscii(matrix: boolean[][]): string {
 export interface QrRenderResult {
   /** Half-block terminal rendering, or null if it wouldn't fit / isn't appropriate. */
   block: string | null;
-  /** Module count per side, including the quiet zone. Useful for width checks. */
+  /** Terminal columns the block needs, including the quiet zone. */
   size: number;
 }
 
