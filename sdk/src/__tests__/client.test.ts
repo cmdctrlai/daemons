@@ -11,6 +11,9 @@ let mockWsInstance: any;
 // meaningful for `unexpectedResponse: 429` (the connect-throttle
 // rejection), whose response carries a Retry-After header.
 let nextConnectOutcome: 'open' | { unexpectedResponse: number; body?: string; headers?: Record<string, string> } | 'hang' = 'open';
+/** Sent to the client on every successful connection, the way the real server
+ *  greets each one with a version_status. */
+let onOpenGreeting: Record<string, unknown> | null = null;
 // Counts every MockWS construction, i.e. every connection attempt made by
 // the client (initial + every reconnect). Reset between tests.
 let connectAttemptCount = 0;
@@ -33,6 +36,10 @@ jest.mock('ws', () => {
       setTimeout(() => {
         if (outcome === 'open') {
           this.emit('open');
+          if (onOpenGreeting) {
+            const greeting = onOpenGreeting;
+            setTimeout(() => this.emit('message', JSON.stringify(greeting)), 0);
+          }
         } else {
           this.readyState = 0; // CONNECTING – matches real ws behavior on a rejected upgrade
           const res = new EE();
@@ -51,7 +58,10 @@ jest.mock('ws', () => {
 
     send(data: string) { this.sentMessages.push(JSON.parse(data)); }
     ping() {}
-    close() { this.readyState = 3; this.emit('close'); }
+    // Real ws starts a closing handshake and delivers 'close' on a later tick.
+    // A synchronous emit here hides every ordering bug between a self-initiated
+    // close and whatever the client does next.
+    close() { this.readyState = 2; setTimeout(() => { this.readyState = 3; this.emit('close'); }, 0); }
     terminate() { this.readyState = 3; }
   }
 
@@ -81,6 +91,7 @@ describe('DaemonClient', () => {
   beforeEach(() => {
     jest.useFakeTimers();
     nextConnectOutcome = 'open';
+    onOpenGreeting = null;
     connectAttemptCount = 0;
   });
 
@@ -907,6 +918,298 @@ describe('DaemonClient', () => {
 
       await client.disconnect();
       jest.restoreAllMocks();
+    });
+  });
+
+  describe('auto-update that installs nothing', () => {
+    // An install that leaves the daemon on its old version reconnects, and a
+    // fresh connection is answered with the same version_status -- so without
+    // a per-target guard the daemon retries forever. A prod daemon sat at one
+    // version across 110 connects in an hour that way.
+    const cases: Array<{
+      name: string;
+      status: 'failed' | 'up-to-date';
+      secondTarget: string;
+      expectedInstalls: number;
+    }> = [
+      { name: 'a failed install is not retried for the same target', status: 'failed', secondTarget: '1.1.0', expectedInstalls: 1 },
+      { name: 'a failed install is retried once the target moves', status: 'failed', secondTarget: '1.2.0', expectedInstalls: 2 },
+      { name: 'a no-op install is not retried for the same target', status: 'up-to-date', secondTarget: '1.1.0', expectedInstalls: 1 },
+      { name: 'a no-op install is retried once the target moves', status: 'up-to-date', secondTarget: '1.2.0', expectedInstalls: 2 },
+    ];
+
+    test.each(cases)('$name', async ({ status, secondTarget, expectedInstalls }) => {
+      const selfUpdate = jest.spyOn(updateModule, 'selfUpdate').mockResolvedValue({
+        status,
+        fromVersion: '1.0.0',
+        toVersion: '1.0.0',
+        error: 'stubbed',
+      });
+      jest.spyOn(console, 'error').mockImplementation(() => {});
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.spyOn(console, 'log').mockImplementation(() => {});
+
+      const client = createClient({
+        autoUpdate: true,
+        autoUpdateConfig: { packageName: '@cmdctrl/test', binName: 'cmdctrl-test' },
+      });
+
+      try {
+        const p = client.connect();
+        await jest.advanceTimersByTimeAsync(0);
+        await p;
+
+        simulateMessage({ type: 'version_status', status: 'update_available', your_version: '1.0.0', latest_version: '1.1.0' });
+        await jest.advanceTimersByTimeAsync(0);
+        expect(selfUpdate).toHaveBeenCalledTimes(1);
+
+        // The client reconnects itself after an install that changed nothing.
+        await jest.advanceTimersByTimeAsync(100);
+        simulateMessage({ type: 'version_status', status: 'update_available', your_version: '1.0.0', latest_version: secondTarget });
+        await jest.advanceTimersByTimeAsync(0);
+
+        expect(selfUpdate).toHaveBeenCalledTimes(expectedInstalls);
+      } finally {
+        // A case that fails mid-way still has to tear its client down, or the
+        // leftover keeps reconnecting and installing under the next case.
+        await client.disconnect();
+        jest.restoreAllMocks();
+      }
+    });
+  });
+
+  describe('auto-update that has nowhere left to go', () => {
+  // The server answers every fresh connection with the same version_status,
+  // and rejects an under-minimum daemon pre-upgrade with a 426 whose body is
+  // routed back through the same handler. If the handler neither installs nor
+  // stops, the daemon reconnects forever -- the storm this guard exists for.
+  beforeEach(() => {
+    jest.useFakeTimers();
+    nextConnectOutcome = 'open';
+    onOpenGreeting = null;
+    connectAttemptCount = 0;
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  const cases: Array<{ name: string; status: 'failed' | 'up-to-date' }> = [
+    { name: 'after a failed install', status: 'failed' },
+    { name: 'after a no-op install', status: 'up-to-date' },
+  ];
+
+  test.each(cases)('stops reconnecting to a 426 $name', async ({ status }) => {
+    jest.spyOn(updateModule, 'selfUpdate').mockResolvedValue({
+      status,
+      fromVersion: '1.0.0',
+      toVersion: '2.0.0',
+      error: status === 'failed' ? 'EACCES' : undefined,
+    } as never);
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+
+    // Every shipped daemon sets onBeforeUpdate, and half of them await real
+    // I/O in it (claude-code stops its adapters). That await is a window in
+    // which a reconnect can be armed, so the guard has to run with one.
+    const client = createClient({
+      autoUpdate: true,
+      autoUpdateConfig: {
+        packageName: '@cmdctrl/test',
+        binName: 'cmdctrl-test',
+        onBeforeUpdate: () => new Promise<void>((r) => setTimeout(r, 1500)),
+      },
+    });
+    try {
+      const connected = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await connected;
+
+      // Every attempt from here is rejected pre-upgrade with a 426 whose body
+      // is a version_status -- what a daemon under min_version sees on the
+      // wire once the install has failed to move it.
+      nextConnectOutcome = {
+        unexpectedResponse: 426,
+        body: JSON.stringify({
+          type: 'version_status',
+          status: 'update_required',
+          your_version: '1.0.0',
+          min_version: '2.0.0',
+          latest_version: '2.0.0',
+        }),
+      };
+      // The install runs, leaves us on 1.0.0, and reconnects to find out.
+      simulateMessage({
+        type: 'version_status',
+        status: 'update_available',
+        your_version: '1.0.0',
+        latest_version: '2.0.0',
+      });
+      await jest.advanceTimersByTimeAsync(2000);
+
+      connectAttemptCount = 0;
+      await jest.advanceTimersByTimeAsync(3600000);
+
+      // Locked out below min_version, the daemon never reconnects on its own.
+      expect(connectAttemptCount).toBe(0);
+      // A failure is retried on a capped backoff; a no-op install is not
+      // retried at all, since npm already gave us everything it has.
+      expect(updateModule.selfUpdate).toHaveBeenCalledTimes(status === 'failed' ? 4 : 1);
+    } finally {
+      await client.disconnect();
+      jest.restoreAllMocks();
+    }
+  });
+});
+
+describe('auto-update interrupted while it is running', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    nextConnectOutcome = 'open';
+    onOpenGreeting = null;
+    connectAttemptCount = 0;
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  // onBeforeUpdate is where a daemon stops its adapters, and it can take
+  // seconds. Anything that arms a reconnect during that window -- a dropped
+  // socket, a 426 -- used to bring us back here for a second `npm install -g`
+  // against the same global prefix, with the first still running.
+  test('a socket close mid-install does not start a second install', async () => {
+    const selfUpdate = jest.spyOn(updateModule, 'selfUpdate').mockResolvedValue({
+      status: 'failed',
+      fromVersion: '1.0.0',
+      toVersion: '2.0.0',
+      error: 'EACCES',
+    } as never);
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+
+    // The server greets every connection with version_status, so a reconnect
+    // mid-install walks straight back into the update path.
+    onOpenGreeting = {
+      type: 'version_status',
+      status: 'update_available',
+      your_version: '1.0.0',
+      latest_version: '2.0.0',
+    };
+
+    let beforeCalls = 0;
+    const client = createClient({
+      autoUpdate: true,
+      autoUpdateConfig: {
+        packageName: '@cmdctrl/test',
+        binName: 'cmdctrl-test',
+        onBeforeUpdate: () => {
+          beforeCalls++;
+          return new Promise<void>((r) => setTimeout(r, 1500));
+        },
+      },
+    });
+    try {
+      const connected = client.connect();
+      await jest.advanceTimersByTimeAsync(0);
+      await connected;
+
+      // Server drops us while onBeforeUpdate is still stopping adapters.
+      await jest.advanceTimersByTimeAsync(100);
+      mockWsInstance.emit('close', 1006, Buffer.from('gone'));
+      // Long enough for a reconnect to land and be greeted again, short
+      // enough that the capped retry backoff has not yet fired.
+      await jest.advanceTimersByTimeAsync(20000);
+
+      expect(beforeCalls).toBe(1);
+      expect(selfUpdate).toHaveBeenCalledTimes(1);
+    } finally {
+      await client.disconnect();
+      jest.restoreAllMocks();
+    }
+  });
+});
+
+describe('auto-update below the minimum version', () => {
+    // Suppressing a hopeless reinstall must not suppress the reason for it --
+    // a daemon the server has locked out has to keep saying so.
+    test('keeps reporting update_required after a failed install', async () => {
+      const selfUpdate = jest.spyOn(updateModule, 'selfUpdate').mockResolvedValue({
+        status: 'failed',
+        fromVersion: '1.0.0',
+        toVersion: '2.0.0',
+        error: 'stubbed',
+      });
+      const error = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      const client = createClient({
+        autoUpdate: true,
+        autoUpdateConfig: { packageName: '@cmdctrl/test', binName: 'cmdctrl-test' },
+      });
+
+      try {
+        const p = client.connect();
+        await jest.advanceTimersByTimeAsync(0);
+        await p;
+
+        const status = { type: 'version_status', status: 'update_required', your_version: '1.0.0', min_version: '2.0.0', latest_version: '2.0.0' };
+        const unsupported = () => error.mock.calls.filter((c) => String(c[0]).includes('no longer supported')).length;
+
+        simulateMessage(status);
+        await jest.advanceTimersByTimeAsync(0);
+        expect(selfUpdate).toHaveBeenCalledTimes(1);
+        expect(unsupported()).toBe(1);
+
+        // The failed install leaves the daemon down on purpose, so the second
+        // report has to come from a second connection -- a supervisor restart,
+        // or the user starting it again. The server greets that one the same
+        // way, and the install stays suppressed while the message does not.
+        onOpenGreeting = status;
+        const again = client.connect();
+        await jest.advanceTimersByTimeAsync(0);
+        await again;
+        await jest.advanceTimersByTimeAsync(10);
+
+        expect(selfUpdate).toHaveBeenCalledTimes(1);
+        expect(unsupported()).toBe(2);
+      } finally {
+        await client.disconnect();
+        jest.restoreAllMocks();
+      }
+    });
+  });
+
+  describe('auto-update on a platform that cannot do it', () => {
+    test('warns once, not on every version_status', async () => {
+      jest.spyOn(updateModule, 'isAutoUpdateSupported').mockReturnValue(false);
+      const selfUpdate = jest.spyOn(updateModule, 'selfUpdate');
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const client = createClient({
+        autoUpdate: true,
+        autoUpdateConfig: { packageName: '@cmdctrl/test', binName: 'cmdctrl-test' },
+      });
+
+      try {
+        const p = client.connect();
+        await jest.advanceTimersByTimeAsync(0);
+        await p;
+
+        const status = { type: 'version_status', status: 'update_available', your_version: '1.0.0', latest_version: '1.1.0' };
+        simulateMessage(status);
+        await jest.advanceTimersByTimeAsync(0);
+        const warnings = warn.mock.calls.length;
+        expect(warnings).toBeGreaterThan(0);
+        expect(selfUpdate).not.toHaveBeenCalled();
+
+        simulateMessage(status);
+        await jest.advanceTimersByTimeAsync(0);
+
+        expect(warn.mock.calls.length).toBe(warnings);
+      } finally {
+        await client.disconnect();
+        jest.restoreAllMocks();
+      }
     });
   });
 
