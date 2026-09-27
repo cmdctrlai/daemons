@@ -138,15 +138,18 @@ export async function pollForToken(
 }
 
 const DEFAULT_COLUMNS = 80;
+// Light grey on black: softer than full white, and the same tile on light and dark themes.
+const QR_COLOR = '\x1b[38;5;249;48;5;16m';
+const RESET = '\x1b[0m';
 
 /**
- * Print the verification URL, user code, and (where the terminal supports
- * it) a scannable QR block. The URL and code are always plain text – a QR
- * is a convenience for phones with a camera, never the only path.
+ * Print a scannable QR block (where the terminal supports it), then the
+ * verification URL and user code. The URL and code are always plain text – a
+ * QR is a convenience for phones with a camera, never the only path.
  *
  * Skips the QR itself when stdout isn't a TTY (piped output, log files) or
- * the terminal is too narrow to render it without wrapping. No ANSI color
- * is used for the QR, so NO_COLOR has nothing to strip.
+ * the terminal is too narrow to render it without wrapping. The QR is drawn
+ * light grey on black, unless NO_COLOR is set.
  *
  * @param url - Verification URL from registerDevice()'s callback
  * @param userCode - User code from registerDevice()'s callback
@@ -157,19 +160,24 @@ export function displayVerification(
   userCode: string,
   stream: NodeJS.WriteStream = process.stdout
 ): void {
-  const lines = [
-    'To complete registration, open this URL in your browser:',
-    '',
-    `  ${url}`,
-    '',
-    `Code: ${userCode}`,
-  ];
+  const lines: string[] = [];
 
   if (stream.isTTY) {
     const { block, size } = renderQrForTerminal(url, stream.columns || DEFAULT_COLUMNS);
-    lines.push('', 'Or scan this with your phone:', '');
-    lines.push(block ?? `(terminal too narrow to show a QR code – needs ${size} columns)`);
+    lines.push('Scan this with your phone to complete registration:', '');
+    if (!block) {
+      lines.push(`(terminal too narrow to show a QR code – needs ${size} columns)`);
+    } else {
+      lines.push(
+        process.env.NO_COLOR ? block : block.split('\n').map((line) => `${QR_COLOR}${line}${RESET}`).join('\n')
+      );
+    }
+    lines.push('', 'Or open this URL in your browser:');
+  } else {
+    lines.push('To complete registration, open this URL in your browser:');
   }
+
+  lines.push('', `  ${url}`, '', `Code: ${userCode}`);
 
   lines.push('', 'Waiting for verification...');
   stream.write(lines.join('\n') + '\n');

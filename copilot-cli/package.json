@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/copilot-cli",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "CmdCtrl daemon for GitHub Copilot CLI agent",
   "main": "./dist/index.js",
   "bin": {
@@ -24,7 +24,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@cmdctrl/daemon-sdk": "^1.6.2",
+    "@cmdctrl/daemon-sdk": "^1.6.5",
     "commander": "^12.1.0"
   },
   "devDependencies": {
