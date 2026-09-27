@@ -96,11 +96,21 @@ export async function selfUpdate(opts: SelfUpdateOptions): Promise<SelfUpdateRes
     };
   }
 
-  // Read the actually-installed version. npm install -g @pkg@latest can
-  // install a different version than `latest` here implied (e.g. if the
-  // server's policy advertised a version that isn't actually published).
-  // Reporting the post-install reality avoids misleading log lines.
-  const installedVersion = readInstalledGlobalVersion(opts.packageName) ?? latest;
+  // Read back what is actually on disk. npm install -g @pkg@latest can land a
+  // different version than `latest` implied, so the post-install reality is
+  // what we report. If we can't read it back -- unreadable npm root, no
+  // package.json where one should be -- we have no evidence the install
+  // landed, and claiming success exits the process for a restart that comes
+  // back on the old version and tries again, forever.
+  const installedVersion = readInstalledGlobalVersion(opts.packageName);
+  if (installedVersion === null) {
+    return {
+      status: 'failed',
+      fromVersion: opts.currentVersion,
+      toVersion: latest,
+      error: `npm install reported success but the installed version of ${opts.packageName} could not be read back`,
+    };
+  }
 
   if (installedVersion === opts.currentVersion) {
     return { status: 'up-to-date', fromVersion: opts.currentVersion, toVersion: installedVersion };

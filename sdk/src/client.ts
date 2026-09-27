@@ -57,7 +57,7 @@ import {
   SlashCommandSet,
   SessionStatus,
 } from './messages';
-import { selfUpdate, isAutoUpdateSupported } from './update';
+import { selfUpdate, isAutoUpdateSupported, type SelfUpdateResult } from './update';
 
 // ============================================================
 // Configuration
@@ -279,6 +279,20 @@ type ResolvedOptions = Omit<Required<DaemonClientOptions>, 'autoUpdateConfig'> &
   autoUpdateConfig?: AutoUpdateConfig;
 };
 
+/**
+ * Resolve with the promise, or reject once `ms` has passed. Used where a
+ * caller-supplied hook can hang and the daemon must not hang with it.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); },
+    );
+  });
+}
+
 export class DaemonClient {
   private ws: WebSocket | null = null;
   private options: ResolvedOptions;
@@ -299,13 +313,34 @@ export class DaemonClient {
   private autoUpdateInProgress = false;
   private idleCheckTimer: NodeJS.Timeout | null = null;
   /**
-   * Remembers the `latest_version` the server told us about most recently
-   * that we already tried to install and found to be a no-op (i.e. npm's
-   * registry latest matches what we already have). Stops us from
-   * reattempting the same install on every reconnect. Cleared when the
-   * server advertises a different latest.
+   * The `latest_version` we last tried to install and which left us on the
+   * version we started on -- the install failed, or npm's registry latest was
+   * what we already had. Every fresh connection is answered with the same
+   * version_status, so without this the daemon reinstalls on every reconnect
+   * and never gets anywhere. Null means nothing has been tried; the empty
+   * string stands for a version_status that named no version at all. Cleared
+   * when the server advertises a different latest.
    */
-  private noopAutoUpdateTarget: string | null = null;
+  /**
+   * The advertised target of the last auto-update attempt, how many times it
+   * has failed, and the earliest time we may try it again. A transient npm or
+   * network failure deserves another go; a broken host does not deserve an
+   * unbounded loop, so attempts are capped and then the daemon stays down.
+   */
+  private autoUpdateAttempt: {
+    target: string;
+    failures: number;
+    nextAttemptAt: number;
+  } | null = null;
+  private autoUpdateRetryTimer: NodeJS.Timeout | null = null;
+  /** The most recent version_status, so a retry acts on what the server last
+   *  said rather than the message that started the first attempt. */
+  private lastVersionStatus: VersionStatusMessage | null = null;
+  private readonly maxAutoUpdateAttempts = 4;
+  private readonly autoUpdateRetryBaseDelay = 60_000;
+  private readonly onBeforeUpdateTimeout = 30_000;
+  /** Set when a caller disconnects while an install is in flight. */
+  private autoUpdateAbandonedByShutdown = false;
 
   // User-provided handlers
   private taskStartHandler?: TaskStartHandler;
@@ -449,6 +484,10 @@ export class DaemonClient {
 
   /** Connect to the CmdCtrl server. Resolves when connected. */
   async connect(): Promise<void> {
+    // Asking to connect is asking to stay connected. Without this a client
+    // that was disconnected once keeps a dead reconnect loop, and the next
+    // dropped socket is a silent permanent outage.
+    this.shouldReconnect = true;
     return new Promise((resolve, reject) => {
       const serverUrl = new URL(this.options.serverUrl);
       const wsProtocol = serverUrl.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -467,7 +506,12 @@ export class DaemonClient {
 
       if (this.options.logFrames) console.log(`Connecting to ${wsUrl}...`);
 
-      this.ws = new WebSocket(wsUrl, {
+      // Every listener below belongs to this socket alone. A socket we have
+      // already moved on from can still deliver events -- ws closes on a later
+      // tick, and an update disconnects, blocks the loop in npm and reconnects
+      // before that tick arrives -- and letting a dead socket tear down the
+      // live one's timers or arm a reconnect is a self-sustaining flap.
+      const socket = new WebSocket(wsUrl, {
         headers: {
           Authorization: `Bearer ${this.options.token}`,
           'X-Device-ID': this.options.deviceId,
@@ -476,8 +520,11 @@ export class DaemonClient {
           ...(capabilities.length > 0 && { 'X-Daemon-Capabilities': capabilities.join(',') }),
         }
       });
+      this.ws = socket;
+      const isStale = () => this.ws !== socket;
 
-      this.ws.on('open', async () => {
+      socket.on('open', async () => {
+        if (isStale()) return;
         if (this.options.logFrames) console.log('WebSocket connected');
         this.reconnectAttempt = 0;
         this.consecutiveAuthFailures = 0;
@@ -489,10 +536,14 @@ export class DaemonClient {
         resolve();
       });
 
-      this.ws.on('message', (data) => this.handleMessage(data.toString()));
+      socket.on('message', (data) => {
+        if (isStale()) return;
+        this.handleMessage(data.toString());
+      });
 
-      this.ws.on('close', (code, reason) => {
+      socket.on('close', (code, reason) => {
         if (this.options.logFrames) console.log(`WebSocket closed: ${code} ${reason}`);
+        if (isStale()) return;
         this.stopPingInterval();
         this.stopSessionRefreshInterval();
         reject(new Error('Connection closed'));
@@ -503,7 +554,8 @@ export class DaemonClient {
       // listener is registered here, so a failed upgrade (401, 5xx, etc.)
       // would otherwise leave a dangling request and never retry.
       // Clean up the request and drive the retry ourselves.
-      this.ws.on('unexpected-response', (req, res) => {
+      socket.on('unexpected-response', (req, res) => {
+        if (isStale()) return;
         req.destroy();
         this.ws = null;
         if (res.statusCode === 401) {
@@ -548,18 +600,31 @@ export class DaemonClient {
         }
       });
 
-      this.ws.on('error', (err) => {
+      socket.on('error', (err) => {
         if (this.options.logFrames) console.error('WebSocket error:', err.message);
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.terminate();
+        // Terminate the socket that errored, which may no longer be the live
+        // one -- leaving it open is how abandoned sockets pile up.
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.terminate();
         }
       });
     });
   }
 
   /** Disconnect from the server. */
-  async disconnect(): Promise<void> {
+  /**
+   * @param keepPendingUpdate internal: leave a scheduled auto-update retry
+   * armed. The daemon disconnects as part of updating itself, and a shutdown
+   * has to cancel that retry while an update-driven disconnect must not.
+   */
+  async disconnect(keepPendingUpdate = false): Promise<void> {
     this.shouldReconnect = false;
+    if (!keepPendingUpdate) {
+      this.clearAutoUpdateRetry();
+      // An update already past its own disconnect would otherwise finish,
+      // reconnect and arm a retry on a client the caller just shut down.
+      this.autoUpdateAbandonedByShutdown = this.autoUpdateInProgress;
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -664,14 +729,34 @@ export class DaemonClient {
     return this.runningTasksProvider ? this.runningTasksProvider() : Array.from(this.runningTasks);
   }
 
+  /**
+   * Whether anything at all might be running. A provider-backed daemon
+   * registers a task with its adapter inside the awaited start, so between
+   * task_start and that registration the provider reports empty while we know
+   * better -- and an update that installs there takes the task down with it.
+   * The provider stays authoritative for what we report; this is only ever
+   * asked before doing something destructive.
+   */
+  private maybeBusy(): boolean {
+    return this.runningTasks.size > 0 || this.runningTaskIds().length > 0;
+  }
+
   // ------------------------------------------------------------------
   // Internal: auto-update
   // ------------------------------------------------------------------
 
   private maybeRunPendingAutoUpdate(): void {
     if (!this.pendingAutoUpdate || this.autoUpdateInProgress) return;
-    if (this.runningTaskIds().length > 0) return;
+    if (this.maybeBusy()) return;
     const msg = this.pendingAutoUpdate;
+    // A target can be capped or abandoned while it waits behind a task. This
+    // is an entry into the install path like any other and binds to the same
+    // budget, otherwise a task finishing buys the dead target another go.
+    if (!this.mayAttemptAutoUpdate(msg.latest_version ?? '')) {
+      this.pendingAutoUpdate = null;
+      this.stopIdleCheck();
+      return;
+    }
     this.pendingAutoUpdate = null;
     this.stopIdleCheck();
     this.runAutoUpdate(msg).catch((e) => {
@@ -703,32 +788,41 @@ export class DaemonClient {
     const auto = this.options.autoUpdate && cfg !== undefined;
 
     if (m.status === 'current') return;
+    // Only a message that asks for an install is worth retrying against. A
+    // 'current' greeting stored here would send an armed retry off to install
+    // the version we are already on, off a socket it tore down to do it.
+    this.lastVersionStatus = m;
 
-    // Don't retry an auto-update attempt that already proved no-op for the
-    // same target (e.g. the server advertised a version that isn't actually
-    // published yet). Clearing happens once the server advertises a
-    // different latest_version.
-    if (auto && m.latest_version && this.noopAutoUpdateTarget === m.latest_version) {
-      return;
+    // A new target from the server is a new chance, and clears the memory of
+    // the last attempt.
+    const target = m.latest_version ?? '';
+    if (this.autoUpdateAttempt !== null && this.autoUpdateAttempt.target !== target) {
+      this.clearAutoUpdateAttempt();
     }
-    if (m.latest_version && this.noopAutoUpdateTarget && this.noopAutoUpdateTarget !== m.latest_version) {
-      this.noopAutoUpdateTarget = null;
-    }
+    // Reattempting the same target on every reconnect is what turns one broken
+    // host into a connect/close storm. This suppresses the install while a
+    // retry is still pending, and for good once the cap is reached -- never
+    // the reporting, which the user still needs to see.
+    const alreadyAttempted = auto && !this.mayAttemptAutoUpdate(target);
 
     if (m.status === 'update_required') {
       console.error(`\n✖ Daemon v${m.your_version} is no longer supported (minimum: v${m.min_version}).`);
       if (m.changelog_url) console.error(`  Changelog: ${m.changelog_url}`);
       if (m.message) console.error(`  ${m.message}`);
-      if (auto) {
+      if (auto && !alreadyAttempted) {
         // Server has logically disconnected us – install immediately, don't wait for idle.
         this.runAutoUpdate(m).catch((e) => {
           console.error('[auto-update] failed:', e);
           this.autoUpdateInProgress = false;
         });
       } else {
+        // Either there is no auto-update, or we already tried this target and
+        // are still below the floor. The server rejects us pre-upgrade either
+        // way, so reconnecting only earns another rejection -- stay down and
+        // let a person install it.
         console.error(`  Run: ${cfg ? cfg.binName : 'cmdctrl-<daemon>'} update\n`);
         this.shouldReconnect = false;
-        this.disconnect();
+        this.disconnect(true);
       }
       return;
     }
@@ -741,8 +835,10 @@ export class DaemonClient {
       return;
     }
 
+    if (alreadyAttempted) return;
+
     const running = this.runningTaskIds();
-    if (running.length === 0) {
+    if (!this.maybeBusy()) {
       this.runAutoUpdate(m).catch((e) => {
         console.error('[auto-update] failed:', e);
         this.autoUpdateInProgress = false;
@@ -757,36 +853,75 @@ export class DaemonClient {
   private async runAutoUpdate(msg: VersionStatusMessage): Promise<void> {
     const cfg = this.options.autoUpdateConfig;
     if (!cfg) return;
+    // An install already running owns the global npm prefix. A second one
+    // started by a reconnect that landed mid-install would fight it for the
+    // same files, so later callers drop out here.
+    if (this.autoUpdateInProgress) return;
     this.autoUpdateInProgress = true;
+    this.autoUpdateAbandonedByShutdown = false;
     this.stopIdleCheck();
+    this.clearAutoUpdateRetry();
 
     if (!isAutoUpdateSupported()) {
       console.warn(`\n⚠ Update available (v${msg.latest_version}) but auto-update is not supported on this platform.`);
       console.warn(`  Run manually: npm install -g ${cfg.packageName}@latest`);
+      // Nothing about the platform changes on reconnect, so say it once.
+      this.abandonAutoUpdate(msg.latest_version ?? '');
       this.autoUpdateInProgress = false;
       return;
     }
 
     console.log(`\n[auto-update] installing ${cfg.packageName}@${msg.latest_version} (current: ${this.options.version})`);
 
+    // Stand the reconnect loop down before the first await, not after it.
+    // Both the 426 handler and the socket close handler arm a reconnect timer,
+    // and either can run while onBeforeUpdate is suspended -- which is how a
+    // reconnect used to land back here and start a second concurrent install.
+    this.shouldReconnect = false;
+
     if (cfg.onBeforeUpdate) {
+      // The reconnect loop is already down, so a hook that never settles would
+      // strand the daemon offline and silent forever. Give it a bounded window
+      // and go ahead without it -- a half-stopped adapter is recoverable, a
+      // daemon that never comes back is not.
       try {
-        await cfg.onBeforeUpdate();
+        await withTimeout(Promise.resolve(cfg.onBeforeUpdate()), this.onBeforeUpdateTimeout);
       } catch (e) {
         console.error('[auto-update] onBeforeUpdate failed:', e);
       }
     }
 
-    this.shouldReconnect = false;
-    await this.disconnect();
+    await this.disconnect(true);
 
-    const result = await selfUpdate({
-      packageName: cfg.packageName,
-      binName: cfg.binName,
-      currentVersion: this.options.version,
-      latestVersion: msg.latest_version,
-      restartAfter: true,
-    });
+    // A caller who shut the client down during the hook or the disconnect
+    // above owns that decision. Past this line selfUpdate spawns a detached
+    // replacement daemon, so this is the last place the shutdown can win.
+    if (!this.updateMayResume()) {
+      console.error('[auto-update] client was shut down before the install started; abandoning it.');
+      this.autoUpdateInProgress = false;
+      return;
+    }
+
+    // The reconnect loop is down at this point, so a throw out of here would
+    // leave the daemon offline with nothing left to bring it back. Anything
+    // that escapes is just another failed install.
+    let result: SelfUpdateResult;
+    try {
+      result = await selfUpdate({
+        packageName: cfg.packageName,
+        binName: cfg.binName,
+        currentVersion: this.options.version,
+        latestVersion: msg.latest_version,
+        restartAfter: true,
+      });
+    } catch (e) {
+      result = {
+        status: 'failed',
+        fromVersion: this.options.version,
+        toVersion: msg.latest_version,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
 
     if (result.status === 'updated') {
       console.log(`[auto-update] installed v${result.toVersion}; daemon restarting under new version.`);
@@ -798,8 +933,10 @@ export class DaemonClient {
       // this target so the next version_status with the same latest_version
       // is ignored until the server advertises a different version.
       console.warn(`[auto-update] no-op: npm latest is still v${result.toVersion}; server's latest (v${msg.latest_version}) may not be published yet.`);
-      this.noopAutoUpdateTarget = msg.latest_version ?? null;
+      // Nothing to retry: npm gave us what it has. Only a new target helps.
+      this.abandonAutoUpdate(msg.latest_version ?? '');
       this.autoUpdateInProgress = false;
+      if (!this.updateMayResume()) return;
       if (msg.status === 'update_required') {
         // Server has already rejected us; reconnecting would just get another
         // immediate disconnect. Print a manual-install hint and stay down.
@@ -812,12 +949,106 @@ export class DaemonClient {
     } else {
       console.error(`[auto-update] ${result.status}: ${result.error ?? 'unknown error'}`);
       this.autoUpdateInProgress = false;
-      // For update_required the server has rejected us; staying connected is futile.
+      // A registry blip and a broken host look identical from here, so treat
+      // the failure as transient a few times before concluding it is not.
+      if (!this.updateMayResume()) {
+        console.error(`  Client was shut down during the install; staying down.`);
+        return;
+      }
+      const retryDelay = this.recordAutoUpdateFailure(msg.latest_version ?? '');
+      if (retryDelay !== null) {
+        console.error(`  Retrying in ${Math.round(retryDelay / 1000)}s.`);
+        this.armAutoUpdateRetry(msg, retryDelay);
+        // On update_available we are still useful while we wait; on
+        // update_required the server won't have us until the install lands.
+        if (msg.status !== 'update_required') {
+          this.shouldReconnect = true;
+          this.connect().catch(() => {});
+        }
+        return;
+      }
+      console.error(`  Staying on v${this.options.version}. To update: ${cfg.binName} update`);
       if (msg.status !== 'update_required') {
         this.shouldReconnect = true;
         this.connect().catch(() => {});
       }
     }
+  }
+
+  /**
+   * Whether the update path may still reconnect and retry. A caller that shut
+   * the client down mid-install owns that decision, not the install.
+   */
+  private updateMayResume(): boolean {
+    return !this.autoUpdateAbandonedByShutdown;
+  }
+
+  /** True while this target is still worth attempting. */
+  private mayAttemptAutoUpdate(target: string): boolean {
+    const a = this.autoUpdateAttempt;
+    if (a === null || a.target !== target) return true;
+    if (a.failures >= this.maxAutoUpdateAttempts) return false;
+    return Date.now() >= a.nextAttemptAt;
+  }
+
+  /** Stop attempting this target entirely -- only a new target revives it. */
+  private abandonAutoUpdate(target: string): void {
+    this.clearAutoUpdateRetry();
+    if ((this.pendingAutoUpdate?.latest_version ?? '') === target) {
+      this.pendingAutoUpdate = null;
+      this.stopIdleCheck();
+    }
+    this.autoUpdateAttempt = {
+      target,
+      failures: this.maxAutoUpdateAttempts,
+      nextAttemptAt: Infinity,
+    };
+  }
+
+  /**
+   * Count a failed install against the cap. Returns the delay before the next
+   * attempt, or null once the cap is reached and the daemon should stay put.
+   */
+  private recordAutoUpdateFailure(target: string): number | null {
+    const prior = this.autoUpdateAttempt?.target === target ? this.autoUpdateAttempt.failures : 0;
+    const failures = prior + 1;
+    if (failures >= this.maxAutoUpdateAttempts) {
+      this.autoUpdateAttempt = { target, failures, nextAttemptAt: Infinity };
+      return null;
+    }
+    const delay = this.autoUpdateRetryBaseDelay * 2 ** (failures - 1);
+    this.autoUpdateAttempt = { target, failures, nextAttemptAt: Date.now() + delay };
+    return delay;
+  }
+
+  private armAutoUpdateRetry(msg: VersionStatusMessage, delay: number): void {
+    this.clearAutoUpdateRetry();
+    const target = msg.latest_version ?? '';
+    this.autoUpdateRetryTimer = setTimeout(() => {
+      this.autoUpdateRetryTimer = null;
+      // A 426 in the meantime may have told us we are below the floor, not
+      // merely behind; retry against that rather than the stale message -- but
+      // only while it still names the target this retry was armed for, so the
+      // failure is booked against that target and the cap still binds.
+      const latest = this.lastVersionStatus;
+      const msgToRetry = latest && (latest.latest_version ?? '') === target ? latest : msg;
+      this.runAutoUpdate(msgToRetry).catch((e) => {
+        console.error('[auto-update] failed:', e);
+        this.autoUpdateInProgress = false;
+      });
+    }, delay);
+  }
+
+  private clearAutoUpdateRetry(): void {
+    if (this.autoUpdateRetryTimer) {
+      clearTimeout(this.autoUpdateRetryTimer);
+      this.autoUpdateRetryTimer = null;
+    }
+  }
+
+  private clearAutoUpdateAttempt(): void {
+    this.clearAutoUpdateRetry();
+    this.autoUpdateAttempt = null;
   }
 
   // ------------------------------------------------------------------
