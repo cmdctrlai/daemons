@@ -10,7 +10,7 @@
  */
 
 import * as fs from 'fs';
-import { isHarnessEntry, isHarnessText, unwrapPastedContent } from './transcript-filter';
+import { isHarnessEntry, isHarnessText, isHumanEntry, unwrapPastedContent } from './transcript-filter';
 import { formatToolUse, normalizeToolUse } from './tool-format';
 
 // Event types emitted by SessionWatcher
@@ -493,9 +493,9 @@ export class SessionWatcher {
 
       // Filter the raw text: the paste wrapper is what marks its payload as the user's,
       // so it has to still be there when isHarnessText decides.
-      // Fallback for entries carrying no harness flag: structured data,
-      // XML-like wrappers and known harness preambles.
-      if (isHarnessText(textContent)) {
+      // Fallback for entries carrying no harness flag and no human origin: structured
+      // data, XML-like wrappers and known harness preambles.
+      if (isHarnessText(textContent, isHumanEntry(entry))) {
         return null;
       }
       const userText = unwrapPastedContent(textContent);

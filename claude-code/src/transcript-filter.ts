@@ -14,7 +14,15 @@ export interface TranscriptEntryFlags {
   isSidechain?: unknown;
   isCompactSummary?: unknown;
   isVisibleInTranscriptOnly?: unknown;
+  origin?: unknown;
+  promptSource?: unknown;
 }
+
+/**
+ * Wrappers Claude Code writes into an entry it records as the person's own: a typed
+ * slash command, `!` shell input and their output. The only text rule a human entry gets.
+ */
+const HUMAN_ENTRY_HARNESS_TAG = /^<(?:command-[\w-]+|local-command-[\w-]+|bash-[\w-]+)>/;
 
 /**
  * Prose the harness injects into the transcript as a `user` entry without the
@@ -29,6 +37,9 @@ const HARNESS_TEXT_PREFIXES = [
   'This session is being continued from a previous conversation',
   'This conversation is being continued from a previous session',
   'Base directory for this skill:',
+  '[Request interrupted by user',
+  '[Image: source:',
+  '[Image: original',
 ];
 
 /**
@@ -45,14 +56,44 @@ const HARNESS_TEXT_PREFIXES = [
  * separate `<session>/subagents/agent-*.jsonl` files, so they no longer appear
  * in a main transcript at all, but older transcripts inlined them and they are
  * agent-internal either way.
+ *
+ * An origin naming anything but a person ("task-notification") is the harness
+ * speaking, however ordinary its prose.
  */
 export function isHarnessEntry(entry: TranscriptEntryFlags): boolean {
+  const origin = entry.origin as { kind?: unknown } | null | undefined;
   return (
     entry.isMeta === true ||
     entry.isSidechain === true ||
     entry.isCompactSummary === true ||
-    entry.isVisibleInTranscriptOnly === true
+    entry.isVisibleInTranscriptOnly === true ||
+    (origin != null && origin.kind !== 'human')
   );
+}
+
+/**
+ * True when Claude Code recorded the entry as sent by a person.
+ *
+ * Positive evidence beats guessing from the text: a human message may start with
+ * anything, including the `[Image #N]` marker Claude Code writes for a pasted image.
+ * Terminal input carries `origin.kind: "human"`; a prompt sent through the SDK (the
+ * CmdCtrl apps) carries `promptSource: "sdk"` and no origin, while SDK-delivered task
+ * notifications name their own origin. Older versions write neither, which proves nothing.
+ */
+export function isHumanEntry(entry: TranscriptEntryFlags): boolean {
+  const origin = entry.origin as { kind?: unknown } | null | undefined;
+  if (origin != null) {
+    return origin.kind === 'human';
+  }
+  return entry.promptSource === 'sdk';
+}
+
+/** isHumanEntry for a line too large to parse; both fields sit in the preserved tail. */
+export function isHumanRawLine(line: string): boolean {
+  if (/"origin"\s*:\s*\{/.test(line)) {
+    return /"origin"\s*:\s*\{\s*"kind"\s*:\s*"human"/.test(line);
+  }
+  return /"promptSource"\s*:\s*"sdk"/.test(line);
 }
 
 /**
@@ -78,8 +119,11 @@ export function unwrapPastedContent(content: string): string {
  * wrappers, and the known harness preambles. The `<` rule requires a
  * non-space next character so a real message such as "< 5ms is the target"
  * survives – every wrapper the harness emits is a bare tag.
+ *
+ * `fromHuman` (isHumanEntry) narrows this to the command wrappers Claude Code records
+ * as the person's own entry; anything else a person sends may open with any character.
  */
-export function isHarnessText(content: string): boolean {
+export function isHarnessText(content: string, fromHuman = false): boolean {
   const trimmed = content.trim();
 
   // A paste wrapper is proof the text came from the person: the harness never wraps its
@@ -88,13 +132,27 @@ export function isHarnessText(content: string): boolean {
   if (trimmed.startsWith('<pasted_content')) {
     return false;
   }
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    return true;
+  if (fromHuman) {
+    return HUMAN_ENTRY_HARNESS_TAG.test(trimmed);
   }
   if (trimmed.startsWith('<') && trimmed.length > 1 && trimmed[1] !== ' ') {
     return true;
   }
+  if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && isJson(trimmed)) {
+    return true;
+  }
   return HARNESS_TEXT_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+// Structured payloads (task-spawn notices, stringified tool results) parse whole;
+// prose that merely opens with a bracket, such as "[Image #3] look at this", does not.
+function isJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -108,4 +166,9 @@ export function hasHarnessFlagInRawLine(line: string): boolean {
   return /"(?:isMeta|isSidechain|isCompactSummary|isVisibleInTranscriptOnly)"\s*:\s*true/.test(
     line
   );
+}
+
+/** isHarnessEntry's origin rule for a line too large to parse. */
+export function hasNonHumanOriginInRawLine(line: string): boolean {
+  return /"origin"\s*:\s*\{\s*"kind"\s*:\s*"(?!human")/.test(line);
 }

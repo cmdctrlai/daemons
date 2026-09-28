@@ -11,8 +11,11 @@ import { MessageEntry } from '@cmdctrl/daemon-sdk';
 import {
   TranscriptEntryFlags,
   hasHarnessFlagInRawLine,
+  hasNonHumanOriginInRawLine,
   isHarnessEntry,
   isHarnessText,
+  isHumanEntry,
+  isHumanRawLine,
   unwrapPastedContent,
 } from './transcript-filter';
 import { formatToolUse } from './tool-format';
@@ -69,17 +72,29 @@ const DEDUPE_HISTORY_ENTRIES = 50_000;
 // lines are kept and anything beyond them dropped.
 const MAX_VERBOSE_LINES = 50;
 const MAX_VERBOSE_LINE_CHARS = 200;
-const LINE_TAIL_SIZE = 1024; // 1KB - also capture tail of long lines (uuid, timestamp are at the end)
+// Also capture the tail of long lines: uuid, timestamp and origin, and the text of an
+// image-first message, which may run as long as a text-first one's head.
+const LINE_TAIL_SIZE = MAX_LINE_SIZE;
 const TRUNCATED_LINE_MARKER = '\x00TRUNCATED\x00'; // Marker added to truncated lines
 const TRUNCATED_MID_MARKER = '\x00MID\x00'; // Separator between head and tail of truncated lines
+// Stands in for the part of an oversized message the reader never held.
+const TRUNCATED_TEXT_MARKER = '[… message truncated]';
 
 interface JournalEntry extends TranscriptEntryFlags {
   type: string;
   uuid?: string;
   sessionId?: string;
   timestamp?: string;
+  entrypoint?: unknown;
   operation?: string;
   content?: string;
+  attachment?: {
+    type?: unknown;
+    isMeta?: unknown;
+    commandMode?: unknown;
+    origin?: { kind?: unknown } | null;
+    prompt?: unknown;
+  };
   message?: {
     role?: string;
     content?: unknown;
@@ -249,15 +264,131 @@ function parseAskUserQuestion(input: unknown): MessageQuestion | null {
   };
 }
 
+/** The last match of a global regex, or null. */
+function lastMatch(text: string, re: RegExp): RegExpMatchArray | null {
+  let last: RegExpMatchArray | null = null;
+  for (const m of text.matchAll(re)) last = m;
+  return last;
+}
+
+/** A JSON string body captured by regex, decoded the way JSON.parse would. */
+function decodeJsonString(raw: string): string {
+  try {
+    return JSON.parse(`"${raw}"`);
+  } catch {
+    return raw.replace(/\\n/g, '\n').replace(/\\"/g, '"');
+  }
+}
+
+/** A JSON string body cut off mid-escape, trimmed so it still decodes. */
+function dropPartialEscape(raw: string): string {
+  const cut = raw.replace(/\\u[0-9a-fA-F]{0,3}$/, '').replace(/\uFFFD$/, '');
+  const slashes = cut.length - cut.replace(/\\+$/, '').length;
+  return slashes % 2 ? cut.slice(0, -1) : cut;
+}
+
+const TEXT_BLOCK = /"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"/;
+// A user line's only large strings are its text and image data, so there a string
+// content counts, and a text cut open by the dropped middle can be told apart.
+// An assistant's are tool inputs too, such as Write's `"content"`.
+const USER_TEXT = /(?:"type"\s*:\s*"text"\s*,\s*"text"|"content")\s*:\s*"((?:[^"\\]|\\.)*)"/;
+const OPENED_USER_TEXT = /(?:"type"\s*:\s*"text"\s*,\s*"text"|"content")\s*:\s*"((?:[^"\\]|\\.)*)$/;
+// Text closes into the next block or the array end; image data into its source object.
+// A cut between the two bytes of an escape leaves its second byte, a `"` or `\`, first.
+const CLOSED_USER_TEXT = /^\uFFFD?[\\"]?((?:[^"\\]|\\.)*)"\s*\}\s*[,\]]/;
+
+/**
+ * The first text of a line too large to hold, whole if either half has it. For a user
+ * line, otherwise the start the head kept or the end the tail kept, marked as partial.
+ */
+function truncatedText(head: string, tail: string, isUser: boolean): string {
+  const re = isUser ? USER_TEXT : TEXT_BLOCK;
+  const whole = head.match(re) || tail.match(re);
+  if (whole) return decodeJsonString(whole[1]);
+  if (!isUser) return '';
+  const opened = head.match(OPENED_USER_TEXT);
+  if (opened) return `${decodeJsonString(dropPartialEscape(opened[1]))}\n\n${TRUNCATED_TEXT_MARKER}`;
+  const closed = tail.match(CLOSED_USER_TEXT);
+  if (closed) return `${TRUNCATED_TEXT_MARKER}\n\n${decodeJsonString(closed[1])}`;
+  return '';
+}
+
+/**
+ * Who sent a `queued_command` attachment, and its text; null for any other line or an
+ * attachment that says neither. A message queued mid-turn and absorbed leaves only its
+ * queue entry and this attachment, and the attachment is the only one that says who sent it.
+ * A prompt sent through the SDK (the CmdCtrl apps) names no origin, as with isHumanEntry;
+ * there the harness queues its own text under another commandMode.
+ */
+function queuedCommand(
+  line: string,
+  isTruncated: boolean
+): { text: string; sender: 'human' | 'harness' } | null {
+  if (!line.includes('"queued_command"')) return null;
+  let text: string | null;
+  let meta: boolean;
+  let commandMode: string | undefined;
+  let originKind: string | null | undefined; // undefined: no origin at all
+  let viaSdk: boolean;
+  if (isTruncated) {
+    const [head, tail = ''] = line.slice(0, -TRUNCATED_LINE_MARKER.length).split(TRUNCATED_MID_MARKER);
+    if (!/^\{[^{]*"attachment"\s*:\s*\{\s*"type"\s*:\s*"queued_command"/.test(head)) return null;
+    text = truncatedText(head, tail, true) || null;
+    meta = hasHarnessFlagInRawLine(line);
+    commandMode = line.match(/"commandMode"\s*:\s*"([^"]*)"/)?.[1];
+    originKind = isHumanRawLine(line) ? 'human'
+      : hasNonHumanOriginInRawLine(line) ? null
+      : undefined;
+    viaSdk = /"entrypoint"\s*:\s*"sdk-cli"/.test(line);
+  } else {
+    const entry = JSON.parse(line) as JournalEntry;
+    const a = entry.attachment;
+    if (entry.type !== 'attachment' || a?.type !== 'queued_command') return null;
+    const prompt = Array.isArray(a.prompt)
+      ? (a.prompt as Record<string, unknown>[]).find((b) => b.type === 'text')?.text
+      : a.prompt;
+    text = typeof prompt === 'string' ? prompt : null;
+    meta = isHarnessEntry(entry) || a.isMeta === true;
+    commandMode = typeof a.commandMode === 'string' ? a.commandMode : undefined;
+    originKind = a.origin == null ? undefined : a.origin.kind === 'human' ? 'human' : null;
+    viaSdk = entry.entrypoint === 'sdk-cli';
+  }
+  if (text === null) return null;
+  if (meta || originKind === null || (commandMode !== undefined && commandMode !== 'prompt')) {
+    return { text, sender: 'harness' };
+  }
+  const human = originKind === 'human' || (commandMode === 'prompt' && viaSdk);
+  return human ? { text, sender: 'human' } : null;
+}
+
+/** A paste cut open by truncation keeps one of its two tags; drop the one left over. */
+function dropCutPasteTag(text: string): string {
+  return unwrapPastedContent(text).replace(/\n?<\/?pasted_content\b[^>]*>\n?/g, '\n').trim();
+}
+
 /**
  * Parse a JSONL line into a MessageEntry if it's a displayable message
  * For truncated lines (marked with TRUNCATED_LINE_MARKER), we extract UUID via regex
  * and return a placeholder message instead of the full content
+ *
+ * `queued` collects who sent the text a queue entry will repeat. Backward reading
+ * meets the attachment or `user` entry before the queue entry it accompanies, which
+ * is what lets a queue entry look itself up.
  */
-function parseLineToMessage(line: string, index: number): ReadMessageEntry | null {
+function parseLineToMessage(
+  line: string,
+  index: number,
+  queued: QueuedSenders
+): ReadMessageEntry | null {
   try {
     // Check if this line was truncated by the streaming reader
     const isTruncated = line.endsWith(TRUNCATED_LINE_MARKER);
+
+    const command = queuedCommand(line, isTruncated);
+    if (command !== null) {
+      queued[command.sender].add(command.text);
+      return null;
+    }
 
     let entry: JournalEntry;
     if (isTruncated) {
@@ -286,11 +417,11 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
 
       // Type is in the head
       const typeMatch = headPart.match(/"type"\s*:\s*"([^"]+)"/);
-      // UUID is in the tail (or occasionally in head if line wasn't too long)
-      const uuidMatch = tailPart.match(/"uuid"\s*:\s*"([^"]+)"/)
+      // UUID and timestamp are top-level fields after the message body, so the last
+      // match in the tail is theirs rather than one inside a tool input.
+      const uuidMatch = lastMatch(tailPart, /"uuid"\s*:\s*"([^"]+)"/g)
                      || headPart.match(/"uuid"\s*:\s*"([^"]+)"/);
-      // Timestamp is also in the tail
-      const timestampMatch = tailPart.match(/"timestamp"\s*:\s*"([^"]+)"/);
+      const timestampMatch = lastMatch(tailPart, /"timestamp"\s*:\s*"([^"]+)"/g);
 
       if (!uuidMatch || !typeMatch) {
         return null;
@@ -303,8 +434,8 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
         const opMatch = headPart.match(/"operation"\s*:\s*"enqueue"/);
         const contentMatch = headPart.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         if (opMatch && contentMatch) {
-          const rawQueue = contentMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
-          if (isHarnessText(rawQueue)) {
+          const rawQueue = decodeJsonString(contentMatch[1]);
+          if (queued.harness.has(rawQueue) || isHarnessText(rawQueue, queued.human.has(rawQueue))) {
             return null;
           }
           const ts = timestampMatch ? timestampMatch[1] : '';
@@ -322,17 +453,21 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
         return null;
       }
 
-      // Try to extract the first text block from the head (user's actual text is near the start)
-      // Pattern: {"type":"text","text":"..."} — extract the text value
-      const textBlockMatch = headPart.match(/"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-      let content = textBlockMatch
-        ? textBlockMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"')
-        : '';
+      // A tool result's nested text block would otherwise pass for the user's text;
+      // the parsed path skips tool_result blocks, so this one must too.
+      if (type === 'user' && /"type"\s*:\s*"tool_result"/.test(headPart)) {
+        return null;
+      }
+      if (type === 'user' && hasNonHumanOriginInRawLine(line)) {
+        return null;
+      }
 
-      if (content && isHarnessText(content)) {
+      let content = truncatedText(headPart, tailPart, type === 'user');
+
+      if (content && isHarnessText(content, isHumanRawLine(line))) {
         content = '';
       }
-      content = unwrapPastedContent(content);
+      content = dropCutPasteTag(content);
 
       // Skip truncated user entries with no text (tool_result blocks, not real messages)
       if (!content && type === 'user') {
@@ -356,12 +491,16 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
 
     // Harness-generated entries are never conversation, whatever their type.
     if (isHarnessEntry(entry)) {
+      const text = entry.type === 'user' && entry.message?.content
+        ? extractReadableText(entry.message.content)
+        : '';
+      if (text) queued.harness.add(text);
       return null;
     }
 
     // Handle queue-operation/enqueue entries (user messages sent via CmdCtrl UI)
     if (entry.type === 'queue-operation' && entry.operation === 'enqueue' && entry.content) {
-      if (isHarnessText(entry.content)) {
+      if (queued.harness.has(entry.content) || isHarnessText(entry.content, queued.human.has(entry.content))) {
         return null;
       }
       // Use timestamp-based UUID so the ID is stable across both the fast path
@@ -433,7 +572,7 @@ function parseLineToMessage(line: string, index: number): ReadMessageEntry | nul
     let role: 'USER' | 'AGENT' | 'SYSTEM' = entry.type === 'user' ? 'USER' : 'AGENT';
 
     if (role === 'USER') {
-      if (isHarnessText(text)) {
+      if (isHarnessText(text, isHumanEntry(entry))) {
         return null;
       }
       text = unwrapPastedContent(text);
@@ -693,6 +832,12 @@ class RecentUserContent {
   }
 }
 
+/** Text the scan has seen a person queue, and text it has seen the harness deliver. */
+class QueuedSenders {
+  readonly human = new RecentUserContent();
+  readonly harness = new RecentUserContent();
+}
+
 /**
  * Fill in missing timestamps from neighboring messages.
  * Truncated lines may fail to extract timestamps; use the next message's
@@ -791,6 +936,7 @@ function readLatest(
   const scanner = new BackwardScanner(filePath, MAX_TAIL_SCAN_BYTES);
   try {
     const recentUsers = new RecentUserContent();
+    const queued = new QueuedSenders();
     const newestFirst: ReadMessageEntry[] = [];
     const tailVerbose = new TailVerbose();
     let lineCount = 0;
@@ -801,7 +947,7 @@ function readLatest(
 
       for (const line of batch) {
         lineCount++;
-        const message = parseLineToMessage(line.text, line.offset);
+        const message = parseLineToMessage(line.text, line.offset, queued);
         tailVerbose.consider(line.text);
         if (!message) continue;
         if (message.role === 'USER' && !message.uuid.startsWith('queue-')) {
@@ -859,6 +1005,7 @@ function readBeforeCursor(
   const scanner = new BackwardScanner(filePath, MAX_CURSOR_SCAN_BYTES);
   try {
     const recentUsers = new RecentUserContent();
+    const queued = new QueuedSenders();
     const olderNewestFirst: ReadMessageEntry[] = [];
     const isCursor = cursorMatcher(beforeUuid);
     let found = false;
@@ -868,7 +1015,7 @@ function readBeforeCursor(
       if (batch.length === 0) break;
 
       for (const line of batch) {
-        const message = parseLineToMessage(line.text, line.offset);
+        const message = parseLineToMessage(line.text, line.offset, queued);
         if (message && message.role === 'USER' && !message.uuid.startsWith('queue-')) {
           recentUsers.add(message.content);
         }
@@ -913,6 +1060,7 @@ function readAfterCursor(
   const scanner = new BackwardScanner(filePath, MAX_CURSOR_SCAN_BYTES);
   try {
     const recentUsers = new RecentUserContent();
+    const queued = new QueuedSenders();
     const nearestCursor: ReadMessageEntry[] = [];
     const isCursor = cursorMatcher(afterUuid);
     let newerThanCursor = 0;
@@ -923,7 +1071,7 @@ function readAfterCursor(
       if (batch.length === 0) break;
 
       for (const line of batch) {
-        const message = parseLineToMessage(line.text, line.offset);
+        const message = parseLineToMessage(line.text, line.offset, queued);
         if (isCursor(line, message)) {
           found = true;
           break scan;
