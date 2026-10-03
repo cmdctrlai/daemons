@@ -70,6 +70,9 @@ export function createDaemon(config: CmdCtrlConfig, credentials: Credentials): C
     },
   });
 
+  // The watcher announces every completed turn once. It tells the adapter's turns apart
+  // by asking whether the adapter had a query alive when the prompt was written, and
+  // announces those on the adapter's `result` instead of on a transcript marker.
   const sessionWatcher = new SessionWatcher(
     (event: SessionEvent) => {
       // `tool`/`arg_summary` are the normalized tool descriptor for VERBOSE
@@ -94,6 +97,7 @@ export function createDaemon(config: CmdCtrlConfig, credentials: Credentials): C
         true,
       );
     },
+    (sessionId, atMs) => adapter.hadQueryAt(sessionId, atMs),
   );
 
   const slashCommands = new SlashCommandRegistry(join(CONFIG_DIR, 'slash-commands.json'));
@@ -103,7 +107,7 @@ export function createDaemon(config: CmdCtrlConfig, credentials: Credentials): C
       watchSessionFromEvent(eventType, data.session_id as string | undefined);
       client.sendEvent(taskId, eventType, data);
       if (eventType === 'TASK_COMPLETE') {
-        fireBackupCompletion(data.session_id as string | undefined, data.result as string | undefined);
+        announceSdkTurn(data.session_id as string | undefined);
       }
     },
     (project, commands) => {
@@ -148,18 +152,12 @@ export function createDaemon(config: CmdCtrlConfig, credentials: Credentials): C
     retry();
   }
 
-  /**
-   * The watcher's own completion signal is the primary one. This covers turns
-   * whose JSONL never produces a completion marker; `reserveCompletionFire`
-   * keeps the two paths from notifying the user twice for one turn.
-   */
-  function fireBackupCompletion(sessionId?: string, result?: string): void {
+  /** Hands the adapter's result to the watcher, which announces the turn it ended. */
+  function announceSdkTurn(sessionId?: string): void {
     if (!sessionId) return;
-    const filePath = findSessionFile(sessionId);
-    if (!filePath || !sessionWatcher.reserveCompletionFire(sessionId)) return;
-
-    console.log(`[WS] TASK_COMPLETE backup: sending session_activity for session ${sessionId.slice(-8)}`);
-    client.sendSessionActivity(sessionId, filePath, (result || '').slice(0, 200), 0, true);
+    if (!sessionWatcher.announceTurn(sessionId)) {
+      console.warn(`[WS] No transcript for session ${sessionId.slice(-8)}, its completion goes unannounced`);
+    }
   }
 
   client.setRunningTasksProvider(() => adapter.getRunningTasks());

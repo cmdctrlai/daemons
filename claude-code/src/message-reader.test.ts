@@ -392,10 +392,19 @@ describe('readMessagesFromFile', () => {
       expect(result.hasMore).toBe(false);
     });
   });
-  describe('queue de-duplication agrees across pages', () => {
-    /** A CmdCtrl-sent message as it appears before Claude Code processes it. */
+  describe('queued messages agree across pages', () => {
     function queueLine(content: string, timestamp: string): string {
       return JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content, timestamp });
+    }
+
+    /** A message the agent absorbed mid-turn, as Claude Code records it. */
+    function queuedLine(sourceUuid: string, prompt: string, timestamp: string): string {
+      return JSON.stringify({
+        type: 'attachment',
+        uuid: `att-${sourceUuid}`,
+        attachment: { type: 'queued_command', prompt, source_uuid: sourceUuid, commandMode: 'prompt', origin: { kind: 'human' }, timestamp },
+        timestamp,
+      });
     }
 
     function assistantLine(uuid: string, text: string, timestamp: string): string {
@@ -407,68 +416,58 @@ describe('readMessagesFromFile', () => {
       });
     }
 
-    it('keeps a pending queued message that repeats older text', () => {
-      // The real twin is always later in the file than its queue entry, so only
-      // an entry the backward scan has already passed may suppress one. Matching
-      // against the whole page instead hid a message still waiting to be sent.
+    it('shows a queued message where it was absorbed, on every page', () => {
       fs.writeFileSync(
         tempFile,
         [
-          queueLine('continue', '2026-01-01T00:00:01.000Z'),
-          userLine('u1', 'continue', '2026-01-01T00:00:02.000Z'),
-          assistantLine('a1', 'ok', '2026-01-01T00:00:03.000Z'),
-          queueLine('continue', '2026-01-01T00:00:04.000Z'),
+          userLine('u1', 'start', '2026-01-01T00:00:01.000Z'),
+          queueLine('continue', '2026-01-01T00:00:02.000Z'),
+          assistantLine('a1', 'working', '2026-01-01T00:00:03.000Z'),
+          queuedLine('q1', 'continue', '2026-01-01T00:00:02.000Z'),
+          assistantLine('a2', 'done', '2026-01-01T00:00:04.000Z'),
         ].join('\n') + '\n'
       );
 
-      const pending = 'queue-2026-01-01T00:00:04.000Z';
-      expect(readMessagesFromFile(tempFile, 10).messages.map((m) => m.uuid)).toEqual([
-        'u1',
-        'a1',
-        pending,
-      ]);
-      expect(readMessagesFromFile(tempFile, 10, undefined, 'a1').messages.map((m) => m.uuid)).toEqual([
-        pending,
-      ]);
-      expect(readMessagesFromFile(tempFile, 10, pending).messages.map((m) => m.uuid)).toEqual([
-        'u1',
-        'a1',
-      ]);
+      const uuids = (...args: [number, string?, string?]) =>
+        readMessagesFromFile(tempFile, ...args).messages.map((m) => m.uuid);
+      expect({
+        latest: uuids(10),
+        afterU1: uuids(10, undefined, 'u1'),
+        afterQ1: uuids(10, undefined, 'q1'),
+        beforeA2: uuids(10, 'a2'),
+        beforeQ1: uuids(10, 'q1'),
+      }).toEqual({
+        latest: ['u1', 'a1', 'q1', 'a2'],
+        afterU1: ['a1', 'q1', 'a2'],
+        afterQ1: ['a2'],
+        beforeA2: ['u1', 'a1', 'q1'],
+        beforeQ1: ['u1', 'a1'],
+      });
     });
 
-    it('drops a processed queue entry across megabytes of unrelated text', () => {
-      // The dedupe window holds digests rather than content, so a session full
-      // of pasted logs does not push the real twin out before its queue entry.
-      const lines = [assistantLine('a0', 'start', '2026-01-01T00:00:00.000Z')];
-      lines.push(queueLine('deploy it', '2026-01-01T00:00:01.000Z'));
+    it('shows nothing for a message still in the queue', () => {
+      fs.writeFileSync(
+        tempFile,
+        [assistantLine('a1', 'working', '2026-01-01T00:00:01.000Z'), queueLine('continue', '2026-01-01T00:00:02.000Z')].join('\n') + '\n'
+      );
+
+      expect(readMessagesFromFile(tempFile, 10).messages.map((m) => m.uuid)).toEqual(['a1']);
+    });
+
+    it('keeps the oldest copy of a source_uuid across megabytes of text', () => {
+      const lines = [queuedLine('q1', 'deploy it', '2026-01-01T00:00:01.000Z')];
       for (let i = 0; i < 30; i++) {
         lines.push(userLine(`p${i}`, `paste ${i} ` + 'z'.repeat(80 * 1024), `2026-01-01T00:01:${String(i).padStart(2, '0')}.000Z`));
       }
-      lines.push(userLine('u2', 'deploy it', '2026-01-01T00:02:00.000Z'));
+      lines.push(JSON.stringify({ ...JSON.parse(queuedLine('q1', 'deploy it', '2026-01-01T00:02:00.000Z')), uuid: 'att-again' }));
       lines.push(assistantLine('a1', 'done', '2026-01-01T00:02:01.000Z'));
       fs.writeFileSync(tempFile, lines.join('\n') + '\n');
 
-      const queueUuid = 'queue-2026-01-01T00:00:01.000Z';
-      for (const result of [
-        readMessagesFromFile(tempFile, 100),
-        readMessagesFromFile(tempFile, 100, undefined, 'a0'),
-        readMessagesFromFile(tempFile, 100, 'a1'),
-      ]) {
-        expect(result.messages.map((m) => m.uuid)).not.toContain(queueUuid);
-        expect(result.messages.filter((m) => m.content === 'deploy it')).toHaveLength(1);
+      for (const result of [readMessagesFromFile(tempFile, 100), readMessagesFromFile(tempFile, 100, 'a1')]) {
+        const queued = result.messages.filter((m) => m.uuid === 'q1');
+        expect(queued).toEqual([expect.objectContaining({ timestamp: '2026-01-01T00:00:01.000Z' })]);
+        expect(result.messages[0].uuid).toBe('q1');
       }
-    });
-
-    it('matches a queued message against its trimmed twin', () => {
-      fs.writeFileSync(
-        tempFile,
-        [
-          queueLine('ship it\n', '2026-01-01T00:00:01.000Z'),
-          userLine('u1', 'ship it', '2026-01-01T00:00:02.000Z'),
-        ].join('\n') + '\n'
-      );
-
-      expect(readMessagesFromFile(tempFile, 10).messages.map((m) => m.uuid)).toEqual(['u1']);
     });
   });
   describe('cursors that name a filtered entry', () => {

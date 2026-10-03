@@ -20,9 +20,10 @@ export interface TranscriptEntryFlags {
 
 /**
  * Wrappers Claude Code writes into an entry it records as the person's own: a typed
- * slash command, `!` shell input and their output. The only text rule a human entry gets.
+ * slash command, `!` shell input and their output. The only text rule a human entry gets,
+ * and only for text that is nothing but these.
  */
-const HUMAN_ENTRY_HARNESS_TAG = /^<(?:command-[\w-]+|local-command-[\w-]+|bash-[\w-]+)>/;
+const HUMAN_ENTRY_HARNESS_TAG = /<((?:command|local-command|bash)-[\w-]+)>[\s\S]*?<\/\1>\s*/y;
 
 /**
  * Prose the harness injects into the transcript as a `user` entry without the
@@ -33,11 +34,13 @@ const HUMAN_ENTRY_HARNESS_TAG = /^<(?:command-[\w-]+|local-command-[\w-]+|bash-[
  * are not listed: the leading-`<` rule below already catches every one of them,
  * so a list here would be dead weight that hides how load-bearing that rule is.
  */
+const INTERRUPT_MARKER = '[Request interrupted by user';
+
 const HARNESS_TEXT_PREFIXES = [
   'This session is being continued from a previous conversation',
   'This conversation is being continued from a previous session',
   'Base directory for this skill:',
-  '[Request interrupted by user',
+  INTERRUPT_MARKER,
   '[Image: source:',
   '[Image: original',
 ];
@@ -71,6 +74,25 @@ export function isHarnessEntry(entry: TranscriptEntryFlags): boolean {
   );
 }
 
+/** A user or assistant entry: what the message count counts, wherever it is reported. */
+export function isMessageEntry(entry: { type?: unknown }): boolean {
+  return entry.type === 'user' || entry.type === 'assistant';
+}
+
+/**
+ * True for the user entry Claude Code writes when a turn is interrupted: the marker as
+ * the whole message, or inside the tool result of the tool that was running.
+ */
+export function mentionsInterrupt(entry: Record<string, unknown>): boolean {
+  if (entry.type !== 'user') return false;
+  const content = (entry.message as Record<string, unknown> | undefined)?.content;
+  if (typeof content === 'string') return content.startsWith(INTERRUPT_MARKER);
+  if (!Array.isArray(content)) return false;
+  return content.some((block: Record<string, unknown>) =>
+    (block.type === 'text' && typeof block.text === 'string' && block.text.startsWith(INTERRUPT_MARKER)) ||
+    (block.type === 'tool_result' && typeof block.content === 'string' && block.content.startsWith(INTERRUPT_MARKER)));
+}
+
 /**
  * True when Claude Code recorded the entry as sent by a person.
  *
@@ -88,12 +110,163 @@ export function isHumanEntry(entry: TranscriptEntryFlags): boolean {
   return entry.promptSource === 'sdk';
 }
 
-/** isHumanEntry for a line too large to parse; both fields sit in the preserved tail. */
-export function isHumanRawLine(line: string): boolean {
-  if (/"origin"\s*:\s*\{/.test(line)) {
-    return /"origin"\s*:\s*\{\s*"kind"\s*:\s*"human"/.test(line);
+/** The `queued_command` attachment fields the sender rule reads. */
+export interface QueuedCommandFlags {
+  isMeta?: unknown;
+  origin?: unknown;
+  commandMode?: unknown;
+}
+
+/**
+ * True when a `queued_command` attachment carries a message a person sent mid-turn.
+ *
+ * The rule is Claude Code's own: `origin` names the sender, and an attachment without
+ * one is the person's when it queued a `prompt` – the SDK, and so the CmdCtrl apps,
+ * write no origin. Other senders either name themselves (peer, coordinator, both
+ * `isMeta`) or queue under their own commandMode (`task-notification`). The text is
+ * never consulted.
+ */
+export function isHumanQueuedCommand(attachment: QueuedCommandFlags): boolean {
+  if (attachment.isMeta === true) return false;
+  const origin = attachment.origin as { kind?: unknown } | null | undefined;
+  if (origin != null) return origin.kind === 'human';
+  return attachment.commandMode === 'prompt';
+}
+
+/** A message a person queued mid-turn, as both read paths show it. */
+export interface QueuedMessage {
+  uuid: string;
+  text: string;
+}
+
+/**
+ * The message a `queued_command` attachment entry carries, or null for any other entry
+ * or a sender that is not a person.
+ *
+ * A message absorbed mid-turn is written only as this attachment, at the point the
+ * agent took it in; the queue entries around it never render. Its identity is
+ * `source_uuid`, the id Claude Code gives the queued message, which older versions
+ * omit – there the entry's own uuid stands in. The prompt is what the person typed,
+ * so no text rule applies to it.
+ */
+export function queuedHumanMessage(entry: Record<string, unknown>): QueuedMessage | null {
+  if (!isQueuedCommandEntry(entry)) return null;
+  const attachment = entry.attachment as Record<string, unknown>;
+  if (isHarnessEntry(entry) || !isHumanQueuedCommand(attachment)) return null;
+
+  const prompt = attachment.prompt;
+  const raw = typeof prompt === 'string'
+    ? prompt
+    : Array.isArray(prompt)
+      ? prompt
+          .filter((b: Record<string, unknown>) => b?.type === 'text' && typeof b.text === 'string')
+          .map((b: Record<string, unknown>) => b.text)
+          .join('\n')
+      : '';
+  const uuid = queuedMessageUuid(attachment.source_uuid, entry.uuid);
+  if (!raw.trim() || !uuid) return null;
+  return { uuid, text: unwrapPastedContent(raw) };
+}
+
+/** True for a `queued_command` attachment entry, whoever sent it. */
+function isQueuedCommandEntry(entry: Record<string, unknown>): boolean {
+  const attachment = entry.attachment as { type?: unknown } | undefined;
+  return entry.type === 'attachment' && attachment?.type === 'queued_command';
+}
+
+/** source_uuid when the attachment has one, else the entry's uuid. */
+function queuedMessageUuid(sourceUuid: unknown, entryUuid: unknown): string | null {
+  if (typeof sourceUuid === 'string' && sourceUuid) return sourceUuid;
+  return typeof entryUuid === 'string' && entryUuid ? entryUuid : null;
+}
+
+const SLASH_COMMAND_TAG = /<command-(name|message|args)>([\s\S]*?)<\/command-\1>\s*/y;
+
+/** Each tag's name and trimmed body when `content` is one or more `tag`s and nothing else. */
+function tagFields(content: string, tag: RegExp): Record<string, string> | null {
+  const fields: Record<string, string> = {};
+  let end = content.length - content.trimStart().length;
+  let matched = false;
+  tag.lastIndex = end;
+  let match: RegExpExecArray | null;
+  while ((match = tag.exec(content))) {
+    fields[match[1]] = (match[2] ?? '').trim();
+    end = tag.lastIndex;
+    matched = true;
   }
-  return /"promptSource"\s*:\s*"sdk"/.test(line);
+  return matched && end === content.length ? fields : null;
+}
+
+/**
+ * The command line a person typed, for text that is only Claude Code's slash-command
+ * wrapper (`<command-name>/pjm</command-name><command-args>bug</command-args>` → `/pjm bug`);
+ * null for anything else. Typed or queued, this entry is the command's only record.
+ */
+export function slashCommandText(content: string): string | null {
+  const fields = tagFields(content, SLASH_COMMAND_TAG);
+  if (!fields?.name?.startsWith('/')) return null;
+  return fields.args ? `${fields.name} ${fields.args}` : fields.name;
+}
+
+/**
+ * The command line of a `system` `local_command` entry that records a slash command sent
+ * through the SDK, or null for any other entry. A command the CLI runs locally and does not
+ * support there (/status) is written only as this bare text plus its output, with no user
+ * entry, so this entry is the command's only record. The terminal writes the wrapped form
+ * here instead, and its output entries open with `<local-command-stdout>`; neither is
+ * matched.
+ */
+export function localCommandText(entry: Record<string, unknown>): string | null {
+  if (entry.type !== 'system' || entry.subtype !== 'local_command' || isHarnessEntry(entry)) return null;
+  const content = typeof entry.content === 'string' ? entry.content.trim() : '';
+  return content.startsWith('/') ? content : null;
+}
+
+/** The trimmed text of a person's user entry; null for any other entry. */
+function userEntryText(entry: Record<string, unknown>): string | null {
+  if (entry.type !== 'user' || isHarnessEntry(entry)) return null;
+  const content = (entry.message as { content?: unknown } | undefined)?.content;
+  return (typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content
+          .filter((b: Record<string, unknown>) => b?.type === 'text' && typeof b.text === 'string')
+          .map((b: Record<string, unknown>) => b.text)
+          .join('\n')
+      : '').trim();
+}
+
+/** The command a plain-typed slash command entry opens its prompt with (`/compact`); null otherwise. */
+export function typedSlashCommand(entry: Record<string, unknown>): string | null {
+  const text = userEntryText(entry);
+  return text?.startsWith('/') ? text : null;
+}
+
+/** The command a `<command-name>` wrapper entry records; null for any other entry. */
+export function wrappedSlashCommand(entry: Record<string, unknown>): string | null {
+  const text = userEntryText(entry);
+  return text ? slashCommandText(text) : null;
+}
+
+/**
+ * Claude Code records `/compact` typed, then again in its wrapper, under one promptId. The
+ * wrapper is the repeat; a plain entry is always shown, since a person may send the same
+ * "/…" text twice in one prompt.
+ */
+export class PromptOpenings {
+  private readonly opened = new Map<string, string | null>();
+
+  /** True when `entry` wraps the command its prompt was opened with by typing it. */
+  repeats(entry: Record<string, unknown>): boolean {
+    const promptId = entry.promptId;
+    if (typeof promptId !== 'string' || !promptId) return false;
+    if (!this.opened.has(promptId)) {
+      this.opened.set(promptId, typedSlashCommand(entry));
+      return false;
+    }
+    const command = wrappedSlashCommand(entry);
+    return command !== null && command === this.opened.get(promptId);
+  }
 }
 
 /**
@@ -120,8 +293,9 @@ export function unwrapPastedContent(content: string): string {
  * non-space next character so a real message such as "< 5ms is the target"
  * survives – every wrapper the harness emits is a bare tag.
  *
- * `fromHuman` (isHumanEntry) narrows this to the command wrappers Claude Code records
- * as the person's own entry; anything else a person sends may open with any character.
+ * `fromHuman` (isHumanEntry) narrows this to text that is only the command wrappers Claude
+ * Code records as the person's own entry; anything else a person sends may open with any
+ * character, a tag name included.
  */
 export function isHarnessText(content: string, fromHuman = false): boolean {
   const trimmed = content.trim();
@@ -133,7 +307,7 @@ export function isHarnessText(content: string, fromHuman = false): boolean {
     return false;
   }
   if (fromHuman) {
-    return HUMAN_ENTRY_HARNESS_TAG.test(trimmed);
+    return tagFields(trimmed, HUMAN_ENTRY_HARNESS_TAG) !== null;
   }
   if (trimmed.startsWith('<') && trimmed.length > 1 && trimmed[1] !== ' ') {
     return true;
@@ -153,22 +327,4 @@ function isJson(text: string): boolean {
   } catch {
     return false;
   }
-}
-
-/**
- * Field-level scan for a line too large to parse as JSON.
- *
- * message-reader truncates oversized lines (base64 images) and recovers fields
- * by regex, so the flags have to be matched the same way. `isMeta` sits after
- * the message body and `isSidechain` before it, so both halves are searched.
- */
-export function hasHarnessFlagInRawLine(line: string): boolean {
-  return /"(?:isMeta|isSidechain|isCompactSummary|isVisibleInTranscriptOnly)"\s*:\s*true/.test(
-    line
-  );
-}
-
-/** isHarnessEntry's origin rule for a line too large to parse. */
-export function hasNonHumanOriginInRawLine(line: string): boolean {
-  return /"origin"\s*:\s*\{\s*"kind"\s*:\s*"(?!human")/.test(line);
 }
