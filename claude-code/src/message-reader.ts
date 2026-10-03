@@ -10,13 +10,15 @@ import * as os from 'os';
 import { MessageEntry } from '@cmdctrl/daemon-sdk';
 import {
   TranscriptEntryFlags,
-  hasHarnessFlagInRawLine,
-  hasNonHumanOriginInRawLine,
   isHarnessEntry,
   isHarnessText,
   isHumanEntry,
-  isHumanRawLine,
+  slashCommandText,
+  typedSlashCommand,
+  wrappedSlashCommand,
+  queuedHumanMessage,
   unwrapPastedContent,
+  localCommandText,
 } from './transcript-filter';
 import { formatToolUse } from './tool-format';
 
@@ -50,8 +52,6 @@ export type ReadMessageEntry = MessageEntry & {
 // Size of chunks to read when scanning for messages
 const CHUNK_SIZE = 64 * 1024; // 64KB
 
-// Safety limits to prevent memory exhaustion from bloated sessions (e.g., sessions with many large images)
-const MAX_LINE_SIZE = 100 * 1024; // 100KB - truncate lines larger than this (likely contain base64 images)
 const NEWLINE_BYTE = 0x0a;
 // How far back an uncursored first page will scan. Transcripts with embedded
 // images run to hundreds of MB, and every session open takes this path, so the
@@ -62,39 +62,17 @@ const MAX_TAIL_SCAN_BYTES = 32 * 1024 * 1024;
 // gets a larger budget than a session open. The scan still stops well short of
 // the handler's timeout rather than blocking the event loop on a whole file.
 const MAX_CURSOR_SCAN_BYTES = 256 * 1024 * 1024;
-// How many USER messages stay eligible for queue de-duplication. Digests, not
-// content, so a transcript of pasted logs costs the same as one of one-liners
-// and the window stays far longer than any queue entry waits to be processed.
-const DEDUPE_HISTORY_ENTRIES = 50_000;
 // The tail message's turn is replayed as verbose lines, so a client arriving
 // after the work sees what produced the answer. A typical turn formats to a few
 // hundred bytes, and a verbose pane only ever shows its tail, so the newest
 // lines are kept and anything beyond them dropped.
 const MAX_VERBOSE_LINES = 50;
 const MAX_VERBOSE_LINE_CHARS = 200;
-// Also capture the tail of long lines: uuid, timestamp and origin, and the text of an
-// image-first message, which may run as long as a text-first one's head.
-const LINE_TAIL_SIZE = MAX_LINE_SIZE;
-const TRUNCATED_LINE_MARKER = '\x00TRUNCATED\x00'; // Marker added to truncated lines
-const TRUNCATED_MID_MARKER = '\x00MID\x00'; // Separator between head and tail of truncated lines
-// Stands in for the part of an oversized message the reader never held.
-const TRUNCATED_TEXT_MARKER = '[… message truncated]';
-
 interface JournalEntry extends TranscriptEntryFlags {
   type: string;
   uuid?: string;
   sessionId?: string;
   timestamp?: string;
-  entrypoint?: unknown;
-  operation?: string;
-  content?: string;
-  attachment?: {
-    type?: unknown;
-    isMeta?: unknown;
-    commandMode?: unknown;
-    origin?: { kind?: unknown } | null;
-    prompt?: unknown;
-  };
   message?: {
     role?: string;
     content?: unknown;
@@ -264,256 +242,41 @@ function parseAskUserQuestion(input: unknown): MessageQuestion | null {
   };
 }
 
-/** The last match of a global regex, or null. */
-function lastMatch(text: string, re: RegExp): RegExpMatchArray | null {
-  let last: RegExpMatchArray | null = null;
-  for (const m of text.matchAll(re)) last = m;
-  return last;
-}
-
-/** A JSON string body captured by regex, decoded the way JSON.parse would. */
-function decodeJsonString(raw: string): string {
-  try {
-    return JSON.parse(`"${raw}"`);
-  } catch {
-    return raw.replace(/\\n/g, '\n').replace(/\\"/g, '"');
-  }
-}
-
-/** A JSON string body cut off mid-escape, trimmed so it still decodes. */
-function dropPartialEscape(raw: string): string {
-  const cut = raw.replace(/\\u[0-9a-fA-F]{0,3}$/, '').replace(/\uFFFD$/, '');
-  const slashes = cut.length - cut.replace(/\\+$/, '').length;
-  return slashes % 2 ? cut.slice(0, -1) : cut;
-}
-
-const TEXT_BLOCK = /"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"/;
-// A user line's only large strings are its text and image data, so there a string
-// content counts, and a text cut open by the dropped middle can be told apart.
-// An assistant's are tool inputs too, such as Write's `"content"`.
-const USER_TEXT = /(?:"type"\s*:\s*"text"\s*,\s*"text"|"content")\s*:\s*"((?:[^"\\]|\\.)*)"/;
-const OPENED_USER_TEXT = /(?:"type"\s*:\s*"text"\s*,\s*"text"|"content")\s*:\s*"((?:[^"\\]|\\.)*)$/;
-// Text closes into the next block or the array end; image data into its source object.
-// A cut between the two bytes of an escape leaves its second byte, a `"` or `\`, first.
-const CLOSED_USER_TEXT = /^\uFFFD?[\\"]?((?:[^"\\]|\\.)*)"\s*\}\s*[,\]]/;
-
 /**
- * The first text of a line too large to hold, whole if either half has it. For a user
- * line, otherwise the start the head kept or the end the tail kept, marked as partial.
- */
-function truncatedText(head: string, tail: string, isUser: boolean): string {
-  const re = isUser ? USER_TEXT : TEXT_BLOCK;
-  const whole = head.match(re) || tail.match(re);
-  if (whole) return decodeJsonString(whole[1]);
-  if (!isUser) return '';
-  const opened = head.match(OPENED_USER_TEXT);
-  if (opened) return `${decodeJsonString(dropPartialEscape(opened[1]))}\n\n${TRUNCATED_TEXT_MARKER}`;
-  const closed = tail.match(CLOSED_USER_TEXT);
-  if (closed) return `${TRUNCATED_TEXT_MARKER}\n\n${decodeJsonString(closed[1])}`;
-  return '';
-}
-
-/**
- * Who sent a `queued_command` attachment, and its text; null for any other line or an
- * attachment that says neither. A message queued mid-turn and absorbed leaves only its
- * queue entry and this attachment, and the attachment is the only one that says who sent it.
- * A prompt sent through the SDK (the CmdCtrl apps) names no origin, as with isHumanEntry;
- * there the harness queues its own text under another commandMode.
- */
-function queuedCommand(
-  line: string,
-  isTruncated: boolean
-): { text: string; sender: 'human' | 'harness' } | null {
-  if (!line.includes('"queued_command"')) return null;
-  let text: string | null;
-  let meta: boolean;
-  let commandMode: string | undefined;
-  let originKind: string | null | undefined; // undefined: no origin at all
-  let viaSdk: boolean;
-  if (isTruncated) {
-    const [head, tail = ''] = line.slice(0, -TRUNCATED_LINE_MARKER.length).split(TRUNCATED_MID_MARKER);
-    if (!/^\{[^{]*"attachment"\s*:\s*\{\s*"type"\s*:\s*"queued_command"/.test(head)) return null;
-    text = truncatedText(head, tail, true) || null;
-    meta = hasHarnessFlagInRawLine(line);
-    commandMode = line.match(/"commandMode"\s*:\s*"([^"]*)"/)?.[1];
-    originKind = isHumanRawLine(line) ? 'human'
-      : hasNonHumanOriginInRawLine(line) ? null
-      : undefined;
-    viaSdk = /"entrypoint"\s*:\s*"sdk-cli"/.test(line);
-  } else {
-    const entry = JSON.parse(line) as JournalEntry;
-    const a = entry.attachment;
-    if (entry.type !== 'attachment' || a?.type !== 'queued_command') return null;
-    const prompt = Array.isArray(a.prompt)
-      ? (a.prompt as Record<string, unknown>[]).find((b) => b.type === 'text')?.text
-      : a.prompt;
-    text = typeof prompt === 'string' ? prompt : null;
-    meta = isHarnessEntry(entry) || a.isMeta === true;
-    commandMode = typeof a.commandMode === 'string' ? a.commandMode : undefined;
-    originKind = a.origin == null ? undefined : a.origin.kind === 'human' ? 'human' : null;
-    viaSdk = entry.entrypoint === 'sdk-cli';
-  }
-  if (text === null) return null;
-  if (meta || originKind === null || (commandMode !== undefined && commandMode !== 'prompt')) {
-    return { text, sender: 'harness' };
-  }
-  const human = originKind === 'human' || (commandMode === 'prompt' && viaSdk);
-  return human ? { text, sender: 'human' } : null;
-}
-
-/** A paste cut open by truncation keeps one of its two tags; drop the one left over. */
-function dropCutPasteTag(text: string): string {
-  return unwrapPastedContent(text).replace(/\n?<\/?pasted_content\b[^>]*>\n?/g, '\n').trim();
-}
-
-/**
- * Parse a JSONL line into a MessageEntry if it's a displayable message
- * For truncated lines (marked with TRUNCATED_LINE_MARKER), we extract UUID via regex
- * and return a placeholder message instead of the full content
+ * Parse a JSONL line into a MessageEntry if it's a displayable message.
  *
- * `queued` collects who sent the text a queue entry will repeat. Backward reading
- * meets the attachment or `user` entry before the queue entry it accompanies, which
- * is what lets a queue entry look itself up.
+ * `queue-operation` entries never render. A queued message the agent absorbed mid-turn
+ * shows from its `queued_command` attachment, one delivered as its own turn from its
+ * `user` entry, and a slash command the CLI ran locally from its `local_command` entry;
+ * what is left is drafts pulled back to the editor and the harness.
  */
-function parseLineToMessage(
-  line: string,
-  index: number,
-  queued: QueuedSenders
-): ReadMessageEntry | null {
+function parseLineToMessage(line: string, index: number): ReadMessageEntry | null {
   try {
-    // Check if this line was truncated by the streaming reader
-    const isTruncated = line.endsWith(TRUNCATED_LINE_MARKER);
-
-    const command = queuedCommand(line, isTruncated);
-    if (command !== null) {
-      queued[command.sender].add(command.text);
-      return null;
-    }
-
-    let entry: JournalEntry;
-    if (isTruncated) {
-      // The flags survive truncation in one half or the other, so match them on
-      // the raw line rather than losing them with the unparsed body.
-      if (hasHarnessFlagInRawLine(line)) {
-        return null;
-      }
-
-      // Truncated line format: {head}TRUNCATED_MID_MARKER{tail}TRUNCATED_LINE_MARKER
-      // - head contains: type (near start)
-      // - tail contains: uuid, timestamp (at end of original line)
-      const lineWithoutEndMarker = line.slice(0, -TRUNCATED_LINE_MARKER.length);
-      const midIndex = lineWithoutEndMarker.indexOf(TRUNCATED_MID_MARKER);
-
-      let headPart: string;
-      let tailPart: string;
-      if (midIndex >= 0) {
-        headPart = lineWithoutEndMarker.slice(0, midIndex);
-        tailPart = lineWithoutEndMarker.slice(midIndex + TRUNCATED_MID_MARKER.length);
-      } else {
-        // Old format (no mid marker) - only have head
-        headPart = lineWithoutEndMarker;
-        tailPart = '';
-      }
-
-      // Type is in the head
-      const typeMatch = headPart.match(/"type"\s*:\s*"([^"]+)"/);
-      // UUID and timestamp are top-level fields after the message body, so the last
-      // match in the tail is theirs rather than one inside a tool input.
-      const uuidMatch = lastMatch(tailPart, /"uuid"\s*:\s*"([^"]+)"/g)
-                     || headPart.match(/"uuid"\s*:\s*"([^"]+)"/);
-      const timestampMatch = lastMatch(tailPart, /"timestamp"\s*:\s*"([^"]+)"/g);
-
-      if (!uuidMatch || !typeMatch) {
-        return null;
-      }
-
-      const type = typeMatch[1];
-
-      // Handle truncated queue-operation entries (unlikely but safe)
-      if (type === 'queue-operation') {
-        const opMatch = headPart.match(/"operation"\s*:\s*"enqueue"/);
-        const contentMatch = headPart.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-        if (opMatch && contentMatch) {
-          const rawQueue = decodeJsonString(contentMatch[1]);
-          if (queued.harness.has(rawQueue) || isHarnessText(rawQueue, queued.human.has(rawQueue))) {
-            return null;
-          }
-          const ts = timestampMatch ? timestampMatch[1] : '';
-          return {
-            uuid: ts ? `queue-${ts}` : `queue-${index}`,
-            role: 'USER',
-            content: unwrapPastedContent(rawQueue),
-            timestamp: ts,
-          };
-        }
-        return null;
-      }
-
-      if (type !== 'user' && type !== 'assistant') {
-        return null;
-      }
-
-      // A tool result's nested text block would otherwise pass for the user's text;
-      // the parsed path skips tool_result blocks, so this one must too.
-      if (type === 'user' && /"type"\s*:\s*"tool_result"/.test(headPart)) {
-        return null;
-      }
-      if (type === 'user' && hasNonHumanOriginInRawLine(line)) {
-        return null;
-      }
-
-      let content = truncatedText(headPart, tailPart, type === 'user');
-
-      if (content && isHarnessText(content, isHumanRawLine(line))) {
-        content = '';
-      }
-      content = dropCutPasteTag(content);
-
-      // Skip truncated user entries with no text (tool_result blocks, not real messages)
-      if (!content && type === 'user') {
-        return null;
-      }
-
-      // Fall back to placeholder for assistant messages with no extractable text
-      if (!content) {
-        content = '[Message contains large content]';
-      }
-
-      return {
-        uuid: uuidMatch[1],
-        role: type === 'user' ? 'USER' : 'AGENT',
-        content,
-        timestamp: timestampMatch ? timestampMatch[1] : '',
-      };
-    }
-
-    entry = JSON.parse(line);
+    const entry: JournalEntry = JSON.parse(line);
 
     // Harness-generated entries are never conversation, whatever their type.
     if (isHarnessEntry(entry)) {
-      const text = entry.type === 'user' && entry.message?.content
-        ? extractReadableText(entry.message.content)
-        : '';
-      if (text) queued.harness.add(text);
       return null;
     }
 
-    // Handle queue-operation/enqueue entries (user messages sent via CmdCtrl UI)
-    if (entry.type === 'queue-operation' && entry.operation === 'enqueue' && entry.content) {
-      if (queued.harness.has(entry.content) || isHarnessText(entry.content, queued.human.has(entry.content))) {
-        return null;
-      }
-      // Use timestamp-based UUID so the ID is stable across both the fast path
-      // (readLastLines, scan-relative index) and the cursor path (readAllLinesSafe,
-      // absolute line index). Positional `queue-${index}` IDs differ between paths
-      // and produce stale cursors that corrupt incremental message fetches.
-      const ts = entry.timestamp as string | undefined;
-      return {
-        uuid: ts ? `queue-${ts}` : `queue-${index}`,
+    if (entry.type === 'attachment') {
+      const queued = queuedHumanMessage(entry as unknown as Record<string, unknown>);
+      return queued && {
+        uuid: queued.uuid,
         role: 'USER',
-        content: unwrapPastedContent(entry.content),
-        timestamp: ts || '',
+        content: queued.text,
+        timestamp: entry.timestamp || '',
       };
+    }
+
+    if (entry.type === 'system') {
+      const command = localCommandText(entry as unknown as Record<string, unknown>);
+      return command ? {
+        uuid: entry.uuid || `generated-${index}`,
+        role: 'USER',
+        content: command,
+        timestamp: entry.timestamp || '',
+      } : null;
     }
 
     // Only process user and assistant messages
@@ -572,10 +335,14 @@ function parseLineToMessage(
     let role: 'USER' | 'AGENT' | 'SYSTEM' = entry.type === 'user' ? 'USER' : 'AGENT';
 
     if (role === 'USER') {
-      if (isHarnessText(text, isHumanEntry(entry))) {
+      const command = slashCommandText(text);
+      if (command) {
+        text = command;
+      } else if (isHarnessText(text, isHumanEntry(entry))) {
         return null;
+      } else {
+        text = unwrapPastedContent(text);
       }
-      text = unwrapPastedContent(text);
     }
 
     // Filter agent no-op responses ("No response requested." etc.)
@@ -597,9 +364,8 @@ function parseLineToMessage(
 /**
  * The formatted tool calls in one raw JSONL line, oldest call first.
  *
- * Empty for anything that is not an assistant entry running tools. A line the
- * scanner truncated no longer parses as JSON and lands here too – a turn whose
- * verbose is short reads better than one that shows a fragment of an argument.
+ * Empty for anything that is not an assistant entry running tools, or a line that
+ * does not parse.
  */
 function toolUseLines(rawLine: string): string[] {
   let entry: JournalEntry;
@@ -623,9 +389,8 @@ function toolUseLines(rawLine: string): string[] {
 /** Cut an over-long line to the display cap without splitting a surrogate pair. */
 function clip(text: string): string {
   if (text.length <= MAX_VERBOSE_LINE_CHARS) return text;
-  let end = MAX_VERBOSE_LINE_CHARS;
-  const lastCode = text.charCodeAt(end - 1);
-  if (lastCode >= 0xd800 && lastCode <= 0xdbff) end--;
+  const lastCode = text.charCodeAt(MAX_VERBOSE_LINE_CHARS - 1);
+  const end = lastCode >= 0xd800 && lastCode <= 0xdbff ? MAX_VERBOSE_LINE_CHARS - 1 : MAX_VERBOSE_LINE_CHARS;
   return text.slice(0, end) + '…';
 }
 
@@ -690,7 +455,7 @@ interface ScannedLine {
 }
 
 /**
- * Streams a JSONL file backwards, newest line first, in bounded memory.
+ * Streams a JSONL file backwards, newest line first, holding one line at a time.
  *
  * Every read path goes through this one scanner, so a given entry yields the
  * same line and the same generated id whichever page reaches it. The scan stops
@@ -702,9 +467,9 @@ class BackwardScanner {
   private readonly fd: number;
   private readonly fileSize: number;
   private position: number;
-  private pendingHead: Buffer = Buffer.alloc(0);
-  private pendingTail: Buffer | null = null;
-  private pendingLen = 0;
+  // The line being assembled, newest bytes first. Held whole however long, so history
+  // classifies every entry on the same text the live path parses.
+  private pendingParts: Buffer[] = [];
   private flushedFirstLine = false;
 
   constructor(filePath: string, private readonly byteBudget: number) {
@@ -761,87 +526,190 @@ class BackwardScanner {
 
   /** Attach bytes that sit in front of the line being assembled. */
   private prepend(part: Buffer): void {
-    if (part.length === 0) return;
-
-    const combined = Buffer.concat([part, this.pendingHead]);
-    const newLen = this.pendingLen + part.length;
-
-    // uuid and timestamp live at the end of the line, which backward reading
-    // hands us first. Capture it before an oversized line pushes it out of range.
-    if (this.pendingTail === null && newLen > MAX_LINE_SIZE) {
-      this.pendingTail = Buffer.from(combined.subarray(Math.max(0, combined.length - LINE_TAIL_SIZE)));
-    }
-
-    this.pendingHead = newLen > MAX_LINE_SIZE
-      ? Buffer.from(combined.subarray(0, MAX_LINE_SIZE))
-      : combined;
-    this.pendingLen = newLen;
+    if (part.length > 0) this.pendingParts.push(part);
   }
 
   /** Close off the assembled line, which starts at `offset`. */
   private finishLine(offset: number): ScannedLine | null {
-    if (this.pendingLen === 0) return null;
+    if (this.pendingParts.length === 0) return null;
+    const text = Buffer.concat(this.pendingParts.reverse()).toString('utf-8').trim();
+    this.pendingParts = [];
+    return text ? { text, offset } : null;
+  }
+}
 
-    const head = this.pendingHead.toString('utf-8').trim();
-    const tail = this.pendingTail;
-    this.pendingHead = Buffer.alloc(0);
-    this.pendingTail = null;
-    this.pendingLen = 0;
+const SOURCE_UUID_KEY = Buffer.from('"source_uuid":"');
+const PROMPT_ID_KEY = Buffer.from('"promptId":"');
+const SOURCE_INDEX_CHUNK = 1024 * 1024;
+const SOURCE_INDEX_FILES = 32;
+// Blocks hashed across what was indexed, first and last included, to tell an append
+// from a rewrite. Hashing it all would cost a full re-read per check (157ms on a 416MB
+// transcript, against 33µs for the samples), the same as re-indexing.
+const SOURCE_INDEX_SAMPLES = 16;
+const SOURCE_INDEX_SAMPLE_BYTES = 4096;
 
-    if (!head) return null;
-    const text = tail === null
-      ? head
-      : head + TRUNCATED_MID_MARKER + tail.toString('utf-8').trim() + TRUNCATED_LINE_MARKER;
-    return { text, offset };
+interface SourceIndex {
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  resumeAt: number;
+  lineStart: number;
+  samples: string;
+  firstSource: Map<string, number>;
+  firstPrompt: Map<string, number>;
+}
+
+// Most recently used last.
+const sourceIndexes = new Map<string, SourceIndex>();
+
+/** How many transcripts hold a source_uuid index; bounded by SOURCE_INDEX_FILES. */
+export function sourceIndexedFiles(): number {
+  return sourceIndexes.size;
+}
+
+function readAt(fd: number, start: number, end: number): Buffer {
+  const bytes = Buffer.alloc(Math.max(0, end - start));
+  const n = bytes.length > 0 ? fs.readSync(fd, bytes, 0, bytes.length, start) : 0;
+  return bytes.subarray(0, n);
+}
+
+function sampleDigest(fd: number, end: number): string {
+  const hash = crypto.createHash('sha1');
+  const span = Math.min(SOURCE_INDEX_SAMPLE_BYTES, end);
+  for (let i = 0; i < SOURCE_INDEX_SAMPLES; i++) {
+    const at = Math.floor(((end - span) * i) / (SOURCE_INDEX_SAMPLES - 1));
+    hash.update(readAt(fd, at, at + span));
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * False when the file was replaced, shrank, was written without growing, or changed in a
+ * sampled block. The samples cover an indexed prefix up to 64KB whole; past that, an
+ * in-place edit between samples followed by an append goes unseen.
+ */
+function indexStillHolds(fd: number, stat: fs.Stats, index: SourceIndex): boolean {
+  return (
+    index.ino === stat.ino &&
+    index.resumeAt <= stat.size &&
+    !(stat.size === index.size && stat.mtimeMs !== index.mtimeMs) &&
+    sampleDigest(fd, index.resumeAt) === index.samples
+  );
+}
+
+/**
+ * The offset of the line holding each source_uuid's first copy, and each promptId's. The index
+ * is kept per file and extended over whatever was appended since; a rewritten file is indexed
+ * afresh.
+ */
+function firstOffsets(filePath: string): SourceIndex {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const stat = fs.fstatSync(fd);
+    const size = stat.size;
+    let index = sourceIndexes.get(filePath);
+    sourceIndexes.delete(filePath);
+    if (!index || !indexStillHolds(fd, stat, index)) {
+      index = { ino: stat.ino, size: 0, mtimeMs: 0, resumeAt: 0, lineStart: 0, samples: '', firstSource: new Map(), firstPrompt: new Map() };
+    }
+    sourceIndexes.set(filePath, index);
+    if (sourceIndexes.size > SOURCE_INDEX_FILES) sourceIndexes.delete(sourceIndexes.keys().next().value as string);
+
+    // Reads overlap by a key and an id, so a copy split between two reads is still found.
+    const overlap = SOURCE_UUID_KEY.length + 64;
+    const keys: Array<[Buffer, Map<string, number>]> = [[SOURCE_UUID_KEY, index.firstSource], [PROMPT_ID_KEY, index.firstPrompt]];
+    const chunk = Buffer.alloc(Math.min(SOURCE_INDEX_CHUNK, Math.max(0, size - index.resumeAt)));
+    while (chunk.length > 0) {
+      const start = index.resumeAt;
+      const n = fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - start), start);
+      if (n <= 0) break;
+      const buf = chunk.subarray(0, n);
+      for (const [key, first] of keys) {
+        for (let i = buf.indexOf(key); i >= 0; i = buf.indexOf(key, i + 1)) {
+          const idStart = i + key.length;
+          const idEnd = buf.indexOf(0x22, idStart);
+          if (idEnd < 0) break;
+          const id = buf.toString('utf-8', idStart, idEnd);
+          const newline = buf.lastIndexOf(NEWLINE_BYTE, i);
+          if (!first.has(id)) first.set(id, newline >= 0 ? start + newline + 1 : index.lineStart);
+        }
+      }
+      const end = start + n;
+      const next = end >= size ? Math.max(start, end - overlap) : end - overlap;
+      if (next > start) {
+        const newline = buf.lastIndexOf(NEWLINE_BYTE, next - start - 1);
+        if (newline >= 0) index.lineStart = start + newline + 1;
+      }
+      index.resumeAt = next;
+      if (end >= size) break;
+    }
+    index.size = size;
+    index.mtimeMs = stat.mtimeMs;
+    index.samples = sampleDigest(fd, index.resumeAt);
+    return index;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+const QUEUED_COMMAND_HEAD = /^\{[^{]*"attachment"\s*:\s*\{\s*"type"\s*:\s*"queued_command"/;
+
+/** The whole line starting at `offset`. */
+function lineAt(filePath: string, offset: number): string {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const parts: Buffer[] = [];
+    for (let at = offset; ; at += CHUNK_SIZE) {
+      const chunk = readAt(fd, at, at + CHUNK_SIZE);
+      const newline = chunk.indexOf(NEWLINE_BYTE);
+      parts.push(newline >= 0 ? chunk.subarray(0, newline) : chunk);
+      if (newline >= 0 || chunk.length < CHUNK_SIZE) break;
+    }
+    return Buffer.concat(parts).toString('utf-8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** True for a slash command wrapper repeating the command its prompt was opened with by typing it. */
+function repeatsPromptCommand(filePath: string, line: ScannedLine): boolean {
+  let entry: Record<string, unknown>;
+  try {
+    entry = JSON.parse(line.text);
+  } catch {
+    return false;
+  }
+  const command = wrappedSlashCommand(entry);
+  if (command === null || typeof entry.promptId !== 'string') return false;
+  const first = firstOffsets(filePath).firstPrompt.get(entry.promptId);
+  if (first === undefined || first >= line.offset) return false;
+  try {
+    return typedSlashCommand(JSON.parse(lineAt(filePath, first))) === command;
+  } catch {
+    return false;
   }
 }
 
 /**
- * Digests of real USER entries the scan has passed, so their queued twins can be
- * dropped. Backward reading meets the real entry before the queue entry it
- * supersedes, which is the order this relies on.
+ * The message a scanned line shows, or null for a repeat: Claude Code shows a queued message
+ * once per source_uuid, the first copy written, and a slash command once per prompt.
  */
-class RecentUserContent {
-  private readonly seen = new Set<string>();
-  private order: string[] = [];
-  // Eviction advances a read index and compacts in bulk. Shifting the array per
-  // entry is linear in the window, which at this size dominates the whole scan.
-  private head = 0;
-
-  add(content: string): void {
-    const digest = RecentUserContent.digest(content);
-    if (this.seen.has(digest)) return;
-    this.seen.add(digest);
-    this.order.push(digest);
-    if (this.seen.size > DEDUPE_HISTORY_ENTRIES) {
-      this.seen.delete(this.order[this.head++]);
-      if (this.head >= DEDUPE_HISTORY_ENTRIES) {
-        this.order = this.order.slice(this.head);
-        this.head = 0;
-      }
-    }
+function shownMessage(filePath: string, line: ScannedLine, message: ReadMessageEntry | null): ReadMessageEntry | null {
+  if (!message) return null;
+  if (QUEUED_COMMAND_HEAD.test(line.text)) {
+    const source = line.text.match(/"source_uuid"\s*:\s*"([^"]+)"/)?.[1];
+    if (source !== message.uuid) return message;
+    const first = firstOffsets(filePath).firstSource.get(source);
+    return first !== undefined && first < line.offset ? null : message;
   }
-
-  has(content: string): boolean {
-    return this.seen.has(RecentUserContent.digest(content));
-  }
-
-  /** Queue entries carry the text as typed; the real entry's is trimmed. */
-  private static digest(content: string): string {
-    return crypto.createHash('sha1').update(content.trim()).digest('base64');
-  }
-}
-
-/** Text the scan has seen a person queue, and text it has seen the harness deliver. */
-class QueuedSenders {
-  readonly human = new RecentUserContent();
-  readonly harness = new RecentUserContent();
+  const maybeCommand = message.role === 'USER' && message.content.startsWith('/');
+  return maybeCommand && repeatsPromptCommand(filePath, line) ? null : message;
 }
 
 /**
  * Fill in missing timestamps from neighboring messages.
- * Truncated lines may fail to extract timestamps; use the next message's
- * timestamp as fallback, or the previous message's if there is no next.
+ * An entry written without one takes the next message's timestamp, or the
+ * previous message's if there is no next.
  */
 function interpolateTimestamps(messages: ReadMessageEntry[]): void {
   for (let i = 0; i < messages.length; i++) {
@@ -935,8 +803,6 @@ function readLatest(
 ): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
   const scanner = new BackwardScanner(filePath, MAX_TAIL_SCAN_BYTES);
   try {
-    const recentUsers = new RecentUserContent();
-    const queued = new QueuedSenders();
     const newestFirst: ReadMessageEntry[] = [];
     const tailVerbose = new TailVerbose();
     let lineCount = 0;
@@ -947,13 +813,9 @@ function readLatest(
 
       for (const line of batch) {
         lineCount++;
-        const message = parseLineToMessage(line.text, line.offset, queued);
+        const message = shownMessage(filePath, line, parseLineToMessage(line.text, line.offset));
         tailVerbose.consider(line.text);
         if (!message) continue;
-        if (message.role === 'USER' && !message.uuid.startsWith('queue-')) {
-          recentUsers.add(message.content);
-        }
-        if (message.uuid.startsWith('queue-') && recentUsers.has(message.content)) continue;
         newestFirst.push(message);
         tailVerbose.sawMessage(message.role);
       }
@@ -973,6 +835,10 @@ function readLatest(
   }
 }
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * Does this raw line carry the cursor? Filtered and unrenderable entries never
  * become messages, but a client can still be holding one as its oldest or
@@ -982,12 +848,19 @@ function readLatest(
 function cursorMatcher(
   cursorUuid: string
 ): (line: ScannedLine, message: ReadMessageEntry | null) => boolean {
+  // A `queue-<timestamp>` id names the enqueue entry written at that time.
+  const enqueuedAt = /^queue-(.+)$/.exec(cursorUuid)?.[1];
+  if (enqueuedAt) {
+    const enqueue = new RegExp(
+      `^\\{\\s*"type"\\s*:\\s*"queue-operation"\\s*,\\s*"operation"\\s*:\\s*"enqueue"\\s*,\\s*"timestamp"\\s*:\\s*"${escapeRegExp(enqueuedAt)}"`
+    );
+    return (line) => enqueue.test(line.text);
+  }
   if (cursorUuid.startsWith('generated-')) {
     return (line, message) =>
       message ? message.uuid === cursorUuid : cursorUuid === `generated-${line.offset}`;
   }
-  const escaped = cursorUuid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = new RegExp(`"uuid"\\s*:\\s*"${escaped}"`);
+  const pattern = new RegExp(`"uuid"\\s*:\\s*"${escapeRegExp(cursorUuid)}"`);
   return (line, message) => (message ? message.uuid === cursorUuid : pattern.test(line.text));
 }
 
@@ -1004,8 +877,6 @@ function readBeforeCursor(
 ): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
   const scanner = new BackwardScanner(filePath, MAX_CURSOR_SCAN_BYTES);
   try {
-    const recentUsers = new RecentUserContent();
-    const queued = new QueuedSenders();
     const olderNewestFirst: ReadMessageEntry[] = [];
     const isCursor = cursorMatcher(beforeUuid);
     let found = false;
@@ -1015,23 +886,18 @@ function readBeforeCursor(
       if (batch.length === 0) break;
 
       for (const line of batch) {
-        const message = parseLineToMessage(line.text, line.offset, queued);
-        if (message && message.role === 'USER' && !message.uuid.startsWith('queue-')) {
-          recentUsers.add(message.content);
-        }
+        const message = shownMessage(filePath, line, parseLineToMessage(line.text, line.offset));
         if (!found) {
           found = isCursor(line, message);
           continue;
         }
         if (!message) continue;
-        if (message.uuid.startsWith('queue-') && recentUsers.has(message.content)) continue;
 
         olderNewestFirst.push(message);
         // One past the page tells us whether anything older remains.
         if (olderNewestFirst.length > limit) break scan;
       }
     }
-
     // A cursor the scan never met was most likely compacted away. Only claim the
     // conversation has nothing older when the whole file was searched - a scan
     // that stopped at its budget knows nothing about what lies beyond it, and
@@ -1059,8 +925,6 @@ function readAfterCursor(
 ): { messages: ReadMessageEntry[]; hasMore: boolean; oldestUuid?: string; newestUuid?: string } {
   const scanner = new BackwardScanner(filePath, MAX_CURSOR_SCAN_BYTES);
   try {
-    const recentUsers = new RecentUserContent();
-    const queued = new QueuedSenders();
     const nearestCursor: ReadMessageEntry[] = [];
     const isCursor = cursorMatcher(afterUuid);
     let newerThanCursor = 0;
@@ -1071,23 +935,18 @@ function readAfterCursor(
       if (batch.length === 0) break;
 
       for (const line of batch) {
-        const message = parseLineToMessage(line.text, line.offset, queued);
+        const message = shownMessage(filePath, line, parseLineToMessage(line.text, line.offset));
         if (isCursor(line, message)) {
           found = true;
           break scan;
         }
         if (!message) continue;
-        if (message.role === 'USER' && !message.uuid.startsWith('queue-')) {
-          recentUsers.add(message.content);
-        }
-        if (message.uuid.startsWith('queue-') && recentUsers.has(message.content)) continue;
 
-        newerThanCursor++;
         nearestCursor.push(message);
+        newerThanCursor++;
         if (nearestCursor.length > limit) nearestCursor.shift();
       }
     }
-
     // Stale cursor - "after this" is unanswerable once the entry is gone, and
     // returning the file tail made clients append messages they already had.
     if (!found) return { messages: [], hasMore: false };

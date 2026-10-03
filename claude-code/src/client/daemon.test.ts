@@ -67,15 +67,17 @@ const adapter = {
   cancelTask: jest.fn(),
   stopAll: jest.fn(),
   getRunningTasks: jest.fn(() => ['task-1']),
+  hadQueryAt: jest.fn((..._args: unknown[]) => false),
 };
 
 const watcher = {
   onEvent: undefined as Handler | undefined,
   onCompletion: undefined as Handler | undefined,
+  adapterHadQuery: undefined as Handler | undefined,
   watchSession: jest.fn(),
   unwatchSession: jest.fn(),
   unwatchAll: jest.fn(),
-  reserveCompletionFire: jest.fn((_sessionId: string) => true),
+  announceTurn: jest.fn((..._args: unknown[]) => true),
 };
 
 jest.mock('../adapter/claude-cli', () => ({
@@ -89,19 +91,21 @@ jest.mock('../adapter/claude-cli', () => ({
     cancelTask(...args: unknown[]) { return adapter.cancelTask(...args); }
     stopAll() { return adapter.stopAll(); }
     getRunningTasks() { return adapter.getRunningTasks(); }
+    hadQueryAt(...args: unknown[]) { return adapter.hadQueryAt(...args); }
   },
 }));
 
 jest.mock('../session-watcher', () => ({
   SessionWatcher: class {
-    constructor(onEvent: Handler, onCompletion: Handler) {
+    constructor(onEvent: Handler, onCompletion: Handler, adapterHadQuery: Handler) {
       watcher.onEvent = onEvent;
       watcher.onCompletion = onCompletion;
+      watcher.adapterHadQuery = adapterHadQuery;
     }
     watchSession(...args: unknown[]) { return watcher.watchSession(...args); }
     unwatchSession(...args: unknown[]) { return watcher.unwatchSession(...args); }
     unwatchAll() { return watcher.unwatchAll(); }
-    reserveCompletionFire(sessionId: string) { return watcher.reserveCompletionFire(sessionId); }
+    announceTurn(...args: unknown[]) { return watcher.announceTurn(...args); }
   },
 }));
 
@@ -138,10 +142,11 @@ beforeEach(() => {
   // The registry persists to the mocked config dir; a cache surviving from an
   // earlier run would make the first record() a no-op and hide the report.
   rmSync('/tmp/cmdctrl-claude-code-test/slash-commands.json', { force: true });
-  watcher.reserveCompletionFire.mockReturnValue(true);
+  watcher.announceTurn.mockReturnValue(true);
   adapter.getRunningTasks.mockReturnValue(['task-1']);
   jest.spyOn(console, 'log').mockImplementation(() => {});
   jest.spyOn(console, 'error').mockImplementation(() => {});
+  jest.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
 afterEach(() => {
@@ -190,7 +195,6 @@ describe('adapter events', () => {
   test.each(watchCases)('$name', ({ eventType, sessionId, filePath, watched }) => {
     build();
     mockFindSessionFile.mockReturnValue(filePath);
-    watcher.reserveCompletionFire.mockReturnValue(false);
 
     adapter.onEvent!('task-1', eventType, sessionId ? { session_id: sessionId } : {});
 
@@ -228,41 +232,39 @@ describe('adapter events', () => {
   });
 });
 
-describe('backup completion', () => {
-  const cases: Array<{ name: string; reserved: boolean; filePath: string | null; fires: boolean }> = [
-    { name: 'fires when the watcher has not already sent one', reserved: true, filePath: '/tmp/s1.jsonl', fires: true },
-    { name: 'stays quiet when the watcher already fired', reserved: false, filePath: '/tmp/s1.jsonl', fires: false },
-    { name: 'stays quiet when the session file is gone', reserved: true, filePath: null, fires: false },
+describe('SDK turn completion', () => {
+  const cases: Array<{ name: string; event: string; data: Record<string, unknown>; announced: string[]; watched: boolean }> = [
+    { name: 'hands every result to the watcher, which announces the turn', event: 'TASK_COMPLETE', data: { session_id: 's1', result: 'all done' }, announced: ['s1'], watched: true },
+    { name: 'hands a result to the watcher even when the session is not watched yet', event: 'TASK_COMPLETE', data: { session_id: 's1', result: 'all done' }, announced: ['s1'], watched: false },
+    { name: 'a result with no session id announces nothing', event: 'TASK_COMPLETE', data: { result: 'all done' }, announced: [], watched: true },
+    { name: 'a question is not a completion', event: 'WAIT_FOR_USER', data: { session_id: 's1', prompt: 'Which one?' }, announced: [], watched: true },
+    { name: 'a permission request is not a completion', event: 'WAIT_FOR_USER', data: { session_id: 's1', prompt: 'Permission required for: Bash', permission_tool: 'Bash' }, announced: [], watched: true },
   ];
 
-  test.each(cases)('$name', ({ reserved, filePath, fires }) => {
-    build();
-    mockFindSessionFile.mockReturnValue(filePath);
-    watcher.reserveCompletionFire.mockReturnValue(reserved);
-
-    adapter.onEvent!('task-1', 'TASK_COMPLETE', { session_id: 's1', result: 'all done' });
-
-    const activity = sent.filter((m) => m.type === 'session_activity');
-    expect(activity).toHaveLength(fires ? 1 : 0);
-    if (fires) {
-      expect(activity[0]).toEqual({
-        type: 'session_activity',
-        session_id: 's1',
-        file_path: '/tmp/s1.jsonl',
-        last_message: 'all done',
-        message_count: 0,
-        is_completion: true,
-      });
-    }
-  });
-
-  test('only completions trigger the backup', () => {
+  test.each(cases)('$name', ({ event, data, announced, watched }) => {
     build();
     mockFindSessionFile.mockReturnValue('/tmp/s1.jsonl');
+    watcher.announceTurn.mockReturnValue(watched);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
-    adapter.onEvent!('task-1', 'WAIT_FOR_USER', { session_id: 's1', prompt: 'Which one?' });
+    adapter.onEvent!('task-1', event, data);
 
+    expect(watcher.announceTurn.mock.calls.map((c) => c[0])).toEqual(announced);
+    // The watch attempt comes first, so the watcher can read the transcript it announces from.
+    if (announced.length) {
+      expect(watcher.watchSession).toHaveBeenCalledWith('s1', '/tmp/s1.jsonl');
+      expect(watcher.watchSession.mock.invocationCallOrder[0]).toBeLessThan(watcher.announceTurn.mock.invocationCallOrder[0]);
+    }
+    expect(warn).toHaveBeenCalledTimes(announced.length && !watched ? 1 : 0);
+    // The daemon itself never reports a session it has not read.
     expect(sent.filter((m) => m.type === 'session_activity')).toHaveLength(0);
+  });
+
+  test('the watcher asks the adapter whether it had a query on the session', () => {
+    build();
+    adapter.hadQueryAt.mockReturnValue(true);
+    expect(watcher.adapterHadQuery!('s1', 1234)).toBe(true);
+    expect(adapter.hadQueryAt).toHaveBeenCalledWith('s1', 1234);
   });
 });
 

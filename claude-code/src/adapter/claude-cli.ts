@@ -60,6 +60,17 @@ interface TurnState {
   planContent?: string;
 }
 
+/** One query's life on a session: `to` is unset while it is alive. */
+interface QuerySpan {
+  from: number;
+  to?: number;
+  session: AgentSession;
+}
+
+// Spans kept per session; a watcher classifying a prompt older than these has no adapter
+// result coming for it anyway.
+const MAX_QUERY_SPANS = 16;
+
 type EventCallback = (
   taskId: string,
   eventType: string,
@@ -91,6 +102,13 @@ export class ClaudeAdapter {
   private live: Set<AgentSession> = new Set();
   /** Turn state, keyed by task id. */
   private turns: Map<string, TurnState> = new Map();
+  /**
+   * When this adapter had a query alive on each session, newest last. The watcher
+   * announces a turn only if it was prompted outside these spans: inside one, the
+   * query's own `result` is the announcement.
+   */
+  private queries: Map<string, QuerySpan[]> = new Map();
+  private queryOpened = new WeakMap<AgentSession, number>();
   private onEvent: EventCallback;
   private onSlashCommands?: SlashCommandsCallback;
   /**
@@ -240,6 +258,27 @@ export class ClaudeAdapter {
     return Array.from(this.turns.keys());
   }
 
+  /** Whether this adapter had a query alive on the session at that moment. */
+  hadQueryAt(sessionId: string, atMs: number): boolean {
+    return (this.queries.get(sessionId) ?? []).some((span) => span.from <= atMs && (span.to === undefined || atMs <= span.to));
+  }
+
+  /** Records that the session's query is alive, from when the agent was created. */
+  private openQuery(sessionId: string, session: AgentSession): void {
+    const spans = this.queries.get(sessionId) ?? [];
+    const last = spans[spans.length - 1];
+    if (last && last.to === undefined && last.session === session) return;
+    spans.push({ from: this.queryOpened.get(session) ?? Date.now(), session });
+    if (spans.length > MAX_QUERY_SPANS) spans.shift();
+    this.queries.set(sessionId, spans);
+  }
+
+  private closeQuery(sessionId: string, session: AgentSession): void {
+    for (const span of this.queries.get(sessionId) ?? []) {
+      if (span.session === session && span.to === undefined) span.to = Date.now();
+    }
+  }
+
   /** Stand up an agent and wire its output back to the daemon's events. */
   private createSession(taskId: string, cwd?: string, resume?: string): AgentSession {
     console.log(`[${taskId}] Starting agent${resume ? ` (resume ${resume.slice(-8)})` : ''} with cwd: ${cwd || 'default'}`);
@@ -258,6 +297,7 @@ export class ClaudeAdapter {
       },
       onClosed: (sessionId) => {
         this.live.delete(session);
+        this.closeQuery(sessionId, session);
         if (this.sessions.get(sessionId) === session) {
           this.sessions.delete(sessionId);
         }
@@ -268,8 +308,10 @@ export class ClaudeAdapter {
     });
 
     this.live.add(session);
+    this.queryOpened.set(session, Date.now());
     if (resume) {
       this.sessions.set(resume, session);
+      this.openQuery(resume, session);
     }
     return session;
   }
@@ -373,6 +415,7 @@ export class ClaudeAdapter {
         if (event.subtype === 'init' && event.session_id) {
           console.log(`[${taskId}] Session initialized: ${event.session_id}`);
           this.sessions.set(event.session_id, session);
+          this.openQuery(event.session_id, session);
           this.onEvent(taskId, 'SESSION_STARTED', {
             session_id: event.session_id
           });

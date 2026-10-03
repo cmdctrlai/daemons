@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as readline from 'readline';
-import { unwrapPastedContent } from './transcript-filter';
+import { unwrapPastedContent, isMessageEntry } from './transcript-filter';
 
 const ACTIVE_THRESHOLD_MS = 30 * 1000; // 30 seconds
 const TAIL_BYTES = 65536; // 64KB - only used as fallback
@@ -507,7 +507,7 @@ async function parseSessionFile(filePath: string, projectPath: string, projectNa
         // but the session file stays in its original project directory.
 
         // Count messages and track last message timestamp
-        if (entry.type === 'user' || entry.type === 'assistant') {
+        if (isMessageEntry(entry)) {
           messageCount++;
           // Track timestamp of actual user/assistant messages (not system messages)
           if (entry.timestamp) {
