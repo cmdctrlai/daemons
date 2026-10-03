@@ -12,8 +12,8 @@ export function status(): void {
   const config = configManager.readConfig()!;
   const credentials = configManager.readCredentials();
 
-  console.log('Codex CLI Daemon Status');
-  console.log('========================');
+  console.log('Codex Daemon Status');
+  console.log('===================');
   console.log(`Device Name: ${config.deviceName}`);
   console.log(`Device ID:   ${config.deviceId}`);
   console.log(`Server:      ${config.serverUrl}`);

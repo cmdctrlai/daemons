@@ -1,5 +1,5 @@
 /**
- * Codex CLI rollout parsing.
+ * Codex rollout parsing.
  *
  * Codex writes one JSON object per line to
  * ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl:

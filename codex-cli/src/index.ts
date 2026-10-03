@@ -11,7 +11,7 @@ const program = new Command();
 
 program
   .name('cmdctrl-codex-cli')
-  .description('CmdCtrl daemon for OpenAI Codex CLI')
+  .description('CmdCtrl daemon for OpenAI Codex')
   .version('0.1.0');
 
 program
@@ -28,7 +28,7 @@ program
 
 program
   .command('start')
-  .description('Start the Codex CLI daemon and connect to the CmdCtrl server')
+  .description('Start the Codex daemon and connect to the CmdCtrl server')
   .option('-f, --foreground', 'Run in foreground (default)')
   .option('-d, --detach', 'Run detached from the terminal')
   .action(start);

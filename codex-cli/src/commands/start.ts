@@ -58,7 +58,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
     } catch { /* use default */ }
   }
 
-  console.log('Codex CLI Daemon');
+  console.log('Codex Daemon');
   console.log(`  Server: ${config.serverUrl}`);
   console.log(`  Device: ${config.deviceName} (${config.deviceId})`);
   console.log(`  Version: ${daemonVersion}`);
@@ -268,6 +268,6 @@ export async function start(options: StartOptions = {}): Promise<void> {
     console.warn('Initial connection failed, will retry...');
   });
 
-  console.log('Codex CLI daemon running. Press Ctrl+C to stop.\n');
+  console.log('Codex daemon running. Press Ctrl+C to stop.\n');
   await new Promise(() => {});
 }

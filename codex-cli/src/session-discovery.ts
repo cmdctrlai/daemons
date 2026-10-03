@@ -1,8 +1,8 @@
 /**
- * Codex CLI Session Discovery
+ * Codex Session Discovery
  *
  * Scans ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl files to discover
- * existing Codex CLI sessions and report them to the CmdCtrl server.
+ * existing Codex sessions and report them to the CmdCtrl server.
  *
  * Line-level parsing lives in session-parser.ts, shared with the live watcher.
  */
@@ -38,7 +38,7 @@ const sessionCache = new Map<string, { session: ExternalSession; fileMtime: numb
 const messageCache = new Map<string, { parsed: ParsedRollout; fileMtime: number }>();
 
 /**
- * Read and parse a Codex CLI JSONL session file.
+ * Read and parse a Codex JSONL session file.
  * Returns null for files with no session ID or no messages – nothing to report.
  */
 function parseSessionFile(filePath: string): ParsedRollout | null {
@@ -69,7 +69,7 @@ function generateTitle(text: string): string {
 }
 
 /**
- * Discover all Codex CLI sessions on this device.
+ * Discover all Codex sessions on this device.
  *
  * Scans ~/.codex/sessions/ recursively for rollout-*.jsonl files and returns
  * session metadata for reporting to the CmdCtrl server.
@@ -175,7 +175,7 @@ function findSessionFiles(dir: string): string[] {
 }
 
 /**
- * Find the file path for a Codex CLI session by its session ID.
+ * Find the file path for a Codex session by its session ID.
  * Checks the session cache first, then scans the filesystem.
  */
 export function findSessionFile(sessionId: string): string | null {
@@ -219,7 +219,7 @@ interface ReadMessagesResult {
 }
 
 /**
- * Read messages from a Codex CLI session file, formatted for the CmdCtrl protocol.
+ * Read messages from a Codex session file, formatted for the CmdCtrl protocol.
  * Generates stable UUIDs from message indices so cursor pagination works.
  */
 export function readSessionMessages(
