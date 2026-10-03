@@ -1,7 +1,7 @@
 /**
- * Codex CLI Session Watcher
+ * Codex Session Watcher
  *
- * Polls Codex CLI JSONL session files for new messages and emits typed events:
+ * Polls Codex JSONL session files for new messages and emits typed events:
  *   - USER_MESSAGE: user turns
  *   - AGENT_RESPONSE: agent turns
  *

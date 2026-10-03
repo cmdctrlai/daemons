@@ -15,7 +15,7 @@ Each daemon is a lightweight background process that connects your AI coding age
 | `@cmdctrl/vscode-copilot` | GitHub Copilot (VS Code) | `npm install -g @cmdctrl/vscode-copilot` |
 | `@cmdctrl/copilot-cli` | GitHub Copilot (CLI) | `npm install -g @cmdctrl/copilot-cli` |
 | `@cmdctrl/gemini-cli` | Gemini CLI | `npm install -g @cmdctrl/gemini-cli` |
-| `@cmdctrl/codex-cli` | OpenAI Codex CLI | `npm install -g @cmdctrl/codex-cli` |
+| `@cmdctrl/codex-cli` | OpenAI Codex | `npm install -g @cmdctrl/codex-cli` |
 | `@cmdctrl/opencode` | OpenCode | `npm install -g @cmdctrl/opencode` |
 
 ## Quick start

@@ -68,7 +68,7 @@ export async function register(options: RegisterOptions): Promise<void> {
     console.log('');
   }
 
-  console.log(`Registering Codex CLI device "${deviceName}" with ${serverUrl}...\n`);
+  console.log(`Registering Codex device "${deviceName}" with ${serverUrl}...\n`);
 
   const result = await registerDevice(
     serverUrl,
