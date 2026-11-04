@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/claude-code",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "description": "CmdCtrl daemon for Claude Code - connects your workstation to the CmdCtrl orchestration server",
   "main": "./dist/index.js",
   "bin": {
@@ -38,6 +38,6 @@
     "typescript": "^5.7.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   }
 }
