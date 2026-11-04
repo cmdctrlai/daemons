@@ -86,6 +86,7 @@ export interface SessionEntry {
   sessionId?: string;
   slug?: string;
   cwd?: string;
+  relocatedCwd?: string; // On a 'relocated' entry: the directory the session moved to
   timestamp?: string; // ISO timestamp of the entry
   message?: {
     role?: string;
@@ -173,62 +174,122 @@ function extractReadableText(content: unknown): string {
 }
 
 /**
- * Decode a project directory name to a path
- * e.g., "-Users-alice-src-myproject" -> "/Users/alice/src/myproject"
- *
- * The encoding is ambiguous: hyphens in directory names look the same as path separators.
- * e.g., "-Users-alice-src-my-project-web-ui" could be:
- *   /Users/alice/src/my-project-web-ui (correct – worktree)
- *   /Users/alice/src/my-project/web/ui (wrong – doesn't exist)
- *
- * We solve this by trying all possible decodings and returning the one that:
- * 1. Actually exists on the filesystem
- * 2. Has the most path components (to prefer /a/b-c over /a/b/c when both exist)
- *
- * If no valid path is found, fall back to replacing all hyphens with slashes.
+ * How Claude Code names a project folder in ~/.claude/projects: every character
+ * outside [a-zA-Z0-9] in the working directory becomes '-'.
  */
-function decodeProjectPath(dirName: string): string {
-  if (!dirName || dirName.length === 0) return '';
+export function encodeProjectPath(projectPath: string): string {
+  return projectPath.replace(/[^a-zA-Z0-9]/g, '-');
+}
 
-  // Remove leading dash and split by dashes
-  const parts = dirName.slice(1).split('-');
-  if (parts.length === 0) return '/';
+// Claude Code cuts a longer folder name here and appends '-' and a hash of the path.
+const MAX_FOLDER_NAME = 200;
 
-  // Generate all possible path interpretations using recursion
-  const candidates: string[] = [];
+/**
+ * Whether a cwd Claude Code recorded is the directory dirName was named for.
+ * A session can cd elsewhere, so any other cwd is not the project.
+ */
+export function isProjectCwd(cwd: unknown, dirName: string): cwd is string {
+  if (typeof cwd !== 'string') return false;
+  const encoded = encodeProjectPath(cwd);
+  // Versions before the cut wrote the full encoding at any length.
+  if (encoded === dirName) return true;
+  if (encoded.length <= MAX_FOLDER_NAME) return false;
+  // The Node and Bun builds hash differently, so match the kept prefix as Claude Code does.
+  const kept = `${encoded.slice(0, MAX_FOLDER_NAME)}-`;
+  return dirName.startsWith(kept) && /^[a-zA-Z0-9]+$/.test(dirName.slice(kept.length));
+}
 
-  function generatePaths(index: number, currentPath: string): void {
-    if (index >= parts.length) {
-      candidates.push(currentPath);
-      return;
+// A first prompt carrying an image or a long paste can put the first cwd megabytes in.
+const CWD_SCAN_BYTES = 2 * 1024 * 1024;
+
+/** The first string cwd in a transcript, read line by line from the start, as Claude Code reads it. */
+async function firstCwd(filePath: string): Promise<string | undefined> {
+  const input = fs.createReadStream(filePath, { end: CWD_SCAN_BYTES - 1 });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.includes('"cwd":')) continue;
+      try {
+        const cwd = JSON.parse(line).cwd;
+        if (typeof cwd === 'string') return cwd;
+      } catch {
+        // A line cut by the scan limit
+      }
     }
+    return undefined;
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+}
 
-    // Try combining remaining parts with hyphens (longer combinations first)
-    for (let end = parts.length; end > index; end--) {
-      const component = parts.slice(index, end).join('-');
-      const newPath = currentPath + '/' + component;
-      generatePaths(end, newPath);
-    }
+/** The filesystem and platform a decode runs against; injectable for tests. */
+export interface PathDecodeEnv {
+  platform: NodeJS.Platform;
+  /** Names of the directories (and symlinks) directly inside dir; [] if unreadable. */
+  listDirs: (dir: string) => string[];
+}
+
+function listChildDirs(dir: string): string[] {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.isDirectory() || e.isSymbolicLink())
+      .map(e => e.name);
+  } catch {
+    return [];
+  }
+}
+
+const defaultDecodeEnv: PathDecodeEnv = { platform: process.platform, listDirs: listChildDirs };
+
+// A real decode lists one directory per path component; the cap only stops
+// pathological trees (symlink loops) from making the search exponential.
+const MAX_DIRS_LISTED = 256;
+
+/**
+ * Decode a project folder name back to the directory it came from,
+ * e.g. "-Users-alice-src-my-proj" -> "/Users/alice/src/my-proj" and
+ * "C--Users-first-last" -> "C:\Users\first.last" on Windows.
+ *
+ * The encoding is lossy, so walk down from the root one directory at a time,
+ * following only children whose encoded name matches the start of what is left.
+ * Longer matches are tried first, so /a/b-c wins over /a/b/c when both exist.
+ * If nothing matches, fall back to reading every '-' as a separator.
+ */
+export function decodeProjectPath(dirName: string, env: PathDecodeEnv = defaultDecodeEnv): string {
+  if (!dirName) return '';
+
+  const windows = env.platform === 'win32';
+  const drive = windows ? /^([A-Za-z])--/.exec(dirName) : null;
+  const root = drive ? `${drive[1]}:\\` : '/';
+  const sep = drive ? '\\' : '/';
+  const rest = drive ? dirName.slice(3) : dirName.slice(1);
+
+  // On Windows only a drive root is walked: any other root is a network path.
+  if (drive || !windows) {
+    const fold = windows ? (s: string) => s.toLowerCase() : (s: string) => s;
+    const join = drive ? path.win32.join : path.posix.join;
+    let budget = MAX_DIRS_LISTED;
+
+    const walk = (dir: string, remaining: string): string | null => {
+      if (remaining === '') return dir;
+      if (budget-- <= 0) return null;
+      const matches = env.listDirs(dir)
+        .map(name => ({ name, encoded: fold(encodeProjectPath(name)) }))
+        .filter(({ encoded }) => remaining === encoded || remaining.startsWith(encoded + '-'))
+        .sort((a, b) => b.encoded.length - a.encoded.length);
+      for (const { name, encoded } of matches) {
+        const found = walk(join(dir, name), remaining.slice(encoded.length + 1));
+        if (found) return found;
+      }
+      return null;
+    };
+
+    const found = walk(root, fold(rest));
+    if (found) return found;
   }
 
-  generatePaths(0, '');
-
-  // Find candidates that exist, preferring fewer path components (more hyphens preserved)
-  // Sort by number of slashes (ascending) to prefer paths with hyphens in names
-  candidates.sort((a, b) => {
-    const slashesA = (a.match(/\//g) || []).length;
-    const slashesB = (b.match(/\//g) || []).length;
-    return slashesA - slashesB;
-  });
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  // Fallback: replace all hyphens with slashes (original behavior)
-  return '/' + parts.join('/');
+  return root + rest.split('-').join(sep);
 }
 
 /**
@@ -261,8 +322,9 @@ export async function discoverSessions(excludeSessionIDs: Set<string> = new Set(
     if (!entry.isDirectory()) continue;
 
     const projectDir = path.join(claudeDir, entry.name);
-    const projectPath = decodeProjectPath(entry.name);
-    const projectName = projectNameFromPath(projectPath);
+    // The folder name is lossy, so it is decoded only for a session with no usable cwd.
+    let decoded: string | undefined;
+    const decodedPath = () => (decoded ??= decodeProjectPath(entry.name));
 
     // Try to use sessions-index.json first (much more efficient)
     const indexPath = path.join(projectDir, 'sessions-index.json');
@@ -308,14 +370,15 @@ export async function discoverSessions(excludeSessionIDs: Set<string> = new Set(
             title = indexEntry.sessionId.slice(0, 8);
           }
 
+          // The index holds the cwd recorded at session start.
+          const project = isProjectCwd(indexEntry.projectPath, entry.name) ? indexEntry.projectPath : decodedPath();
+
           const session: ExternalSession = {
             session_id: indexEntry.sessionId,
             slug: '',  // Not in index, but we don't really use it
             title,
-            // Always use directory-derived projectPath, not indexEntry.projectPath
-            // The index stores cwd at session start, which can be a subdirectory
-            project: projectPath,
-            project_name: projectNameFromPath(projectPath),
+            project,
+            project_name: projectNameFromPath(project),
             file_path: indexEntry.fullPath,
             last_message: indexEntry.firstPrompt !== 'No prompt' ? generateTitle(indexEntry.firstPrompt) : '',
             last_activity: indexEntry.modified,  // This is the correct message timestamp!
@@ -333,7 +396,7 @@ export async function discoverSessions(excludeSessionIDs: Set<string> = new Set(
         // Re-parse stale sessions from index
         for (const stalePath of staleSessionPaths) {
           try {
-            const session = await parseSessionFile(stalePath, projectPath, projectName);
+            const session = await parseSessionFile(stalePath, entry.name, decodedPath);
             if (session.message_count === 0) continue;
 
             const existing = sessionMap.get(session.session_id);
@@ -375,7 +438,7 @@ export async function discoverSessions(excludeSessionIDs: Set<string> = new Set(
               session.is_active = Date.now() - new Date(session.last_activity).getTime() < ACTIVE_THRESHOLD_MS;
             } else {
               // File is new or modified, parse it
-              session = await parseSessionFile(jsonlPath, projectPath, projectName);
+              session = await parseSessionFile(jsonlPath, entry.name, decodedPath);
               if (session.message_count === 0) continue;
               parsedSessionCache.set(sessionId, { session, fileMtime });
             }
@@ -408,7 +471,7 @@ export async function discoverSessions(excludeSessionIDs: Set<string> = new Set(
 
     for (const jsonlPath of jsonlFiles) {
       try {
-        const session = await parseSessionFile(jsonlPath, projectPath, projectName);
+        const session = await parseSessionFile(jsonlPath, entry.name, decodedPath);
 
         // Skip if excluded or no messages
         if (excludeSessionIDs.has(session.session_id)) continue;
@@ -443,7 +506,7 @@ export async function discoverSessions(excludeSessionIDs: Set<string> = new Set(
 /**
  * Parse a session JSONL file to extract metadata
  */
-async function parseSessionFile(filePath: string, projectPath: string, projectName: string): Promise<ExternalSession> {
+async function parseSessionFile(filePath: string, dirName: string, decodedPath: () => string): Promise<ExternalSession> {
   const stat = fs.statSync(filePath);
   const lastActivity = stat.mtime;
   const isActive = Date.now() - lastActivity.getTime() < ACTIVE_THRESHOLD_MS;
@@ -452,8 +515,8 @@ async function parseSessionFile(filePath: string, projectPath: string, projectNa
     session_id: '',
     slug: '',
     title: '',
-    project: projectPath,
-    project_name: projectName,
+    project: '',
+    project_name: '',
     file_path: filePath,
     last_message: '',
     last_activity: lastActivity.toISOString(),
@@ -461,11 +524,14 @@ async function parseSessionFile(filePath: string, projectPath: string, projectNa
     message_count: 0,
   };
 
-  // Read the tail of the file
+  // The folder is named for the cwd the session started in; later entries can be anywhere.
+  const startCwd = await firstCwd(filePath);
+
   const fileSize = stat.size;
   const fd = fs.openSync(filePath, 'r');
 
   try {
+    // Read the tail of the file
     const seekPos = Math.max(0, fileSize - TAIL_BYTES);
     const buffer = Buffer.alloc(Math.min(TAIL_BYTES, fileSize));
     fs.readSync(fd, buffer, 0, buffer.length, seekPos);
@@ -487,6 +553,7 @@ async function parseSessionFile(filePath: string, projectPath: string, projectNa
     let foundSessionId = false;
     let foundSlug = false;
     let lastMessageTimestamp = ''; // Track actual last message timestamp
+    let relocatedCwd: string | undefined;
 
     for (const line of lines) {
       try {
@@ -501,10 +568,10 @@ async function parseSessionFile(filePath: string, projectPath: string, projectNa
           session.slug = entry.slug;
           foundSlug = true;
         }
-        // NOTE: Do NOT override project with entry.cwd - the project path must come from
-        // the directory where the session file is stored, not from cwd in JSONL entries.
-        // The cwd can change during a session (e.g., when Claude changes to a subdirectory),
-        // but the session file stays in its original project directory.
+        // A session moved to another project is stamped with where it went; the last stamp wins.
+        if (entry.type === 'relocated' && typeof entry.relocatedCwd === 'string') {
+          relocatedCwd = entry.relocatedCwd;
+        }
 
         // Count messages and track last message timestamp
         if (isMessageEntry(entry)) {
@@ -539,6 +606,9 @@ async function parseSessionFile(filePath: string, projectPath: string, projectNa
     }
 
     session.message_count = messageCount;
+    const projectCwd = relocatedCwd ?? startCwd;
+    session.project = isProjectCwd(projectCwd, dirName) ? projectCwd : decodedPath();
+    session.project_name = projectNameFromPath(session.project);
 
     // Fallback session ID from filename
     if (!session.session_id) {
