@@ -172,3 +172,19 @@ describe('CommandCollapser', () => {
     expect(c.collapse(noArgs)).toBeNull();
   });
 });
+
+describe('CommandCollapser and arguments appended after a template', () => {
+  const LONG = 'Run the whole test suite and report failures in a table.';
+  const cases: Array<{ name: string; argsAppended?: boolean; template: string; text: string; want: string | null }> = [
+    { name: 'omp: the template alone', argsAppended: true, template: LONG, text: LONG, want: '/runtests' },
+    { name: 'omp: arguments after a blank line', argsAppended: true, template: LONG, text: `${LONG}\n\nquickly please`, want: '/runtests quickly please' },
+    { name: 'omp: text that merely continues the template is not arguments', argsAppended: true, template: LONG, text: `${LONG} And more.`, want: null },
+    { name: 'pi: arguments are never read back, as pi drops them', template: LONG, text: `${LONG}\n\nquickly please`, want: null },
+    { name: 'omp: a short template is matched exactly only', argsAppended: true, template: 'Run tests.', text: 'Run tests.\n\nnow', want: null },
+  ];
+  test.each(cases)('$name', ({ argsAppended, template, text, want }) => {
+    const c = new CommandCollapser();
+    c.setCommands([{ name: 'runtests', template, ...(argsAppended ? { argsAppended } : {}) }]);
+    expect(c.collapse(text)).toBe(want);
+  });
+});

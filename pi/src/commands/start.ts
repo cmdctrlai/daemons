@@ -1,19 +1,24 @@
 /**
  * Start command – connect to the CmdCtrl server and run as a daemon.
  *
- * Wires the `pi` CLI (via `../agent.ts`) to the SDK's DaemonClient. Session
- * storage and message history both live in pi's native session files under
- * `~/.pi/agent/sessions/` – there is no daemon-side store. See
- * `../session-reader.ts` and `../session-watcher.ts`.
+ * Wires the agent CLI – `pi`, or its fork `omp` – (through `../agent.ts`) to
+ * the SDK's DaemonClient. Session storage and message history both live in the
+ * agent's native session files – there is no daemon-side store. See
+ * `../session-source.ts`, `../session-reader.ts` and `../session-watcher.ts`.
  */
 
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 import {
   DaemonClient,
+  type DaemonClientOptions,
+  type DaemonConfig,
+  type DaemonCredentials,
   type MessageEntry,
 } from '@cmdctrl/daemon-sdk';
-import { AGENT_TYPE, DAEMON_VERSION, PI_BIN, config } from '../context';
+import { AGENT_TYPE, BIN_ENV, CLI_NAME, DAEMON_VERSION, PACKAGE_NAME, PI_BIN, config } from '../context';
+import { flavorFromVersion, ompSessionsRoot } from '../agent-flavor';
+import { ompSessions, useSessionSource } from '../session-source';
 import { piSdk } from '../pi-sdk';
 import { startTask, resumeTask, cancelTask } from '../agent';
 import { readMessages, listReportedSessions, resolveSessionPath } from '../session-reader';
@@ -43,9 +48,28 @@ interface StartOptions {
   detach?: boolean;
 }
 
+/** How this daemon connects, and which package it updates itself from. */
+export function clientOptions(cfg: DaemonConfig, creds: DaemonCredentials): DaemonClientOptions {
+  return {
+    serverUrl: cfg.serverUrl,
+    deviceId: cfg.deviceId,
+    agentType: AGENT_TYPE,
+    token: creds.refreshToken,
+    version: DAEMON_VERSION,
+    autoUpdate: true,
+    autoUpdateConfig: {
+      packageName: PACKAGE_NAME,
+      binName: CLI_NAME,
+      onBeforeUpdate: () => {
+        config.deletePidFile();
+      },
+    },
+  };
+}
+
 export async function start(options: StartOptions = {}): Promise<void> {
   if (!config.isRegistered()) {
-    console.error('Not registered. Run: cmdctrl-pi register -s <server-url>');
+    console.error(`Not registered. Run: ${CLI_NAME} register -s <server-url>`);
     process.exit(1);
   }
   if (config.isDaemonRunning()) {
@@ -66,7 +90,8 @@ export async function start(options: StartOptions = {}): Promise<void> {
   console.log(`Starting daemon for device "${cfg.deviceName}"...`);
   console.log(`Server: ${cfg.serverUrl}`);
 
-  await checkPiVersion();
+  await checkAgentCli();
+  if (AGENT_TYPE === 'omp') useSessionSource(ompSessions(ompSessionsRoot()));
 
   config.writePidFile(process.pid);
 
@@ -91,7 +116,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
       if (previous !== undefined && Date.now() - previous < PROJECT_REFRESH_INTERVAL_MS) continue;
       lastProbed.set(project, Date.now());
       try {
-        const commands = await listCommands(project);
+        const commands = await listCommands(project, AGENT_TYPE);
         for (const command of commands) knownCommands.set(command.name, command);
         if (slashCommands.record(project, commands)) changed = true;
       } catch (err) {
@@ -121,21 +146,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
   }
 
   // --- SDK client ---
-  const client = new DaemonClient({
-    serverUrl: cfg.serverUrl,
-    deviceId: cfg.deviceId,
-    agentType: AGENT_TYPE,
-    token: creds.refreshToken,
-    version: DAEMON_VERSION,
-    autoUpdate: true,
-    autoUpdateConfig: {
-      packageName: '@cmdctrl/pi',
-      binName: 'cmdctrl-pi',
-      onBeforeUpdate: () => {
-        config.deletePidFile();
-      },
-    },
-  });
+  const client = new DaemonClient(clientOptions(cfg, creds));
 
   // --- Session watcher. Emits events for active observers of a session. ---
   const watcher = new SessionWatcher(
@@ -172,15 +183,34 @@ export async function start(options: StartOptions = {}): Promise<void> {
     collapser,
   );
 
+  // --- Running turns ---
+  // A follow-up shares its session's task id and waits behind the turn before it
+  // (see agent.ts), so the SDK's own set – cleared by the first complete() – would
+  // report the session idle, and let a pending update restart the daemon, while
+  // the follow-up still waits. Count turns per task id instead, and drop each
+  // before its complete() so the status that sends is already right.
+  const inFlight = new Map<string, number>();
+  async function turn<T>(taskId: string, run: () => Promise<T>): Promise<T> {
+    inFlight.set(taskId, (inFlight.get(taskId) ?? 0) + 1);
+    try {
+      return await run();
+    } finally {
+      const left = (inFlight.get(taskId) ?? 1) - 1;
+      if (left > 0) inFlight.set(taskId, left);
+      else inFlight.delete(taskId);
+    }
+  }
+  client.setRunningTasksProvider(() => [...inFlight.keys()]);
+
   // --- Handlers ---
   client.onTaskStart(async (task) => {
     console.log(`Starting task: ${task.instruction.substring(0, 80)}`);
-    const { result } = await startTask(
+    const { result } = await turn(task.taskId, () => startTask(
       task.instruction,
       task.projectPath,
       (action, target) => task.progress(action, target),
       (piSessionId) => task.sessionStarted(piSessionId),
-    );
+    ));
     task.complete(result);
     // A template or skill the user added since startup shows up here. Kept out of
     // the task itself so a probe failure can't error a completed task.
@@ -191,12 +221,12 @@ export async function start(options: StartOptions = {}): Promise<void> {
 
   client.onTaskResume(async (task) => {
     console.log(`Resuming session ${task.sessionId}: ${task.message.substring(0, 80)}`);
-    const { result } = await resumeTask(
+    const { result } = await turn(task.taskId, () => resumeTask(
       task.sessionId,
       task.message,
       task.projectPath,
       (action, target) => task.progress(action, target),
-    );
+    ));
     task.complete(result);
     if (task.projectPath && await refreshSlashCommands([task.projectPath])) {
       client.reportSlashCommands();
@@ -281,24 +311,41 @@ export async function start(options: StartOptions = {}): Promise<void> {
   }
 }
 
-async function checkPiVersion(): Promise<void> {
-  const { VERSION: piSdkVersion } = await piSdk();
+/**
+ * Reports the agent CLI this daemon drives. A missing CLI is a warning – turns
+ * fail until it is installed – but a CLI that is the other agent is refused:
+ * driving it would mix one agent's sessions into the other's device.
+ */
+async function checkAgentCli(): Promise<void> {
   // pi writes --version to stderr, so capture both streams and keep whichever
   // has content.
   const out = spawnSync(PI_BIN, ['--version'], { encoding: 'utf-8' });
   if (out.error || out.status !== 0) {
     console.warn(
-      `Unable to detect pi CLI version at "${PI_BIN}": ${out.error?.message ?? `exit ${out.status}`}. ` +
-        `Install @mariozechner/pi-coding-agent globally or set PI_BIN.`,
+      `${AGENT_TYPE} not found: could not run "${PI_BIN}" (${out.error?.message ?? `exit ${out.status}`}). ` +
+        `Install ${AGENT_TYPE}, or set ${BIN_ENV} to its path; sessions cannot start until then.`,
     );
     return;
   }
   const cliVersion = (out.stdout || out.stderr || '').trim();
   if (!cliVersion) return;
+  const actual = flavorFromVersion(cliVersion);
+  if (actual !== AGENT_TYPE) {
+    console.error(
+      `"${PI_BIN}" is ${actual} (${cliVersion}), but ${CLI_NAME} drives ${AGENT_TYPE}. ` +
+        `Point ${BIN_ENV} at ${AGENT_TYPE}, or use @cmdctrl/${actual} for ${actual}.`,
+    );
+    process.exit(1);
+  }
+  if (AGENT_TYPE === 'omp') {
+    console.log(`Driving ${cliVersion} at "${PI_BIN}", sessions in ${ompSessionsRoot()}`);
+    return;
+  }
+  const { VERSION: piSdkVersion } = await piSdk();
   if (cliVersion !== piSdkVersion) {
     console.warn(
       `pi CLI ${cliVersion} differs from bundled SDK ${piSdkVersion}. ` +
-        `If session reads fail, upgrade @cmdctrl/pi to match the CLI.`,
+        `If session reads fail, upgrade ${PACKAGE_NAME} to match the CLI.`,
     );
   }
 }

@@ -34,6 +34,11 @@ export interface CollapsibleCommand {
   name: string;
   /** The template body. Commands without one (skills, extensions) are ignored here. */
   template?: string;
+  /**
+   * The agent appends the arguments, after a blank line, to a template with no
+   * placeholder – omp's `appendInlineArgsFallback`. pi drops them instead.
+   */
+  argsAppended?: boolean;
 }
 
 interface CompiledTemplate {
@@ -44,6 +49,8 @@ interface CompiledTemplate {
   suffix: string;
   /** exact: no placeholder; args: one, so they can be read back; prefix: several. */
   mode: 'exact' | 'args' | 'prefix';
+  /** exact only: arguments may follow the template after a blank line. */
+  argsAppended?: boolean;
 }
 
 export class CommandCollapser {
@@ -64,8 +71,11 @@ export class CommandCollapser {
       const markers = [...template.matchAll(PLACEHOLDER)];
       if (markers.length === 0) {
         // pi substitutes nothing and appends nothing, so the expansion is the
-        // template itself – an exact comparison, safe at any length.
-        compiled.push({ name: command.name, prefix: template, suffix: '', mode: 'exact' });
+        // template itself – an exact comparison, safe at any length. omp appends
+        // any arguments after a blank line; reading those back is only as safe as
+        // the template is long.
+        const argsAppended = command.argsAppended === true && template.length >= MIN_TEMPLATE_TEXT;
+        compiled.push({ name: command.name, prefix: template, suffix: '', mode: 'exact', ...(argsAppended ? { argsAppended } : {}) });
         continue;
       }
 
@@ -105,6 +115,9 @@ export class CommandCollapser {
     for (const template of this.templates) {
       if (template.mode === 'exact') {
         if (trimmed === template.prefix) return `/${template.name}`;
+        if (template.argsAppended && trimmed.startsWith(`${template.prefix}\n\n`)) {
+          return invocation(template.name, trimmed.slice(template.prefix.length).trim());
+        }
         continue;
       }
       if (!trimmed.startsWith(template.prefix)) continue;

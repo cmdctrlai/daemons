@@ -2,12 +2,12 @@
  * Status command - show registration and daemon status.
  */
 
-import { config } from '../context';
+import { CLI_NAME, config } from '../context';
 
 export function status(): void {
   if (!config.isRegistered()) {
     console.log('Status: Not registered');
-    console.log('Run: cmdctrl-pi register -s <server-url>');
+    console.log(`Run: ${CLI_NAME} register -s <server-url>`);
     return;
   }
 

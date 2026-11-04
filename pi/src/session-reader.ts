@@ -1,31 +1,28 @@
 /**
- * Session access backed by pi's own SessionManager.
+ * Session access for the pi family.
  *
- * Pi owns session storage (`~/.pi/agent/sessions/<cwd-slug>/<ts>_<id>.jsonl`).
- * We read via its public API – no path math, no JSONL parsing. Sessions
- * created here show up in `pi --resume` unchanged.
+ * The agent owns session storage (`~/.pi/agent/sessions/` for pi, `~/.omp/agent/sessions/`
+ * for omp). We read through `session-source.ts` – pi's own SessionManager for pi – so
+ * sessions created here show up in the agent's `--resume` unchanged.
  */
 
 import * as path from 'path';
-import type {
-  SessionInfo as PiSessionInfo,
-  SessionEntry,
-  SessionMessageEntry,
-} from '@mariozechner/pi-coding-agent';
 import type { MessageEntry, SessionInfo as DaemonSessionInfo } from '@cmdctrl/daemon-sdk';
-import { piSdk } from './pi-sdk';
+import { sessionSource, type StoredEntry, type StoredSession } from './session-source';
 import type { CommandCollapser } from './command-collapse';
 
-/** Locate the on-disk path for a pi session id. Optional cwd narrows the scan. */
+/**
+ * Locate the on-disk path for a session id. Optional cwd narrows the scan; a miss
+ * there falls back to every session, because the agent buckets by the canonical
+ * cwd and a project path reached through a symlink names a different bucket.
+ */
 export async function resolveSessionPath(
-  piSessionId: string,
+  sessionId: string,
   cwd?: string
-): Promise<PiSessionInfo | undefined> {
-  const { SessionManager } = await piSdk();
-  const candidates = cwd
-    ? await SessionManager.list(cwd)
-    : await SessionManager.listAll();
-  return candidates.find(s => s.id === piSessionId);
+): Promise<StoredSession | undefined> {
+  const source = sessionSource();
+  const scoped = cwd ? (await source.list(cwd)).find(s => s.id === sessionId) : undefined;
+  return scoped ?? (await source.list()).find(s => s.id === sessionId);
 }
 
 /**
@@ -34,7 +31,7 @@ export async function resolveSessionPath(
  * progress events during task runs and aren't part of the chat transcript.
  */
 export async function readMessages(
-  piSessionId: string,
+  sessionId: string,
   opts: {
     cwd?: string;
     limit: number;
@@ -49,22 +46,10 @@ export async function readMessages(
   oldestUuid?: string;
   newestUuid?: string;
 }> {
-  const info = await resolveSessionPath(piSessionId, opts.cwd);
+  const info = await resolveSessionPath(sessionId, opts.cwd);
   if (!info) return { messages: [], hasMore: false };
 
-  const { SessionManager, CURRENT_SESSION_VERSION, VERSION: PI_SDK_VERSION } = await piSdk();
-  const mgr = SessionManager.open(info.path);
-  const header = mgr.getHeader();
-  if (header?.version != null && header.version > CURRENT_SESSION_VERSION) {
-    throw new Error(
-      `pi session ${piSessionId} was written with file-format v${header.version}; ` +
-        `this daemon bundles pi SDK ${PI_SDK_VERSION} (reads up to v${CURRENT_SESSION_VERSION}). ` +
-        `Upgrade @cmdctrl/pi.`
-    );
-  }
-
-  let mapped = mgr
-    .getEntries()
+  let mapped = (await sessionSource().entries(info.path))
     .filter(isMessage)
     .map(entry => toMessageEntry(entry, opts.collapser))
     .filter((m): m is MessageEntry => m !== null);
@@ -91,16 +76,15 @@ export async function readMessages(
 /**
  * SDK-shaped list of sessions for setSessionsProvider / report_sessions.
  *
- * pi has no notion of a child or subtask session – its tools are read, bash, edit,
- * write, grep, find and ls, and nothing in the daemon's path forks – so every
- * session here is one a person started. Forks carry `parentSessionPath` and are
+ * Every session listed is one a person started. pi has no child or subtask
+ * session at all; omp's subagents write their transcripts inside the parent
+ * session's artifact directory, which the listing does not descend into. Forks are
  * deliberately kept: a fork is a branch the user made in the TUI, not machinery.
  */
 export async function listReportedSessions(
   collapser?: CommandCollapser
 ): Promise<DaemonSessionInfo[]> {
-  const { SessionManager } = await piSdk();
-  const all = await SessionManager.listAll();
+  const all = await sessionSource().list();
   return all.map(info => {
     // firstMessage is the raw stored text, so a session opened with a command
     // would otherwise be titled with the command's whole expansion.
@@ -121,12 +105,12 @@ export async function listReportedSessions(
   });
 }
 
-function isMessage(entry: SessionEntry): entry is SessionMessageEntry {
+function isMessage(entry: StoredEntry): boolean {
   return entry.type === 'message';
 }
 
 function toMessageEntry(
-  entry: SessionMessageEntry,
+  entry: StoredEntry,
   collapser?: CommandCollapser
 ): MessageEntry | null {
   const msg: any = entry.message;

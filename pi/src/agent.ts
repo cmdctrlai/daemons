@@ -2,21 +2,22 @@
  * Pi agent integration.
  *
  * Spawns the `pi` CLI in JSON event-stream mode (`--mode json -p`) for each
- * task. Pi owns session storage: on a fresh task we pass no `--session`, and
+ * task, with the user's message on stdin. Pi owns session storage: on a fresh task we pass no `--session`, and
  * pi writes the new session file at `~/.pi/agent/sessions/<cwd-slug>/<ts>_<id>.jsonl`.
  * We capture the session id from the first `{"type":"session",...}` event in
  * the event stream and surface it as our native session id. On resume, we
  * point pi at the same file via `--session <path>`, which we resolve through
- * `SessionManager.list(cwd)` – no hand-rolled path math and the session
- * remains visible to `pi --resume`.
+ * the active session source – no hand-rolled path math and the session remains
+ * visible to `pi --resume`. omp takes the same flags and writes under `~/.omp/agent/`.
  */
 
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as readline from 'readline';
 import * as fs from 'fs';
-import { PI_BIN } from './context';
+import { AGENT_TYPE, PI_BIN } from './context';
 import { resolveSessionPath } from './session-reader';
+import { sessionSource } from './session-source';
 
 export type ProgressFn = (action: string, target: string) => void;
 
@@ -48,18 +49,23 @@ interface RunOpts {
 async function runPi(prompt: string, opts: RunOpts): Promise<RunResult> {
   const args = ['--mode', 'json', '-p'];
   if (opts.sessionPath) args.push('--session', opts.sessionPath);
-  args.push(prompt);
 
+  // The message goes on stdin, never in argv: as an argument, one that starts
+  // with `-` is read as a flag and one that starts with `@` as a file to attach.
+  // A `--` separator is not enough – pi still reads `@` as a file after it.
   const child = spawn(PI_BIN, args, {
     cwd: opts.cwd,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
     env: process.env,
   });
+  child.stdin!.on('error', () => { /* the agent exited before reading; its exit code says why */ });
+  child.stdin!.end(prompt);
   running.set(opts.runKey, child);
 
   const rl = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
 
   let collected = '';
+  let modelError: string | undefined;
   let stderrBuf = '';
   let sessionId: string | undefined;
 
@@ -90,8 +96,11 @@ async function runPi(prompt: string, opts: RunOpts): Promise<RunResult> {
       }
       case 'message_end': {
         const msg = event.message;
-        if (msg?.role === 'assistant' && Array.isArray(msg.content)) {
-          for (const block of msg.content) {
+        if (msg?.role === 'assistant') {
+          // A failed model call ends the turn with exit code 0; the error is only here.
+          // A retry that succeeds clears it.
+          modelError = msg.stopReason === 'error' ? String(msg.errorMessage || 'The model request failed') : undefined;
+          for (const block of Array.isArray(msg.content) ? msg.content : []) {
             if (block?.type === 'text' && typeof block.text === 'string') {
               collected += (collected ? '\n\n' : '') + block.text;
             }
@@ -114,18 +123,20 @@ async function runPi(prompt: string, opts: RunOpts): Promise<RunResult> {
       child.on('close', (code) => resolve(code ?? 0));
     });
 
+    if (modelError) throw new Error(modelError);
+
     if (exitCode !== 0 && !collected) {
       const tail = stderrBuf.trim().split('\n').slice(-5).join('\n');
-      throw new Error(`pi exited with code ${exitCode}${tail ? `: ${tail}` : ''}`);
+      throw new Error(`${AGENT_TYPE} exited with code ${exitCode}${tail ? `: ${tail}` : ''}`);
     }
 
     if (!sessionId) {
-      throw new Error('pi did not emit a session event – cannot track session id');
+      throw new Error(`${AGENT_TYPE} did not emit a session event – cannot track session id`);
     }
 
     return {
       sessionId,
-      result: collected || '(pi produced no assistant text)',
+      result: collected || `(${AGENT_TYPE} produced no assistant text)`,
     };
   } finally {
     running.delete(opts.runKey);
@@ -164,6 +175,33 @@ function describeToolTarget(name: string, args: any): string {
   }
 }
 
+/**
+ * One agent process per session at a time. The app keeps its composer open while
+ * a turn runs, so a follow-up can arrive mid-turn; run at once, it would be a
+ * second writer on the same session – omp moves it to a continuation that then
+ * diverges from the original, pi interleaves two branches in one file. Each
+ * session's turns therefore run one after another: the tail of its queue.
+ */
+const turns = new Map<string, Promise<void>>();
+
+/** Bumped by cancelTask: a turn queued before the stop is dropped, not run. */
+const stops = new Map<string, number>();
+
+function queueTurn<T>(sessionId: string, run: () => Promise<T>): Promise<T> {
+  const before = turns.get(sessionId) ?? Promise.resolve();
+  const stopsWhenQueued = stops.get(sessionId) ?? 0;
+  const result = before.then(() => {
+    if ((stops.get(sessionId) ?? 0) !== stopsWhenQueued) {
+      throw new Error('Not sent: the session was stopped while this message waited for the turn before it.');
+    }
+    return run();
+  });
+  const settled = result.then(() => undefined, () => undefined);
+  turns.set(sessionId, settled);
+  void settled.then(() => { if (turns.get(sessionId) === settled) turns.delete(sessionId); });
+  return result;
+}
+
 /** Start a fresh pi session. Pi allocates the session id; we capture it. */
 export async function startTask(
   instruction: string,
@@ -176,52 +214,73 @@ export async function startTask(
   // its session id. cancelTask uses pi's id once it's known; the initial
   // window before sessionStarted is vanishingly small.
   const runKey = `start:${Date.now()}:${Math.random()}`;
-  const result = await runPi(instruction, {
-    cwd,
-    onProgress,
-    onSessionId: (id) => {
-      // Re-key the running child under pi's id so cancelTask works.
-      const child = running.get(runKey);
-      if (child) {
-        running.delete(runKey);
-        running.set(id, child);
-      }
-      onSessionId(id);
-    },
-    runKey,
-  });
-  return result;
+  // A follow-up can only name this session once its id is known, so that is
+  // when this turn becomes the head of the session's queue.
+  let ended!: () => void;
+  const finished = new Promise<void>(resolve => { ended = resolve; });
+  let sessionId: string | undefined;
+  try {
+    return await runPi(instruction, {
+      cwd,
+      onProgress,
+      onSessionId: (id) => {
+        sessionId = id;
+        if (!turns.has(id)) turns.set(id, finished);
+        // Re-key the running child under pi's id so cancelTask works.
+        const child = running.get(runKey);
+        if (child) {
+          running.delete(runKey);
+          running.set(id, child);
+        }
+        onSessionId(id);
+      },
+      runKey,
+    });
+  } finally {
+    ended();
+    if (sessionId && turns.get(sessionId) === finished) turns.delete(sessionId);
+  }
 }
 
-/** Follow-up turn on an existing pi session. */
-export async function resumeTask(
+/** Follow-up turn on an existing pi session; waits for any turn already running on it. */
+export function resumeTask(
   sessionId: string,
   message: string,
   projectPath: string | undefined,
   onProgress: ProgressFn
 ): Promise<RunResult> {
-  const info = await resolveSessionPath(sessionId, projectPath);
-  if (!info) {
-    throw new Error(`pi session ${sessionId} not found (expected in ~/.pi/agent/sessions/)`);
-  }
-  if (!fs.existsSync(info.path)) {
-    throw new Error(`pi session file missing: ${info.path}`);
-  }
-  const cwd = validateProjectPath(projectPath) || info.cwd || process.cwd();
-  return runPi(message, {
-    cwd,
-    sessionPath: info.path,
-    onProgress,
-    runKey: sessionId,
+  return queueTurn(sessionId, async () => {
+    // Resolved only now: the turn before may have moved the session (an omp continuation).
+    const source = sessionSource();
+    const info = await resolveSessionPath(sessionId, projectPath);
+    if (!info) {
+      throw new Error(`${source.agent} session ${sessionId} not found (expected in ${source.location})`);
+    }
+    if (!fs.existsSync(info.path)) {
+      throw new Error(`${source.agent} session file missing: ${info.path}`);
+    }
+    const cwd = validateProjectPath(projectPath) || info.cwd || process.cwd();
+    return runPi(message, {
+      cwd,
+      sessionPath: info.path,
+      onProgress,
+      runKey: sessionId,
+    });
   });
 }
 
+/**
+ * Stop the session: end the running turn, and drop any follow-up still waiting
+ * behind it (each fails with a message saying it was not sent).
+ */
 export function cancelTask(sessionId: string): void {
+  stops.set(sessionId, (stops.get(sessionId) ?? 0) + 1);
   const child = running.get(sessionId);
   if (!child) return;
   child.kill('SIGTERM');
+  // runPi drops the child from `running` when it exits; still there means it
+  // ignored SIGTERM, and the session's next turn is waiting on it.
   setTimeout(() => {
-    if (running.has(sessionId)) child.kill('SIGKILL');
+    if (running.get(sessionId) === child) child.kill('SIGKILL');
   }, 2000).unref();
-  running.delete(sessionId);
 }

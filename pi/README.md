@@ -1,13 +1,13 @@
 # @cmdctrl/pi
 
-Cmd+Ctrl daemon for the [pi coding agent](https://shittycodingagent.ai/).
+Cmd+Ctrl daemon for the [pi coding agent](https://pi.dev). For its fork [oh-my-pi](https://omp.sh), use [`@cmdctrl/omp`](https://www.npmjs.com/package/@cmdctrl/omp).
 
 ## Prerequisites
 
 `pi` installed and authenticated:
 
 ```bash
-npm install -g @mariozechner/pi-coding-agent
+npm install -g @earendil-works/pi-coding-agent
 pi          # run once and /login, or set a provider env var
 ```
 

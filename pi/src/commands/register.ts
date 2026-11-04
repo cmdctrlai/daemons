@@ -11,7 +11,7 @@
 
 import * as os from 'os';
 import { registerDevice, displayVerification } from '@cmdctrl/daemon-sdk';
-import { AGENT_TYPE, config } from '../context';
+import { AGENT_TYPE, CLI_NAME, config } from '../context';
 
 interface RegisterOptions {
   server: string;
@@ -59,5 +59,5 @@ export async function register(options: RegisterOptions): Promise<void> {
 
   console.log('\n\nRegistration complete!');
   console.log(`Device ID: ${result.deviceId}`);
-  console.log(`\nRun 'cmdctrl-pi start' to connect.`);
+  console.log(`\nRun '${CLI_NAME} start' to connect.`);
 }
