@@ -33,6 +33,17 @@
  * | `prompt` | Works. `/reviewdiff Widget` against a project-local `.pi/prompts/reviewdiff.md` expanded, ran a turn and returned assistant text. The stored user message is the expansion, so `CommandCollapser` puts the invocation back. |
  * | `skill` | Works. `/skill:probeskill please` expanded into pi's `<skill …>` block, ran a turn (the model read the SKILL.md and answered) and returned assistant text. The block is likewise collapsed back to `/skill:probeskill please`. |
  *
+ * omp's catalog is mapped onto these sources in `pi-commands.ts`: its markdown
+ * `file` commands are offered as `prompt`, its `custom` and `extension` commands are
+ * withheld as `extension`, and its `builtin` and skill commands are dropped before
+ * they get here – print mode expands neither, so `/model` and `/skill:notes` reached
+ * the model as literal text.
+ * A `file` command is stored expanded, as pi's templates are; omp reports no path,
+ * so its template is found where omp itself reads commands (`omp-commands.ts`) and
+ * collapsed back, including arguments omp appended to a template with no
+ * placeholder. Only commands with no file there – the bundled `/init`, plugin
+ * commands – stay expanded.
+ *
  * Templates and skills the user adds later flow through untouched. That is the
  * point of subtracting rather than listing: they are the whole set and we cannot
  * know their names.

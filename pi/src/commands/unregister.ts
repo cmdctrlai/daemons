@@ -6,7 +6,7 @@
  */
 
 import { unregisterDevice } from '@cmdctrl/daemon-sdk';
-import { config } from '../context';
+import { CLI_NAME, config } from '../context';
 
 export async function unregister(): Promise<void> {
   if (!config.isRegistered()) {
@@ -15,7 +15,7 @@ export async function unregister(): Promise<void> {
   }
 
   if (config.isDaemonRunning()) {
-    console.error('Daemon is running. Run `cmdctrl-pi stop` first.');
+    console.error(`Daemon is running. Run \`${CLI_NAME} stop\` first.`);
     process.exit(1);
   }
 

@@ -1,17 +1,14 @@
 /**
- * File-polling watcher for pi session JSONL files.
+ * File-polling watcher for pi and omp session JSONL files.
  *
- * On each poll tick, re-opens the session via `SessionManager.open(path)` and
- * emits callbacks for entries that landed since the last read. The watcher
- * never parses JSONL itself – pi's SessionManager is the parser.
+ * On each poll tick, re-reads the session through the active session source and
+ * emits callbacks for entries that landed since the last read. The watcher never
+ * parses JSONL itself – see `session-source.ts`.
  */
 
 import * as fs from 'fs';
-import type {
-  SessionEntry,
-  SessionMessageEntry,
-} from '@mariozechner/pi-coding-agent';
-import { piSdk } from './pi-sdk';
+import * as path from 'path';
+import { sessionSource, type StoredEntry } from './session-source';
 import type { CommandCollapser } from './command-collapse';
 
 export interface AgentResponseEvent {
@@ -52,6 +49,12 @@ interface Watched {
   lastMessage: string;
   messageCount: number;
   primed: boolean;
+  /**
+   * When the session can move between files (omp continuations): the directory
+   * listing and the sizes of the other copies at the last `locate`. Any change
+   * to either is what can move the session, so only then is it located again.
+   */
+  moves?: { names: string; sizes: Map<string, number> };
 }
 
 const POLL_INTERVAL_MS = 500;
@@ -59,6 +62,8 @@ const POLL_INTERVAL_MS = 500;
 export class SessionWatcher {
   private watched: Map<string, Watched> = new Map();
   private timer: NodeJS.Timeout | null = null;
+  /** Reads are async; a slow tick must not overlap the next one. */
+  private ticking = false;
 
   /**
    * `collapser` keeps an expanded command out of the activity preview, which is
@@ -101,13 +106,50 @@ export class SessionWatcher {
   }
 
   private async tick(): Promise<void> {
-    const { SessionManager } = await piSdk();
-    for (const w of this.watched.values()) {
-      this.pollOne(w, SessionManager);
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      for (const w of [...this.watched.values()]) {
+        await this.pollOne(w);
+      }
+    } finally {
+      this.ticking = false;
     }
   }
 
-  private pollOne(w: Watched, SessionManager: typeof import('@mariozechner/pi-coding-agent').SessionManager): void {
+  /**
+   * Keep `w` on the file its session reads from. omp moves a session's next turn
+   * to a continuation file when another omp process holds the original open, and
+   * can move it back once the original goes on; history and the listing follow
+   * that, so the watcher must too. `seen` carries over: copies share entry ids,
+   * so only the turns new to this session fire.
+   */
+  private async follow(w: Watched): Promise<void> {
+    const locate = sessionSource().locate;
+    if (!locate) return;
+    let names: string;
+    try {
+      names = fs.readdirSync(path.dirname(w.filePath)).filter(f => f.endsWith('.jsonl')).sort().join('\n');
+    } catch {
+      return;
+    }
+    const last = w.moves;
+    if (last && last.names === names && [...last.sizes].every(([p, size]) => sizeOf(p) === size)) return;
+
+    const found = await locate(w.sessionId, w.filePath).catch(() => undefined);
+    if (found && found.path !== w.filePath) {
+      w.filePath = found.path;
+      w.lastSize = -1; // read the new file even if it happens to be the old one's size
+    }
+    // Sizes as locate read them: a copy written to since then reads as changed next tick.
+    const others = (found?.copies ?? []).filter(c => c.path !== w.filePath);
+    w.moves = { names, sizes: new Map(others.map(c => [c.path, c.size])) };
+  }
+
+  private async pollOne(w: Watched): Promise<void> {
+    await this.follow(w);
+    if (this.watched.get(w.sessionId) !== w) return;
+
     let size: number;
     try {
       size = fs.statSync(w.filePath).size;
@@ -117,14 +159,15 @@ export class SessionWatcher {
     if (size === w.lastSize && w.primed) return;
     w.lastSize = size;
 
-    let entries: SessionEntry[];
+    let entries: StoredEntry[];
     try {
-      const mgr = SessionManager.open(w.filePath);
-      entries = mgr.getEntries();
+      entries = await sessionSource().entries(w.filePath);
     } catch (err) {
-      // Transient parse error during pi's append – try again next tick.
+      // Transient parse error during the agent's append – try again next tick.
       return;
     }
+    // Unwatched while the read was in flight.
+    if (this.watched.get(w.sessionId) !== w) return;
 
     // On first read, seed "seen" without firing events (retrospective reads
     // are served by get_messages, not by replaying the whole history here).
@@ -144,7 +187,7 @@ export class SessionWatcher {
 
       if (!isMessage(entry)) continue;
       w.messageCount++;
-      const msg: any = (entry as SessionMessageEntry).message;
+      const msg: any = entry.message;
 
       if (msg?.role === 'assistant') {
         const text = extractText(msg.content);
@@ -190,7 +233,16 @@ export class SessionWatcher {
   }
 }
 
-function isMessage(entry: SessionEntry): entry is SessionMessageEntry {
+/** -1 for a file that is not there, so its appearance reads as a change. */
+function sizeOf(file: string): number {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return -1;
+  }
+}
+
+function isMessage(entry: StoredEntry): boolean {
   return entry.type === 'message';
 }
 
@@ -217,11 +269,11 @@ function firstToolCallName(content: unknown): string | undefined {
   return undefined;
 }
 
-function extractLastMessageText(entries: SessionEntry[], collapser?: CommandCollapser): string {
+function extractLastMessageText(entries: StoredEntry[], collapser?: CommandCollapser): string {
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
     if (!isMessage(e)) continue;
-    const msg: any = (e as SessionMessageEntry).message;
+    const msg: any = e.message;
     if (msg?.role !== 'user' && msg?.role !== 'assistant') continue;
     const text = extractText(msg.content);
     if (!text.trim()) continue;
