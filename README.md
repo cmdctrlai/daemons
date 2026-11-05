@@ -18,7 +18,7 @@ Each daemon is a lightweight background process that connects your AI agent to C
 | `@cmdctrl/codex-cli` | OpenAI Codex | `npm install -g @cmdctrl/codex-cli` |
 | `@cmdctrl/opencode` | OpenCode | `npm install -g @cmdctrl/opencode` |
 | `@cmdctrl/pi` | Pi | `npm install -g @cmdctrl/pi` |
-| `@cmdctrl/omp` | Oh My Pi | `npm install -g @cmdctrl/omp` |
+| `@cmdctrl/omp` | oh-my-pi | `npm install -g @cmdctrl/omp` |
 | `@cmdctrl/openclaw` | OpenClaw | `npm install -g @cmdctrl/openclaw` |
 
 ## Quick start
