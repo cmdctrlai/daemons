@@ -1,8 +1,8 @@
 # Cmd+Ctrl Daemons
 
-Official daemon adapters and SDK for [Cmd+Ctrl](https://cmd-ctrl.ai) – an orchestration layer that lets you manage AI coding agent sessions from your phone, browser, or Apple Watch.
+Official daemon adapters and SDK for [Cmd+Ctrl](https://cmd-ctrl.ai) – an orchestration layer that lets you manage AI agent sessions from your phone, browser, or Apple Watch.
 
-Each daemon is a lightweight background process that connects your AI coding agent to Cmd+Ctrl. Install one (or several), register with your Cmd+Ctrl account, and control your agents from anywhere.
+Each daemon is a lightweight background process that connects your AI agent to Cmd+Ctrl. Install one (or several), register with your Cmd+Ctrl account, and control your agents from anywhere.
 
 ## Official daemons
 
@@ -17,6 +17,9 @@ Each daemon is a lightweight background process that connects your AI coding age
 | `@cmdctrl/gemini-cli` | Gemini CLI | `npm install -g @cmdctrl/gemini-cli` |
 | `@cmdctrl/codex-cli` | OpenAI Codex | `npm install -g @cmdctrl/codex-cli` |
 | `@cmdctrl/opencode` | OpenCode | `npm install -g @cmdctrl/opencode` |
+| `@cmdctrl/pi` | Pi | `npm install -g @cmdctrl/pi` |
+| `@cmdctrl/omp` | Oh My Pi | `npm install -g @cmdctrl/omp` |
+| `@cmdctrl/openclaw` | OpenClaw | `npm install -g @cmdctrl/openclaw` |
 
 ## Quick start
 
@@ -59,6 +62,8 @@ npm install @cmdctrl/daemon-sdk
 See [`sdk/`](./sdk/) for the source and [`DAEMON-PROTOCOL.md`](./DAEMON-PROTOCOL.md) for the full protocol reference.
 
 ## Building a custom daemon
+
+Any AI agent can get a daemon, not just coding agents. [Build Your Own Cmd+Ctrl Daemon](https://docs.cmd-ctrl.ai/blog/build-your-own-daemon) has a prompt you can hand your own agent to write one.
 
 See [`DAEMON-PROTOCOL.md`](./DAEMON-PROTOCOL.md) for the protocol spec and [`example/`](./example/) for a minimal working implementation.
 
