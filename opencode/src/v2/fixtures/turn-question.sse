@@ -1,0 +1,44 @@
+data: {"id":"evt_194aace76001k16mSMDp2KXEcM","type":"server.connected","data":{}}
+
+data: {"id":"evt_194ab79d7001Xf9SFdb7lPxkaF","created":1793495628247,"type":"session.inbox.enqueued","location":{"directory":"/tmp/feat119/proj"},"data":{"inboxID":"msg_194ab79d60012naKKGSuEgVhKh","sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","item":{"type":"user","payload":{"text":"Use your question tool to ask me which color I prefer, with the options Red and Blue. After I answer, reply with just the color I picked."},"delivery":"steer"}},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":31,"version":1}}
+
+data: {"id":"evt_194ab79d8001agjDQnAVViEheh","created":1793495628248,"type":"session.execution.started","data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":32,"version":1}}
+
+data: {"id":"evt_194ab79da001ftKzOnRQ05eufn","created":1793495628250,"type":"session.inbox.delivered","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","inboxID":"msg_194ab79d60012naKKGSuEgVhKh"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":33,"version":1}}
+
+data: {"id":"evt_194ab7bed001Q74lNMagmUWksM","created":1793495628781,"type":"session.step.started","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","agent":"build","model":{"id":"big-pickle","providerID":"opencode"},"assistantMessageID":"msg_194ab79dc001mGyTny3J7VD5gX","started":1793495628253},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":34,"version":1}}
+
+data: {"id":"evt_194ab7bee001PBNeOASFKAgLVp","created":1793495628782,"type":"session.tool.input.started","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab79dc001mGyTny3J7VD5gX","id":"chatcmpl-tool-8627d46504c1eb18","name":"question"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":35,"version":1}}
+
+data: {"id":"evt_194ab7cdf001vHqId5VoEaZVD0","created":1793495629023,"type":"session.tool.input.ended","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab79dc001mGyTny3J7VD5gX","id":"chatcmpl-tool-8627d46504c1eb18","text":"{\"questions\": [{\"question\": \"Which color do you prefer?\", \"header\": \"Color preference\", \"options\": [{\"label\": \"Red\", \"description\": \"Choose red\"}, {\"label\": \"Blue\", \"description\": \"Choose blue\"}]}]}"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":36,"version":1}}
+
+data: {"id":"evt_194ab7ce0001ymTOrJRnyQAGfb","created":1793495629024,"type":"session.tool.called","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab79dc001mGyTny3J7VD5gX","id":"chatcmpl-tool-8627d46504c1eb18","input":{"questions":[{"question":"Which color do you prefer?","header":"Color preference","options":[{"label":"Red","description":"Choose red"},{"label":"Blue","description":"Choose blue"}]}]},"executed":false},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":37,"version":1}}
+
+data: {"id":"evt_194ab7ce2001HRPnfGcFaKzcAW","created":1793495629026,"type":"session.step.streamed","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab79dc001mGyTny3J7VD5gX"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":38,"version":1}}
+
+data: {"id":"evt_194ab7ce40026G17oHycnbH3O0","created":1793495629028,"type":"form.created","location":{"directory":"/tmp/feat119/proj"},"data":{"form":{"id":"frm_194ab7ce4001ltcNOW3BpFoehJ","sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","title":"Questions","metadata":{"kind":"question","tool":{"messageID":"msg_194ab79dc001mGyTny3J7VD5gX","id":"chatcmpl-tool-8627d46504c1eb18"}},"fields":[{"key":"q0","title":"Color preference","description":"Which color do you prefer?","type":"string","options":[{"value":"Red","label":"Red","description":"Choose red"},{"value":"Blue","label":"Blue","description":"Choose blue"}],"custom":true}]}}}
+
+data: {"id":"evt_194ab991e001geWfbRrPrsCtit","created":1793495636254,"type":"form.replied","location":{"directory":"/tmp/feat119/proj"},"data":{"id":"frm_194ab7ce4001ltcNOW3BpFoehJ","sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","answer":{"q0":"Blue"}}}
+
+data: {"id":"evt_194ab991e002elsBAj40bHZVqN","created":1793495636254,"type":"session.tool.success","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab79dc001mGyTny3J7VD5gX","id":"chatcmpl-tool-8627d46504c1eb18","content":[{"type":"text","text":"User has answered your questions: \"Which color do you prefer?\"=\"Blue\". You can now continue with the user's answers in mind."}],"metadata":{"answers":[["Blue"]],"truncated":false},"executed":false},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":39,"version":2}}
+
+data: {"id":"evt_194ab991f001Q2YkDptOocNwGS","created":1793495636255,"type":"session.step.ended","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab79dc001mGyTny3J7VD5gX","finish":"tool-calls","rawFinish":"tool_calls","tokens":{"input":106,"output":87,"reasoning":0,"cache":{"read":8192,"write":0}},"cost":0},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":40,"version":1}}
+
+data: {"id":"evt_194ab9920001nMHyjYmC4Ivbnu","created":1793495636256,"type":"session.usage.updated","data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","cost":0,"tokens":{"input":4023,"output":169,"reasoning":132,"cache":{"read":28928,"write":0}}}}
+
+data: {"id":"evt_194ab9b65001imzn3ahXdyU3Xw","created":1793495636837,"type":"session.step.started","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","agent":"build","model":{"id":"big-pickle","providerID":"opencode"},"assistantMessageID":"msg_194ab9922001Qh105I0cr0nVio","started":1793495636259},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":41,"version":1}}
+
+data: {"id":"evt_194ab9b67001qqttFNFhFqYEe2","created":1793495636839,"type":"session.text.started","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab9922001Qh105I0cr0nVio","ordinal":0},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":42,"version":1}}
+
+data: {"id":"evt_194ab9b69001rntHT0MWDdUyEU","created":1793495636841,"type":"session.text.delta","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab9922001Qh105I0cr0nVio","ordinal":0,"delta":"Blue"}}
+
+data: {"id":"evt_194ab9b69002dST99INXJqggII","created":1793495636841,"type":"session.text.ended","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab9922001Qh105I0cr0nVio","ordinal":0,"text":"Blue"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":43,"version":1}}
+
+data: {"id":"evt_194ab9b6a001JxuhBLRsIdKwzg","created":1793495636842,"type":"session.step.streamed","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab9922001Qh105I0cr0nVio"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":44,"version":1}}
+
+data: {"id":"evt_194ab9b6a002eINwlnfXRlFx72","created":1793495636842,"type":"session.step.ended","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab9922001Qh105I0cr0nVio","finish":"stop","rawFinish":"stop","tokens":{"input":103,"output":3,"reasoning":0,"cache":{"read":8320,"write":0}},"cost":0},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":45,"version":1}}
+
+data: {"id":"evt_194ab9b6b001qu765QwqCe9D0R","created":1793495636843,"type":"session.usage.updated","data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","cost":0,"tokens":{"input":4126,"output":172,"reasoning":132,"cache":{"read":37248,"write":0}}}}
+
+data: {"id":"evt_194ab9b6b002NjovIMzbA73za1","created":1793495636843,"type":"session.execution.succeeded","data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":46,"version":1}}
+

@@ -43,6 +43,26 @@ import { mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname } from 'path';
 import { SlashCommandInfo, SlashCommandSet } from '@cmdctrl/daemon-sdk';
 import type { OpenCodeCommand } from './adapter/opencode';
+import type { OpenCodeServer } from './opencode-server';
+
+/** How often commands are re-read, so one the user adds appears without a restart. */
+export const COMMAND_REFRESH_MS = 60_000;
+
+/**
+ * A project with a session this recent has its commands reloaded on every refresh;
+ * older ones keep their last set. Reloading restarts the project's MCP servers, so
+ * it is spent only where the user is working.
+ */
+const RECENT_PROJECT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Commands the daemon runs itself. opencode's terminal compacts a session on
+ * `/compact`, but its `GET /command` doesn't list it; the daemon calls opencode's
+ * summarize instead.
+ */
+export const DAEMON_COMMANDS: OpenCodeCommand[] = [
+  { name: 'compact', description: 'Summarize the conversation to free up context' },
+];
 
 /** Commands opencode advertises that do not survive the daemon path. Empty today. */
 const WITHHELD = new Set<string>();
@@ -73,10 +93,10 @@ export function filterSlashCommands(commands: OpenCodeCommand[]): SlashCommandIn
 /**
  * Remembers the command set for each project the daemon has seen.
  *
- * opencode's `GET /command` is a cheap synchronous call, so the daemon re-reads it
- * as a side effect of real work rather than probing. Keeping the set across restarts
- * still matters: otherwise every daemon update would take the menu away until the
- * next message. Pass a `cachePath` to persist it; omit it for an in-memory registry.
+ * CommandRefresher re-reads the sets on a timer. Keeping them across restarts still
+ * matters: a project the daemon has not reached yet would otherwise have no menu
+ * after every daemon update. Pass a `cachePath` to persist it; omit it for an
+ * in-memory registry.
  */
 export class SlashCommandRegistry {
   private byProject = new Map<string, SlashCommandInfo[]>();
@@ -128,6 +148,69 @@ export class SlashCommandRegistry {
       writeFileSync(this.cachePath, JSON.stringify(this.all()), 'utf-8');
     } catch (err) {
       console.error('Failed to cache slash commands:', (err as Error).message);
+    }
+  }
+}
+
+/**
+ * Keeps the registry and the adapter's command routing in step with opencode.
+ *
+ * opencode resolves commands per directory: the global built-ins and user skills
+ * merged with whatever that project defines. A session only ever sees its own
+ * project's set, so each distinct session directory is asked separately and its
+ * set recorded under that project – the API looks the set up by the session's
+ * project. Resolving only the server's own directory would key every command
+ * under wherever the daemon happens to run and match no session.
+ */
+export class CommandRefresher {
+  /** Each project's full commands, templates included, for the adapter's routing. */
+  private byProject = new Map<string, OpenCodeCommand[]>();
+
+  constructor(
+    private readonly adapter: OpenCodeServer,
+    private readonly registry: SlashCommandRegistry,
+  ) {}
+
+  /**
+   * Re-read every project's commands. Returns true when a set changed, so the
+   * caller knows a report is worth sending. Non-fatal – the daemon runs fine
+   * without a composer menu.
+   */
+  async refresh(now = Date.now()): Promise<boolean> {
+    try {
+      // Every session, including ones the app started – their projects need menus too.
+      const projects = new Map<string, boolean>();
+      for (const session of await this.adapter.listSessions(new Set())) {
+        if (!session.project) continue;
+        const recent = now - Date.parse(session.last_activity) < RECENT_PROJECT_MS;
+        projects.set(session.project, projects.get(session.project) || recent);
+      }
+      // The server's own directory covers a daemon with no sessions yet.
+      projects.set(await this.adapter.getProjectDirectory(), true);
+
+      let changed = false;
+      for (const [project, reload] of projects) {
+        if (!project) continue;
+        const commands = reload
+          ? await this.adapter.reloadCommands(project)
+          : await this.adapter.listCommands(project);
+        // A turn is running; this project keeps its set until the next refresh.
+        if (!commands) continue;
+        this.byProject.set(project, commands);
+        if (this.registry.record(project, [...commands, ...DAEMON_COMMANDS])) changed = true;
+      }
+
+      // Every project's commands, so a leading-slash message from any session
+      // routes to /command and any project's expansion can be recognised again.
+      const known = new Map<string, OpenCodeCommand>();
+      for (const commands of this.byProject.values()) {
+        for (const command of commands) known.set(command.name, command);
+      }
+      this.adapter.setCommands([...known.values()]);
+      return changed;
+    } catch (err) {
+      console.warn('Could not enumerate opencode slash commands:', (err as Error).message);
+      return false;
     }
   }
 }

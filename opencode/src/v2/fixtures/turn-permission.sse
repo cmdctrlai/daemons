@@ -1,0 +1,60 @@
+data: {"id":"evt_194aace76001k16mSMDp2KXEcM","type":"server.connected","data":{}}
+
+data: {"id":"evt_194ab1ceb0024PREGSxiQEk7Pw","created":1793495604459,"type":"session.inbox.enqueued","location":{"directory":"/tmp/feat119/proj"},"data":{"inboxID":"msg_194ab1ceb001kfF1B734bBWiPH","sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","item":{"type":"user","payload":{"text":"Use your shell tool to run: ls -la. Then tell me how many entries it printed."},"delivery":"steer"}},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":13,"version":1}}
+
+data: {"id":"evt_194ab1cec001b4P0BGPD1LYvoP","created":1793495604460,"type":"session.execution.started","data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":14,"version":1}}
+
+data: {"id":"evt_194ab1cee001e3MnlRTX4S4Zg7","created":1793495604462,"type":"session.inbox.delivered","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","inboxID":"msg_194ab1ceb001kfF1B734bBWiPH"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":15,"version":1}}
+
+data: {"id":"evt_194ab25390012wRd4rANTGC2oK","created":1793495606585,"type":"session.step.started","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","agent":"build","model":{"id":"big-pickle","providerID":"opencode"},"assistantMessageID":"msg_194ab1cf00012vt689C3F2qT1V","started":1793495604466},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":16,"version":1}}
+
+data: {"id":"evt_194ab253a0010u45o5Vp12LXOg","created":1793495606586,"type":"session.tool.input.started","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab1cf00012vt689C3F2qT1V","id":"chatcmpl-tool-9d04cf30bd1fc42d","name":"shell"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":17,"version":1}}
+
+data: {"id":"evt_194ab258e0019UYbIdC57lmmif","created":1793495606670,"type":"session.tool.input.ended","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab1cf00012vt689C3F2qT1V","id":"chatcmpl-tool-9d04cf30bd1fc42d","text":"{\"command\": \"ls -la\"}"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":18,"version":1}}
+
+data: {"id":"evt_194ab258f0015tdXESQc5Y4OPz","created":1793495606671,"type":"session.tool.called","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab1cf00012vt689C3F2qT1V","id":"chatcmpl-tool-9d04cf30bd1fc42d","input":{"command":"ls -la"},"executed":false},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":19,"version":1}}
+
+data: {"id":"evt_194ab2590001MgH6ucgtPenaae","created":1793495606672,"type":"session.step.streamed","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab1cf00012vt689C3F2qT1V"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":20,"version":1}}
+
+data: {"id":"evt_194ab2592001GcnxXy2lbgie30","created":1793495606674,"type":"permission.asked","location":{"directory":"/tmp/feat119/proj"},"data":{"id":"per_194ab25910014L925gKLcGuQNr","sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","action":"shell","resources":["ls -la"],"save":["ls *"],"source":{"type":"tool","messageID":"msg_194ab1cf00012vt689C3F2qT1V","id":"chatcmpl-tool-9d04cf30bd1fc42d"}}}
+
+data: {"id":"evt_194ab5ac1001Tax9hfiYdHHDWo","created":1793495620289,"type":"permission.replied","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","requestID":"per_194ab25910014L925gKLcGuQNr","reply":"once"}}
+
+data: {"id":"evt_194ab5ac2001L94a55EJDlXGuw","created":1793495620290,"type":"shell.created","location":{"directory":"/tmp/feat119/proj"},"data":{"info":{"id":"sh_194ab5ac1002YB9azxeNbNWyke","status":"running","command":"ls -la","cwd":"/tmp/feat119/proj","shell":"/bin/bash","file":"/tmp/feat119/xdg/data/opencode/shell/global/sh_194ab5ac1002YB9azxeNbNWyke.out","metadata":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI"},"time":{"started":1793495620289}}}}
+
+data: {"id":"evt_194ab5ac3001kA40m6yVbORvJn","created":1793495620291,"type":"session.tool.progress","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab1cf00012vt689C3F2qT1V","id":"chatcmpl-tool-9d04cf30bd1fc42d","metadata":{"shellID":"sh_194ab5ac1002YB9azxeNbNWyke"}}}
+
+data: {"id":"evt_194ab5ac8001Hi8N0jtrlhPGPP","created":1793495620296,"type":"shell.exited","location":{"directory":"/tmp/feat119/proj"},"data":{"id":"sh_194ab5ac1002YB9azxeNbNWyke","exit":0,"status":"exited"}}
+
+data: {"id":"evt_194ab5ac8002cp2e5pPjv1vWjG","created":1793495620296,"type":"session.tool.success","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab1cf00012vt689C3F2qT1V","id":"chatcmpl-tool-9d04cf30bd1fc42d","content":[{"type":"text","text":"total 8\ndrwxr-xr-x@  4 user  wheel  128 Oct 31 19:11 .\ndrwxr-xr-x@ 12 user  wheel  384 Oct 31 19:13 ..\ndrwxr-xr-x@  9 user  wheel  288 Oct 31 19:11 .git\n-rw-r--r--@  1 user  wheel    6 Oct 31 19:11 README.md\n"}],"metadata":{"status":"completed","truncated":false,"exit":0},"executed":false},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":21,"version":2}}
+
+data: {"id":"evt_194ab5aca0014eNT7MghikNt4a","created":1793495620298,"type":"session.step.ended","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab1cf00012vt689C3F2qT1V","finish":"tool-calls","rawFinish":"tool_calls","tokens":{"input":81,"output":40,"reasoning":0,"cache":{"read":7936,"write":0}},"cost":0},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":22,"version":1}}
+
+data: {"id":"evt_194ab5acb001YAcOTGshWhvssc","created":1793495620299,"type":"session.usage.updated","data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","cost":0,"tokens":{"input":3680,"output":50,"reasoning":73,"cache":{"read":12800,"write":0}}}}
+
+data: {"id":"evt_194ab5ce0001c9xYAUP0Tyx2Jm","created":1793495620832,"type":"session.step.started","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","agent":"build","model":{"id":"big-pickle","providerID":"opencode"},"assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","started":1793495620303},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":23,"version":1}}
+
+data: {"id":"evt_194ab5ce1001xZFVXDf8oZGUL1","created":1793495620833,"type":"session.reasoning.started","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","ordinal":0,"native":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":24,"version":1}}
+
+data: {"id":"evt_194ab5d47001N2Ur7Y13zzIKs0","created":1793495620935,"type":"session.reasoning.delta","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","ordinal":0,"delta":"Count entries printed: the `ls -la` output includes a \"total 8\" line plus 4 entries"}}
+
+data: {"id":"evt_194ab5db6001Ddivklycmdojpx","created":1793495621046,"type":"session.reasoning.delta","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","ordinal":0,"delta":" (. , .. , .git, README.md). The question: \"how many entries it printed\". Typically 4 entries (including ."}}
+
+data: {"id":"evt_194ab5e0f001AOV6Y6O36zILnu","created":1793495621135,"type":"session.reasoning.delta","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","ordinal":0,"delta":" and ..). Let me answer clearly."}}
+
+data: {"id":"evt_194ab5e0f002SsPJhjKkmVV3ud","created":1793495621135,"type":"session.text.started","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","ordinal":0},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":25,"version":1}}
+
+data: {"id":"evt_194ab5e6c001xTgK3i4hoERUOt","created":1793495621228,"type":"session.reasoning.ended","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","ordinal":0,"text":"Count entries printed: the `ls -la` output includes a \"total 8\" line plus 4 entries (. , .. , .git, README.md). The question: \"how many entries it printed\". Typically 4 entries (including . and ..). Let me answer clearly.","native":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":26,"version":1}}
+
+data: {"id":"evt_194ab5e6d001wLNbSD7ZAs94gz","created":1793495621229,"type":"session.text.delta","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","ordinal":0,"delta":"It printed **4 entries**: `.`, `..`, `.git`, and `README.md` (plus a `total 8` summary line)."}}
+
+data: {"id":"evt_194ab5e6d002WcJJ6YBUPxQFd7","created":1793495621229,"type":"session.text.ended","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","ordinal":0,"text":"It printed **4 entries**: `.`, `..`, `.git`, and `README.md` (plus a `total 8` summary line)."},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":27,"version":1}}
+
+data: {"id":"evt_194ab5e6d0036TtVzI0MD2hBn1","created":1793495621229,"type":"session.step.streamed","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":28,"version":1}}
+
+data: {"id":"evt_194ab5e6e001XIh1vceiKSLHi9","created":1793495621230,"type":"session.step.ended","location":{"directory":"/tmp/feat119/proj"},"data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","assistantMessageID":"msg_194ab5acd001iDiY6eRk6jYmEn","finish":"stop","rawFinish":"stop","tokens":{"input":237,"output":32,"reasoning":59,"cache":{"read":7936,"write":0}},"cost":0},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":29,"version":1}}
+
+data: {"id":"evt_194ab5e6e00248JuWe1ctTlfmt","created":1793495621230,"type":"session.usage.updated","data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI","cost":0,"tokens":{"input":3917,"output":82,"reasoning":132,"cache":{"read":20736,"write":0}}}}
+
+data: {"id":"evt_194ab5e6f0015Hip5sYt01S183","created":1793495621231,"type":"session.execution.succeeded","data":{"sessionID":"ses_e6b552f8effeFw7O2cQqQ1CroI"},"durable":{"aggregateID":"ses_e6b552f8effeFw7O2cQqQ1CroI","seq":30,"version":1}}
+

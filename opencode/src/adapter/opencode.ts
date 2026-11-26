@@ -1,9 +1,16 @@
-import { ChildProcess, spawn, execFileSync } from 'child_process';
+import { ChildProcess, spawn } from 'child_process';
 import { existsSync } from 'fs';
+import { homedir } from 'os';
 import { join } from 'path';
-import type { SessionInfo, MessageEntry } from '@cmdctrl/daemon-sdk';
+import type { SessionInfo } from '@cmdctrl/daemon-sdk';
+import type { DiffTurn } from '@cmdctrl/daemon-sdk';
+import {
+  diffTurns, errorText, extractText, page, toEntries, turnState,
+  type Entry, type OpenCodeMessage, type QuestionInfo, type TurnState,
+} from './transcript';
 
-const OPENCODE_DB = join(process.env.HOME || '~', '.local', 'share', 'opencode', 'opencode.db');
+/** How many of the user's most recent sessions the app's list is offered. */
+const SESSION_LIST_LIMIT = 200;
 
 /** What opencode substitutes the user's arguments for when expanding a command. */
 const ARGUMENTS_PLACEHOLDER = '$ARGUMENTS';
@@ -15,30 +22,52 @@ const ARGUMENTS_PLACEHOLDER = '$ARGUMENTS';
  */
 const MIN_TEMPLATE_PREFIX = 24;
 
+/**
+ * Where opencode keeps every session's transcript. The server watches a session
+ * only once the daemon names the file behind it.
+ */
+export const TRANSCRIPT_FILE = join(
+  process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'opencode', 'opencode.db',
+);
+
+/** How many sessions' transcripts the list reads at once when they changed. */
+const LIST_READ_CONCURRENCY = 8;
+/** Enough of a transcript's tail to tell where its turn stands and preview it. */
+const LIST_TAIL_MESSAGES = 5;
+
 export interface GetMessagesResponse {
-  messages: MessageEntry[];
+  messages: Entry[];
   hasMore: boolean;
 }
 
-interface OpenCodeMessagePart {
-  type: string;
-  text?: string;
-  /**
-   * opencode's own flag for text it generated to keep a turn moving – the
-   * "Summarize the task tool output above and continue with your task." nudge
-   * after a subtask, for instance. The user never typed it, so it is machinery
-   * rather than conversation and is dropped rather than shown as their message.
-   */
-  synthetic?: boolean;
+/** What a finished turn produced: its final text, or the error it ended on. */
+export interface TurnResult {
+  text: string;
+  error?: string;
 }
 
-interface OpenCodeMessage {
-  info: {
-    id: string;
-    role: string;
-    time: { created: number };
-  };
-  parts: OpenCodeMessagePart[];
+/** A tool call opencode is holding until the user allows it. */
+export interface PermissionRequest {
+  id: string;
+  sessionID: string;
+  permission: string;
+  patterns?: string[];
+}
+
+/** Questions the model asked with opencode's question tool, held until answered. */
+export interface QuestionRequest {
+  id: string;
+  sessionID: string;
+  questions: QuestionInfo[];
+  /** The question tool call holding the request; its id names the question's entries. */
+  tool?: { messageID: string; callID: string };
+}
+
+/** A session's conversation as the app counts it, and where its turn stands. */
+export interface SessionActivity {
+  count: number;
+  last?: Entry;
+  state: TurnState;
 }
 
 interface OpenCodeSession {
@@ -47,6 +76,14 @@ interface OpenCodeSession {
   slug?: string;
   directory?: string;
   time?: { updated: number };
+}
+
+/** An image attachment as opencode takes it: a file part carrying a data URL. */
+interface OpenCodeFilePart {
+  type: 'file';
+  mime: string;
+  filename: string;
+  url: string;
 }
 
 /**
@@ -69,6 +106,14 @@ export interface OpenCodeCommand {
   subtask?: boolean;
 }
 
+/**
+ * The environment the daemon runs opencode in: opencode's own installer puts the
+ * binary in ~/.opencode/bin, which comes before the rest of PATH.
+ */
+export function opencodeEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...env, PATH: `${env.HOME}/.opencode/bin:${env.PATH || '/usr/local/bin:/usr/bin:/bin'}` };
+}
+
 export class OpenCodeAdapter {
   private port: number = 0;
   private serverProcess: ChildProcess | null = null;
@@ -85,17 +130,31 @@ export class OpenCodeAdapter {
     mode: 'exact' | 'args' | 'prefix';
   }> = [];
 
+  /**
+   * Whether a turn is running in a project. Reloading opencode's commands
+   * disposes the project's instance, which aborts any turn running in it.
+   */
+  busy: (directory: string) => boolean = () => false;
+  /** A command reload under way, which a new turn waits out rather than lose. */
+  private reloading: Promise<unknown> = Promise.resolve();
+  /** The tail of each listed session's transcript, kept until opencode touches it again. */
+  private tails = new Map<string, { updated: number; messages: OpenCodeMessage[] }>();
+
+  /** The opencode server this adapter talks to. */
+  get url(): string {
+    return this.baseUrl;
+  }
+
+  /** Pass the URL of an opencode server that is already running; otherwise call startServer. */
+  constructor(baseUrl = '') {
+    this.baseUrl = baseUrl;
+  }
+
   async startServer(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const homeBin = `${process.env.HOME}/.opencode/bin`;
-      const env = {
-        ...process.env,
-        PATH: `${homeBin}:${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`,
-      };
-
       const proc = spawn('opencode', ['serve', '--port', '0'], {
         stdio: ['ignore', 'pipe', 'pipe'],
-        env,
+        env: opencodeEnv(),
       });
 
       this.serverProcess = proc;
@@ -142,8 +201,19 @@ export class OpenCodeAdapter {
     }
   }
 
-  async createSession(): Promise<string> {
-    const response = await fetch(`${this.baseUrl}/session`, {
+  /**
+   * Start a session in the project the user picked. A path this machine doesn't
+   * have falls back to the server's own directory rather than failing the task.
+   */
+  async createSession(projectPath?: string): Promise<string> {
+    let url = `${this.baseUrl}/session`;
+    if (projectPath && existsSync(projectPath)) {
+      url += `?directory=${encodeURIComponent(projectPath)}`;
+    } else if (projectPath) {
+      console.warn(`Project path does not exist: ${projectPath}; using the daemon's directory`);
+    }
+
+    const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
@@ -174,6 +244,48 @@ export class OpenCodeAdapter {
       throw new Error(`Failed to list commands: HTTP ${response.status}`);
     }
     return await response.json() as OpenCodeCommand[];
+  }
+
+  /**
+   * Like listCommands, but sees a command the user added since opencode last read
+   * this project. opencode loads commands once per project instance and offers no
+   * reload, so the instance is disposed and the listing builds a fresh one.
+   *
+   * Disposing aborts any turn running in it, so this returns null without
+   * touching opencode while one is; try again later.
+   */
+  async reloadCommands(directory: string): Promise<OpenCodeCommand[] | null> {
+    if (this.busy(directory)) return null;
+    // The daemon may start a turn here while the status is read.
+    if ((await this.running(directory)) || this.busy(directory)) return null;
+
+    const reload = (async () => {
+      const response = await fetch(
+        `${this.baseUrl}/instance/dispose?directory=${encodeURIComponent(directory)}`,
+        { method: 'POST' },
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to reload commands: HTTP ${response.status}`);
+      }
+      return this.listCommands(directory);
+    })();
+    this.reloading = reload.catch(() => undefined);
+    return reload;
+  }
+
+  /**
+   * Whether this server is running a turn in the project – a terminal attached to
+   * it runs turns the daemon never started. When it can't tell, it says yes.
+   */
+  private async running(directory: string): Promise<boolean> {
+    try {
+      const status = await this.getJson<Record<string, { type: string }>>(
+        `/session/status?directory=${encodeURIComponent(directory)}`,
+      );
+      return Object.values(status).some((s) => s.type !== 'idle');
+    } catch {
+      return true;
+    }
   }
 
   /**
@@ -265,27 +377,170 @@ export class OpenCodeAdapter {
     return data.directory || '';
   }
 
-  async sendMessage(sessionId: string, text: string): Promise<string> {
-    const command = this.matchCommand(text);
-    const url = command
-      ? `${this.baseUrl}/session/${sessionId}/command`
-      : `${this.baseUrl}/session/${sessionId}/message`;
-    const body = command
-      ? { command: command.name, arguments: command.args }
-      : { parts: [{ type: 'text', text }] };
+  /**
+   * Start a turn, with any attached images (base64 data URLs) for the model to see.
+   *
+   * Returns once opencode has the turn; the turn itself is followed on the event
+   * stream. A command or `/compact` gets its HTTP answer only when the turn ends,
+   * so its rejection arrives later, through `onFailure`.
+   */
+  async send(
+    sessionId: string,
+    text: string,
+    images: string[] | undefined,
+    onFailure: (err: Error) => void,
+  ): Promise<void> {
+    await this.reloading;
+    const files = imageParts(images);
 
-    const response = await fetch(url, {
+    if (text.trim() === '/compact') {
+      const model = await this.sessionModel(sessionId);
+      if (!model) return onFailure(new Error('Nothing to compact yet'));
+      return this.fire(`/session/${sessionId}/summarize`, model, onFailure);
+    }
+
+    const command = this.matchCommand(text);
+    if (command) {
+      const body = { command: command.name, arguments: command.args, ...(files.length ? { parts: files } : {}) };
+      return this.fire(`/session/${sessionId}/command`, body, onFailure);
+    }
+
+    try {
+      // Images first, so the text that refers to them comes after them.
+      const parts = [...files, ...(text ? [{ type: 'text', text }] : [])];
+      await this.post(`/session/${sessionId}/prompt_async`, { parts });
+    } catch (err) {
+      onFailure(err as Error);
+    }
+  }
+
+  /** Allow or refuse a tool call opencode is holding for the user. */
+  async replyPermission(id: string, directory: string, reply: 'once' | 'reject', message?: string): Promise<void> {
+    await this.post(`/permission/${id}/reply?directory=${encodeURIComponent(directory)}`, {
+      reply,
+      ...(message ? { message } : {}),
+    });
+  }
+
+  /** Answer a question opencode is holding for the user: one list of labels per question. */
+  async replyQuestion(id: string, directory: string, answers: string[][]): Promise<void> {
+    await this.post(`/question/${id}/reply?directory=${encodeURIComponent(directory)}`, { answers });
+  }
+
+  /** The permission and question requests a project is waiting on, straight from opencode. */
+  async pendingRequests(directory: string): Promise<{ permissions: PermissionRequest[]; questions: QuestionRequest[] }> {
+    const dir = encodeURIComponent(directory);
+    const [permissions, questions] = await Promise.all([
+      this.getJson<PermissionRequest[]>(`/permission?directory=${dir}`),
+      this.getJson<QuestionRequest[]>(`/question?directory=${dir}`),
+    ]);
+    return { permissions, questions };
+  }
+
+  /** The project directory a session runs in. */
+  async sessionDirectory(sessionId: string): Promise<string> {
+    return (await this.getJson<{ directory: string }>(`/session/${sessionId}`)).directory;
+  }
+
+  /** The session that started this one – a subagent's runs in a child session – or null. */
+  async parentSession(sessionId: string): Promise<string | null> {
+    return (await this.getJson<{ parentID?: string }>(`/session/${sessionId}`)).parentID ?? null;
+  }
+
+  /**
+   * Halt the turn running in a session. The session's project instance is the
+   * one running it, so the directory goes along.
+   */
+  async abort(sessionId: string, directory?: string): Promise<void> {
+    const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
+    await this.post(`/session/${sessionId}/abort${query}`, {});
+  }
+
+  /**
+   * Wait until the session's newest message has ended, so the transcript shows how
+   * the turn finished. abort returns before opencode records the aborted message.
+   */
+  async awaitTurnEnd(sessionId: string, timeoutMs = 3000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const [last] = await this.messages(sessionId, 1);
+      const open = last?.info.role === 'assistant' && !last.info.error && !last.info.time.completed;
+      if (!open || Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  /** What the agent changed in a session, turn by turn, newest first. */
+  async diff(sessionId: string): Promise<DiffTurn[]> {
+    return diffTurns(await this.messages(sessionId), (t) => this.collapseCommandTemplate(t));
+  }
+
+  /** The final text of the session's newest turn, or the error it ended on. */
+  async turnResult(sessionId: string): Promise<TurnResult> {
+    const [last] = await this.messages(sessionId, 1);
+    if (!last || last.info.role !== 'assistant') return { text: '' };
+    return { text: extractText(last), error: errorText(last.info.error) };
+  }
+
+  /** The session's conversation as the app counts it, and where its turn stands. */
+  async activity(sessionId: string): Promise<SessionActivity> {
+    const raw = await this.messages(sessionId);
+    const entries = toEntries(raw, (t) => this.collapseCommandTemplate(t));
+    return { count: entries.length, last: entries[entries.length - 1], state: turnState(raw, Date.now()) };
+  }
+
+  /** The model the session last used, which opencode needs to summarize it. */
+  private async sessionModel(sessionId: string): Promise<{ providerID: string; modelID: string } | null> {
+    const recent = await this.messages(sessionId, 10);
+    for (let i = recent.length - 1; i >= 0; i--) {
+      const { providerID, modelID, model } = recent[i].info;
+      if (providerID && modelID) return { providerID, modelID };
+      if (model) return model;
+    }
+    return null;
+  }
+
+  private async post(path: string, body: unknown): Promise<void> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-
     if (!response.ok) {
-      throw new Error(`Failed to send message: HTTP ${response.status}`);
+      throw new Error(`opencode ${path.split('?')[0]}: HTTP ${response.status}`);
     }
+  }
 
-    const data = await response.json() as OpenCodeMessage;
-    return extractText(data);
+  /**
+   * Start a request opencode answers only when the turn ends. Dropping the
+   * connection does not stop the turn, so a client timeout on a long one is
+   * expected and ignored; only opencode refusing the request is a failure.
+   */
+  private fire(path: string, body: unknown, onFailure: (err: Error) => void): void {
+    fetch(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(
+      (response) => {
+        if (!response.ok) onFailure(new Error(`opencode ${path}: HTTP ${response.status}`));
+        else response.body?.cancel().catch(() => undefined);
+      },
+      (err: Error & { cause?: { code?: string } }) => {
+        if (!err.cause?.code?.startsWith('UND_ERR_')) onFailure(err);
+      },
+    );
+  }
+
+  private async getJson<T>(path: string): Promise<T> {
+    const response = await fetch(`${this.baseUrl}${path}`);
+    if (!response.ok) throw new Error(`opencode ${path.split('?')[0]}: HTTP ${response.status}`);
+    return await response.json() as T;
+  }
+
+  /** The session's messages, oldest first; the newest `limit` when given. */
+  private messages(sessionId: string, limit?: number): Promise<OpenCodeMessage[]> {
+    return this.getJson<OpenCodeMessage[]>(`/session/${sessionId}/message${limit ? `?limit=${limit}` : ''}`);
   }
 
   /**
@@ -308,109 +563,106 @@ export class OpenCodeAdapter {
     return { name, args: match[2] ?? '' };
   }
 
-  async getMessages(sessionId: string, limit: number): Promise<GetMessagesResponse> {
-    const response = await fetch(`${this.baseUrl}/session/${sessionId}/message`);
-
-    if (!response.ok) {
-      throw new Error(`Failed to get messages: HTTP ${response.status}`);
-    }
-
-    const all = await response.json() as OpenCodeMessage[];
-
-    const entries: MessageEntry[] = all
-      .map((m) => {
-        const role = (m.info.role === 'user' ? 'USER' : 'AGENT') as 'USER' | 'AGENT';
-        const content = extractText(m);
-        return {
-          uuid: m.info.id,
-          role,
-          // A user "message" that is really an expanded command reads as the
-          // command again, so the app can render it the way it renders one.
-          content: (role === 'USER' && this.collapseCommandTemplate(content)) || content,
-          timestamp: new Date(m.info.time.created).toISOString(),
-        };
-      })
-      // Messages whose only text was synthetic drop out here, having no content.
-      .filter((m) => m.content);
-
-    const hasMore = entries.length > limit;
-    const messages = entries.slice(-limit);
-    return { messages, hasMore };
+  /** One page of the conversation, as the app shows it. See `page` for `afterTime`. */
+  async getMessages(
+    sessionId: string,
+    limit: number,
+    before?: string,
+    after?: string,
+    afterTime?: number,
+  ): Promise<GetMessagesResponse> {
+    const entries = toEntries(await this.messages(sessionId), (t) => this.collapseCommandTemplate(t));
+    return page(entries, limit, before, after, afterTime);
   }
 
   /**
-   * The user's opencode sessions, read from opencode's own database.
+   * The user's opencode sessions from every project, newest first, whichever
+   * directory the daemon was started in. opencode's own `/session` is scoped to
+   * the server's project; `/experimental/session` is its cross-project list.
    *
-   * Only top-level sessions. opencode runs a subtask – the `task` tool, and any
-   * command marked `subtask` such as `/review` – in a child session, and the
-   * parent receives the summary, so the child is an implementation detail rather
-   * than a conversation the user started. Surfacing children put phantom entries
-   * in the session list whose opening "user" message was the command's whole
-   * expanded prompt template.
+   * Only top-level sessions (`roots`). opencode runs a subtask – the `task` tool,
+   * and any command marked `subtask` such as `/review` – in a child session, and
+   * the parent receives the summary, so the child is an implementation detail
+   * rather than a conversation the user started. Surfacing children put phantom
+   * entries in the session list whose opening "user" message was the command's
+   * whole expanded prompt template.
+   *
+   * Never throws: the SDK polls this on a timer, and an empty list is the honest
+   * answer while opencode is unreachable.
    */
-  listSessions(managedIds: Set<string>): SessionInfo[] {
-    if (!existsSync(OPENCODE_DB)) return [];
-
-    const sql = `
-      SELECT s.id, s.slug, s.title, s.directory, s.time_updated,
-             COUNT(m.id) as message_count
-      FROM session s
-      LEFT JOIN message m ON m.session_id = s.id
-      WHERE s.time_archived IS NULL
-        AND s.parent_id IS NULL
-      GROUP BY s.id
-      ORDER BY s.time_updated DESC
-      LIMIT 200
-    `;
-
-    let output: string;
+  async listSessions(managedIds: Set<string>): Promise<SessionInfo[]> {
+    let sessions: OpenCodeSession[];
     try {
-      output = execFileSync('sqlite3', ['-separator', '\t', OPENCODE_DB, sql], {
-        encoding: 'utf-8',
-        timeout: 3000,
-      });
-    } catch {
+      const response = await fetch(
+        `${this.baseUrl}/experimental/session?roots=true&limit=${SESSION_LIST_LIMIT}`,
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      sessions = await response.json() as OpenCodeSession[];
+    } catch (err) {
+      console.warn('Could not list opencode sessions:', (err as Error).message);
       return [];
     }
 
-    const now = new Date().toISOString();
-    const results: SessionInfo[] = [];
+    const listed = sessions.filter((s) => s.id && !managedIds.has(s.id));
+    const states = await this.listStates(listed);
+    return listed.map((s, i) => {
+      const directory = s.directory || '';
+      return {
+        session_id: s.id,
+        slug: s.slug || s.id,
+        title: s.title || s.id,
+        project: directory,
+        project_name: directory.split('/').filter(Boolean).pop() || '',
+        file_path: TRANSCRIPT_FILE,
+        last_message: states[i]?.preview ?? '',
+        last_activity: new Date(s.time?.updated ?? Date.now()).toISOString(),
+        is_active: states[i]?.running ?? false,
+        // At most the tail read; the server only asks whether any exist, to resume rather than start anew.
+        message_count: this.tails.get(s.id)?.messages.length ?? 0,
+      };
+    });
+  }
 
-    for (const line of output.trim().split('\n')) {
-      if (!line) continue;
-      const [id, slug, title, directory, timeUpdatedRaw, messageCountRaw] = line.split('\t');
-      if (!id || managedIds.has(id)) continue;
-
-      const timeUpdated = timeUpdatedRaw ? new Date(parseInt(timeUpdatedRaw, 10)).toISOString() : now;
-      const projectName = directory ? directory.split('/').filter(Boolean).pop() || '' : '';
-      const messageCount = messageCountRaw ? parseInt(messageCountRaw, 10) : 0;
-
-      results.push({
-        session_id: id,
-        slug: slug || id,
-        title: title || id,
-        project: directory || '',
-        project_name: projectName,
-        file_path: '',
-        last_message: '',
-        last_activity: timeUpdated,
-        is_active: false,
-        message_count: messageCount,
-      });
-    }
-
-    return results;
+  /**
+   * Each listed session's preview and whether its turn is running. The tail of a
+   * transcript is re-read only when opencode has touched the session since.
+   */
+  private async listStates(sessions: OpenCodeSession[]): Promise<Array<TurnState | undefined>> {
+    const now = Date.now();
+    const states: Array<TurnState | undefined> = new Array(sessions.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < sessions.length) {
+        const i = next++;
+        const s = sessions[i];
+        const updated = s.time?.updated ?? 0;
+        let tail = this.tails.get(s.id);
+        if (!tail || tail.updated !== updated) {
+          try {
+            tail = { updated, messages: await this.messages(s.id, LIST_TAIL_MESSAGES) };
+            this.tails.set(s.id, tail);
+          } catch {
+            continue;
+          }
+        }
+        states[i] = turnState(tail.messages, updated, now);
+      }
+    };
+    await Promise.all(Array.from({ length: LIST_READ_CONCURRENCY }, worker));
+    return states;
   }
 }
 
 /**
- * Join an opencode message's text parts, dropping reasoning and tool parts along
- * with opencode's own synthetic continuations, which are machinery rather than
- * anything a participant said.
+ * opencode file parts for the user's attached images. The app sends base64 data
+ * URLs, which opencode hands the model as-is; anything else is skipped.
  */
-function extractText(message: OpenCodeMessage): string {
-  return message.parts
-    .filter((p) => p.type === 'text' && p.text && !p.synthetic)
-    .map((p) => p.text!)
-    .join('\n');
+export function imageParts(images?: string[]): OpenCodeFilePart[] {
+  const parts: OpenCodeFilePart[] = [];
+  for (const url of images ?? []) {
+    const mime = /^data:([^;,]+);base64,/.exec(url)?.[1];
+    if (!mime?.startsWith('image/')) continue;
+    parts.push({ type: 'file', mime, filename: `image-${parts.length + 1}`, url });
+  }
+  return parts;
 }

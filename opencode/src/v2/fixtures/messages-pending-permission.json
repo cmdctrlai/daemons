@@ -1,0 +1,48 @@
+{
+    "data": [
+        {
+            "id": "msg_194ab1cf00012vt689C3F2qT1V",
+            "time": {
+                "created": 1793495604466,
+                "streamed": 1793495606672
+            },
+            "type": "assistant",
+            "agent": "build",
+            "model": {
+                "id": "big-pickle",
+                "providerID": "opencode"
+            },
+            "content": [
+                {
+                    "type": "tool",
+                    "id": "chatcmpl-tool-9d04cf30bd1fc42d",
+                    "name": "shell",
+                    "executed": false,
+                    "state": {
+                        "status": "running",
+                        "input": {
+                            "command": "ls -la"
+                        },
+                        "metadata": {}
+                    },
+                    "time": {
+                        "created": 1793495606586,
+                        "ran": 1793495606671
+                    }
+                }
+            ]
+        },
+        {
+            "id": "msg_194ab1ceb001kfF1B734bBWiPH",
+            "time": {
+                "created": 1793495604462
+            },
+            "text": "Use your shell tool to run: ls -la. Then tell me how many entries it printed.",
+            "type": "user"
+        }
+    ],
+    "cursor": {
+        "previous": "eyJpZCI6Im1zZ18xOTRhYjFjZjAwMDEydnQ2ODlDM0YycVQxViIsIm9yZGVyIjoiZGVzYyIsImRpcmVjdGlvbiI6InByZXZpb3VzIn0",
+        "next": "eyJpZCI6Im1zZ18xOTRhYjFjZWIwMDFrZkYxQjczNGJCV2lQSCIsIm9yZGVyIjoiZGVzYyIsImRpcmVjdGlvbiI6Im5leHQifQ"
+    }
+}
