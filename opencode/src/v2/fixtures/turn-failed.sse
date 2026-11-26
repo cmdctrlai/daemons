@@ -1,0 +1,12 @@
+data: {"id":"evt_194aace76001k16mSMDp2KXEcM","type":"server.connected","data":{}}
+
+data: {"id":"evt_194b4d3560015lKGxQKn24WzdL","created":1793496240982,"type":"session.inbox.enqueued","location":{"directory":"/private/tmp/feat119/repo"},"data":{"inboxID":"msg_194b4d355001CuQs6WkRzHOqhE","sessionID":"ses_e6b4b2cdbffeF627S0tb7dgm9s","item":{"type":"user","payload":{"text":"hi"},"delivery":"steer"}},"durable":{"aggregateID":"ses_e6b4b2cdbffeF627S0tb7dgm9s","seq":1,"version":1}}
+
+data: {"id":"evt_194b4d357001mYqmrq0LG8dJIl","created":1793496240983,"type":"session.execution.started","data":{"sessionID":"ses_e6b4b2cdbffeF627S0tb7dgm9s"},"durable":{"aggregateID":"ses_e6b4b2cdbffeF627S0tb7dgm9s","seq":2,"version":1}}
+
+data: {"id":"evt_194b4d35a001arRLPBIWFLQHLj","created":1793496240986,"metadata":{"instructions":{"initial":true}},"type":"session.instructions.updated","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b4b2cdbffeF627S0tb7dgm9s","delta":{"core/codemode":"1f1291478accf8b3e4d96a40c150bf844d60557dede4aae56c47ea0043bbdce2","core/skill-guidance":"13845fa6d2b675c560fc91a9c6f96fa8b5deb9601544a30b66486b2d5a34eadd","core/date":"95219933f52e27bc9e1942a54b509ff842c6ad715ece5eddf1b42bba9eb2278e","core/environment":"a5cb85dad64b7de832a1ca8ef4dd7dedac18ef94fba352904614decec30611b8"}},"durable":{"aggregateID":"ses_e6b4b2cdbffeF627S0tb7dgm9s","seq":3,"version":2}}
+
+data: {"id":"evt_194b4d35b001fupguo6nC06tOI","created":1793496240987,"type":"session.inbox.delivered","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b4b2cdbffeF627S0tb7dgm9s","inboxID":"msg_194b4d355001CuQs6WkRzHOqhE"},"durable":{"aggregateID":"ses_e6b4b2cdbffeF627S0tb7dgm9s","seq":4,"version":1}}
+
+data: {"id":"evt_194b4d35e001BWEHgbtha4CIHJ","created":1793496240990,"type":"session.execution.failed","data":{"sessionID":"ses_e6b4b2cdbffeF627S0tb7dgm9s","error":{"type":"provider.no-route","message":"Model unavailable: opencode/no-such-model"}},"durable":{"aggregateID":"ses_e6b4b2cdbffeF627S0tb7dgm9s","seq":5,"version":1}}
+

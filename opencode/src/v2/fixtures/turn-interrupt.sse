@@ -1,0 +1,46 @@
+data: {"id":"evt_194aace76001k16mSMDp2KXEcM","type":"server.connected","data":{}}
+
+data: {"id":"evt_194acd980001H2JMEgFyaCHSG3","created":1793495718272,"type":"session.inbox.enqueued","location":{"directory":"/private/tmp/feat119/repo"},"data":{"inboxID":"msg_194acd97f001Hqu5zQrUuA0998","sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","item":{"type":"user","payload":{"text":"Write a 1500 word essay about the history of pickles. Do not use any tools."},"delivery":"steer"}},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":31,"version":1}}
+
+data: {"id":"evt_194acd980002VNyuSq3G7zJfZ5","created":1793495718272,"type":"session.execution.started","data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz"},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":32,"version":1}}
+
+data: {"id":"evt_194acd982001B1QoFONCRAiD1h","created":1793495718274,"type":"session.inbox.delivered","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","inboxID":"msg_194acd97f001Hqu5zQrUuA0998"},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":33,"version":1}}
+
+data: {"id":"evt_194acdb68001iGktenjRFEI47X","created":1793495718760,"type":"session.step.started","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","agent":"build","model":{"id":"big-pickle","providerID":"opencode"},"assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","snapshot":"dbd305339d13535c1abdbe3e2b903b6455598559","started":1793495718277},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":34,"version":1}}
+
+data: {"id":"evt_194acdb6b001PNc3CJn6h6oSma","created":1793495718763,"type":"session.reasoning.started","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"native":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":35,"version":1}}
+
+data: {"id":"evt_194acdbd200131jAYkBee7fhaF","created":1793495718866,"type":"session.reasoning.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":"The user wants a 1500 word essay about the history of pickles, no tools. I should just"}}
+
+data: {"id":"evt_194acdc37001ZC7uz25XvU2Yo8","created":1793495718967,"type":"session.reasoning.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":" write it. Need roughly 1500 words. Let me compose a well"}}
+
+data: {"id":"evt_194acde5f001IzK3kYGTJVQf4V","created":1793495719519,"type":"session.reasoning.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":"-structured essay.\n\nLet me aim ~1500 words. I'll write substantive history: etymology, ancient Mesopotamia, Egypt, China, Rome, India, Middle Ages, Dutch, New World, kosher dills, industrial"}}
+
+data: {"id":"evt_194acdec5001SHqSjfRzdybvEv","created":1793495719621,"type":"session.reasoning.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":" era, science, modern craft."}}
+
+data: {"id":"evt_194acdf36001zQKdm0rDLmS34l","created":1793495719734,"type":"session.reasoning.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":" Include"}}
+
+data: {"id":"evt_194acdfa60019DpCRnKrhyKLMI","created":1793495719846,"type":"session.reasoning.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":" accurate details.\n\nI'll count approximately. Let me write ~1500 words. I"}}
+
+data: {"id":"evt_194ace02c001yYeNoIzquNXmYW","created":1793495719980,"type":"session.reasoning.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":"'ll structure with title and paragraphs, no tools.\n\nLet me draft and"}}
+
+data: {"id":"evt_194ace093001RXG83A5jIS3wHR","created":1793495720083,"type":"session.reasoning.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":" keep an eye on length. Aim maybe 1450-155"}}
+
+data: {"id":"evt_194ace0c6001ufZvF950g2R12f","created":1793495720134,"type":"session.reasoning.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":"0.\n\nI'll write."}}
+
+data: {"id":"evt_194ace0c6002hbMgv3dpPSZCMS","created":1793495720134,"type":"session.text.started","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":36,"version":1}}
+
+data: {"id":"evt_194ace12f0012ZL6Fg1cnqG0fR","created":1793495720239,"type":"session.text.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":"# A Br"}}
+
+data: {"id":"evt_194ace1960012W1gaCZGaHSUlC","created":1793495720342,"type":"session.text.delta","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"delta":"ine Through Time: The History of Pickles\n\nThe pickle is one"}}
+
+data: {"id":"evt_194ace19b001vvBp29wUaSJgML","created":1793495720347,"type":"session.text.ended","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"text":"# A Brine Through Time: The History of Pickles\n\nThe pickle is one"},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":37,"version":1}}
+
+data: {"id":"evt_194ace19d001x2nzaSgN1cyPTx","created":1793495720349,"type":"session.reasoning.ended","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","ordinal":0,"text":"The user wants a 1500 word essay about the history of pickles, no tools. I should just write it. Need roughly 1500 words. Let me compose a well-structured essay.\n\nLet me aim ~1500 words. I'll write substantive history: etymology, ancient Mesopotamia, Egypt, China, Rome, India, Middle Ages, Dutch, New World, kosher dills, industrial era, science, modern craft. Include accurate details.\n\nI'll count approximately. Let me write ~1500 words. I'll structure with title and paragraphs, no tools.\n\nLet me draft and keep an eye on length. Aim maybe 1450-1550.\n\nI'll write.","native":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":38,"version":1}}
+
+data: {"id":"evt_194ace19e001ngHI7x0VRxA0Ty","created":1793495720350,"type":"session.step.streamed","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR"},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":39,"version":1}}
+
+data: {"id":"evt_194ace1a8001waK9QNYuS9zJeN","created":1793495720360,"type":"session.step.failed","location":{"directory":"/private/tmp/feat119/repo"},"data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","assistantMessageID":"msg_194acd984001WxTCbWtvxDLfKR","error":{"type":"aborted","message":"Step interrupted"},"snapshot":"dbd305339d13535c1abdbe3e2b903b6455598559","files":[]},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":40,"version":1}}
+
+data: {"id":"evt_194ace1a9001DSKQwGyPQegTqo","created":1793495720361,"type":"session.execution.interrupted","data":{"sessionID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","reason":"user"},"durable":{"aggregateID":"ses_e6b535aa4ffe2fk2IDPyoTGlVz","seq":41,"version":1}}
+

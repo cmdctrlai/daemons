@@ -1,8 +1,12 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { DaemonClient, ConfigManager } from '@cmdctrl/daemon-sdk';
-import { OpenCodeAdapter, type OpenCodeCommand } from '../adapter/opencode';
-import { SlashCommandRegistry } from '../slash-commands';
+import { ActivityReporter } from '../activity';
+import { OpenCodeEvents } from '../events';
+import { serverFor } from '../opencode-server';
+import { checkOpencode, refuseTasks } from '../opencode-version';
+import { COMMAND_REFRESH_MS, CommandRefresher, SlashCommandRegistry } from '../slash-commands';
+import { continuedSession, TurnManager } from '../turns';
 
 const configManager = new ConfigManager('opencode');
 
@@ -23,6 +27,8 @@ export async function start(options: StartOptions = {}): Promise<void> {
   }
 
   if (options.detach) {
+    // The detached daemon's own output goes to its log; say it here too.
+    await checkOpencode();
     const { pid, logFile } = configManager.spawnDetached();
     console.log(`Daemon started in background (pid ${pid}).`);
     console.log(`Logs: ${logFile}`);
@@ -49,8 +55,18 @@ export async function start(options: StartOptions = {}): Promise<void> {
   console.log(`  Version: ${daemonVersion}`);
   console.log('');
 
-  console.log('Starting opencode server...');
-  const adapter = new OpenCodeAdapter();
+  const { version: opencode, reason: unsupported } = await checkOpencode();
+  if (unsupported) {
+    console.error('');
+    // Connected, with auto-update on, so a release that supports this opencode reaches the device.
+    configManager.writePidFile(process.pid);
+    const client = newClient(config, credentials, daemonVersion, () => configManager.deletePidFile());
+    refuseTasks(client, unsupported);
+    await run(client, () => undefined);
+  }
+
+  console.log(opencode ? `Starting opencode ${opencode} server...` : 'Starting opencode server...');
+  const { server: adapter, feed } = serverFor(opencode, configManager.configDir);
   await adapter.startServer();
   console.log('OpenCode server ready.\n');
 
@@ -61,146 +77,141 @@ export async function start(options: StartOptions = {}): Promise<void> {
   // Session IDs started via task_start – excluded from native session discovery
   const managedSessionIds = new Set<string>();
 
-  // opencode resolves commands per directory: the global built-ins and user
-  // skills merged with whatever that project defines. A session only ever sees
-  // its own project's set, so ask opencode once per distinct session directory
-  // and record each set under that project – the API looks the set up by the
-  // session's project. Resolving only the server's own directory would key every
-  // command under wherever the daemon happens to run and match no session.
-  // Cheap and non-fatal – the daemon runs fine without a composer menu.
-  async function refreshSlashCommands(): Promise<boolean> {
-    try {
-      const projects = new Set<string>();
-      for (const session of adapter.listSessions(managedSessionIds)) {
-        if (session.project) projects.add(session.project);
-      }
-      // The server's own directory covers a daemon with no sessions discovered yet.
-      projects.add(await adapter.getProjectDirectory());
+  // Learn the sets before connecting; the SDK reports them on connect via the
+  // provider. After that, a timer picks up commands the user adds.
+  const commandRefresher = new CommandRefresher(adapter, slashCommands);
+  await commandRefresher.refresh();
 
-      let changed = false;
-      const known = new Map<string, OpenCodeCommand>();
-      for (const project of projects) {
-        if (!project) continue;
-        const commands = await adapter.listCommands(project);
-        for (const command of commands) known.set(command.name, command);
-        if (slashCommands.record(project, commands)) changed = true;
-      }
-      // Every project's commands, so a leading-slash message from any session
-      // routes to /command and any project's expansion can be recognised again.
-      adapter.setCommands([...known.values()]);
-      return changed;
-    } catch (err) {
-      console.warn('Could not enumerate opencode slash commands:', (err as Error).message);
-      return false;
-    }
-  }
-
-  // Learn the sets before connecting; the SDK reports them on connect via the provider.
-  await refreshSlashCommands();
-
-  // Track watched sessions: sessionId -> last known message count
-  const watchedMessageCounts = new Map<string, number>();
   const watchIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
-  const client = new DaemonClient({
-    serverUrl: config.serverUrl,
-    deviceId: config.deviceId,
-    agentType: 'opencode',
-    token: credentials.refreshToken,
-    version: daemonVersion,
-    autoUpdate: true,
-    autoUpdateConfig: {
-      packageName: '@cmdctrl/opencode',
-      binName: 'cmdctrl-opencode',
-      onBeforeUpdate: () => {
-        for (const interval of watchIntervals.values()) clearInterval(interval);
-        watchIntervals.clear();
-        adapter.stopServer();
-        configManager.deletePidFile();
-      },
-    },
+  const stopWork = () => {
+    clearInterval(commandRefreshTimer);
+    events.stop();
+    for (const interval of watchIntervals.values()) clearInterval(interval);
+    watchIntervals.clear();
+    adapter.stopServer();
+  };
+  const client = newClient(config, credentials, daemonVersion, () => {
+    stopWork();
+    configManager.deletePidFile();
   });
 
-  client.setSessionsProvider(() => adapter.listSessions(managedSessionIds));
+  const activity = new ActivityReporter(adapter, client);
+  const turns = new TurnManager(adapter, {
+    tool: (taskId, callId, line, tool, target) => client.sendEvent(taskId, 'VERBOSE', {
+      uuid: callId,
+      content: line,
+      tool,
+      arg_summary: target,
+      timestamp: new Date().toISOString(),
+    }),
+    finished: (sessionId) => {
+      activity.finished(sessionId).catch((err) => console.warn('Could not announce completion:', err.message));
+    },
+  });
+  adapter.busy = (directory) => turns.busyIn(directory);
+  const events = new OpenCodeEvents(adapter.url, (event) => turns.handleEvent(event), () => void turns.resync(), feed);
+  events.start();
+
+  // A turn this daemon is running is busy whatever its transcript says so far.
+  client.setSessionsProvider(async () => (await adapter.listSessions(managedSessionIds))
+    .map((s) => (turns.isBusy(s.session_id) ? { ...s, is_active: true } : s)));
 
   client.setSlashCommandsProvider(() => slashCommands.all());
 
-  client.onWatchSession(async (sessionId) => {
+  let refreshing = false;
+  const commandRefreshTimer = setInterval(async () => {
+    if (refreshing) return;
+    refreshing = true;
     try {
-      const { messages } = await adapter.getMessages(sessionId, 1000);
-      watchedMessageCounts.set(sessionId, messages.length);
-    } catch {
-      watchedMessageCounts.set(sessionId, 0);
+      if (await commandRefresher.refresh()) client.reportSlashCommands();
+    } finally {
+      refreshing = false;
     }
+  }, COMMAND_REFRESH_MS);
 
-    const interval = setInterval(async () => {
-      try {
-        const { messages } = await adapter.getMessages(sessionId, 1000);
-        const lastCount = watchedMessageCounts.get(sessionId) ?? 0;
-        if (messages.length > lastCount) {
-          const newest = messages[messages.length - 1];
-          const isCompletion = newest.role === 'AGENT';
-          client.sendSessionActivity(
-            sessionId,
-            '',
-            newest.content,
-            messages.length,
-            isCompletion,
-            newest.timestamp,
-          );
-          watchedMessageCounts.set(sessionId, messages.length);
-        }
-      } catch { /* session may be unavailable, ignore */ }
+  client.onWatchSession(async (sessionId) => {
+    await activity.watch(sessionId).catch(() => undefined);
+    const interval = setInterval(() => {
+      activity.poll(sessionId).catch(() => { /* session may be unavailable, ignore */ });
     }, 2000);
-
     watchIntervals.set(sessionId, interval);
   });
 
   client.onUnwatchSession((sessionId) => {
-    const interval = watchIntervals.get(sessionId);
-    if (interval) {
-      clearInterval(interval);
-      watchIntervals.delete(sessionId);
-    }
-    watchedMessageCounts.delete(sessionId);
+    clearInterval(watchIntervals.get(sessionId));
+    watchIntervals.delete(sessionId);
+    activity.unwatch(sessionId);
   });
 
   client.onTaskStart(async (task) => {
     try {
-      const sessionId = await adapter.createSession();
+      const existing = continuedSession(task.taskId, managedSessionIds);
+      if (existing) {
+        await turns.send(existing, task, task.instruction, task.images);
+        return;
+      }
+      const sessionId = await adapter.createSession(task.projectPath);
       managedSessionIds.add(sessionId);
       task.sessionStarted(sessionId);
-      const result = await adapter.sendMessage(sessionId, task.instruction);
-      task.complete(result);
+      await turns.send(sessionId, task, task.instruction, task.images);
     } catch (err: unknown) {
       task.error(err instanceof Error ? err.message : 'Unknown error');
     }
-    // A skill the user added since startup shows up here; re-report if so. Kept
-    // out of the task's try so a report failure can't error a completed task.
-    if (await refreshSlashCommands()) client.reportSlashCommands();
   });
 
   client.onTaskResume(async (task) => {
     try {
-      const result = await adapter.sendMessage(task.sessionId, task.message);
-      task.complete(result);
+      await turns.send(task.sessionId, task, task.message, task.images);
     } catch (err: unknown) {
       task.error(err instanceof Error ? err.message : 'Unknown error');
     }
   });
 
+  // Stop: halt the session's turn. With nothing running, still end the task so a
+  // server that thinks it is running stops showing it.
+  client.onSessionStop(async ({ taskId, sessionId }) => {
+    if (!(await turns.stop(sessionId, taskId))) client.sendEvent(taskId, 'TASK_COMPLETE', { result: '' });
+  });
+
+  client.onGetDiff(({ sessionId }) => adapter.diff(sessionId));
+
   client.onGetMessages(async (req) => {
-    const { messages, hasMore } = await adapter.getMessages(req.sessionId, req.limit);
-    return { messages, hasMore };
+    const { messages, hasMore } = await adapter.getMessages(
+      req.sessionId, req.limit, req.beforeUuid, req.afterUuid, turns.cardTime(req.afterUuid),
+    );
+    // What opencode is waiting on ends the newest page, as a card the app can answer.
+    const ask = req.beforeUuid || hasMore ? undefined : turns.askEntry(req.sessionId);
+    const fresh = ask && ask.uuid !== req.afterUuid && !messages.some((m) => m.uuid === ask.uuid);
+    return { messages: fresh ? [...messages, ask] : messages, hasMore };
   });
 
   // Auto-update is handled by the SDK via autoUpdateConfig above.
+  await run(client, stopWork);
+}
 
+function newClient(
+  config: { serverUrl: string; deviceId: string },
+  credentials: { refreshToken: string },
+  version: string,
+  onBeforeUpdate: () => void,
+): DaemonClient {
+  return new DaemonClient({
+    serverUrl: config.serverUrl,
+    deviceId: config.deviceId,
+    agentType: 'opencode',
+    token: credentials.refreshToken,
+    version,
+    autoUpdate: true,
+    autoUpdateConfig: { packageName: '@cmdctrl/opencode', binName: 'cmdctrl-opencode', onBeforeUpdate },
+  });
+}
+
+/** Connect and serve until a signal: stopWork halts what the daemon runs besides the connection. */
+async function run(client: DaemonClient, stopWork: () => void): Promise<never> {
   const shutdown = async () => {
     console.log('\nShutting down...');
-    for (const interval of watchIntervals.values()) clearInterval(interval);
-    watchIntervals.clear();
-    adapter.stopServer();
+    stopWork();
     await client.disconnect();
     configManager.deletePidFile();
     process.exit(0);
@@ -214,5 +225,5 @@ export async function start(options: StartOptions = {}): Promise<void> {
   });
 
   console.log('OpenCode daemon running. Press Ctrl+C to stop.\n');
-  await new Promise(() => {});
+  return new Promise<never>(() => {});
 }

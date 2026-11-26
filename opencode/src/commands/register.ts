@@ -4,6 +4,7 @@ import { openSync } from 'fs';
 import { spawn } from 'child_process';
 import { ConfigManager, registerDevice, displayVerification } from '@cmdctrl/daemon-sdk';
 import { stop } from './stop';
+import { checkOpencode } from '../opencode-version';
 
 function confirm(question: string, defaultYes = false): Promise<boolean> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -101,15 +102,19 @@ export async function register(options: RegisterOptions): Promise<void> {
   // install.sh starts the daemon itself once registration returns.
   if (process.stdin.isTTY && !process.env.CMDCTRL_INSTALLER) {
     const startNow = await confirm('\nStart daemon in background now?', true);
-    if (startNow) {
-      const logFile = '/tmp/cmdctrl-daemon-opencode.log';
-      const logFd = openSync(logFile, 'a');
-      const child = spawn(process.execPath, [process.argv[1], 'start'], {
-        detached: true,
-        stdio: ['ignore', logFd, logFd],
-      });
-      child.unref();
-      console.log(`Daemon started. Logs: tail -f ${logFile}`);
-    }
+    if (startNow) await startInBackground();
   }
+}
+
+/** Start the daemon detached; its output goes to a log, so a problem with opencode is said here first. */
+export async function startInBackground(): Promise<void> {
+  await checkOpencode();
+  const logFile = '/tmp/cmdctrl-daemon-opencode.log';
+  const logFd = openSync(logFile, 'a');
+  const child = spawn(process.execPath, [process.argv[1], 'start'], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+  });
+  child.unref();
+  console.log(`Daemon started. Logs: tail -f ${logFile}`);
 }
