@@ -1,0 +1,42 @@
+{
+  "name": "@cmdctrl/acp",
+  "version": "0.1.0",
+  "description": "CmdCtrl daemon for any agent that speaks the Agent Client Protocol (ACP) – DeepSeek Harness, Qwen Code, goose and others",
+  "main": "./dist/index.js",
+  "bin": {
+    "cmdctrl-acp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/index.js",
+    "test": "jest",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build && node -e \"const p=require('./package.json');const c=require('./dist/context.js');if(c.DAEMON_VERSION!==p.version){console.error('ERROR: DAEMON_VERSION '+c.DAEMON_VERSION+' does not match package.json '+p.version+'. A daemon that under-reports its version makes the server push updates it can never satisfy.');process.exit(1)}\" && node -e \"const p=require(\\\"./package.json\\\"); const bad=Object.entries(p.dependencies||{}).filter(([,v])=>v.startsWith(\\\"file:\\\")); if(bad.length){console.error(\\\"ERROR: file: dependencies are not allowed in published packages:\\\",bad.map(([k,v])=>k+\\\"=\\\"+v).join(\\\", \\\")); process.exit(1)}\""
+  },
+  "keywords": [
+    "cmdctrl",
+    "daemon",
+    "acp",
+    "agent-client-protocol",
+    "coding-agent",
+    "ai",
+    "agent"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@cmdctrl/daemon-sdk": "^1.7.0",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.2",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
+  }
+}
