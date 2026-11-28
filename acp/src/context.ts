@@ -2,7 +2,6 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { ConfigManager, type DaemonConfig } from '@cmdctrl/daemon-sdk';
 
-export const AGENT_TYPE = 'acp';
 export const PACKAGE_NAME = '@cmdctrl/acp';
 export const BIN_NAME = 'cmdctrl-acp';
 
@@ -24,6 +23,8 @@ export const DAEMON_VERSION = packageVersion();
 export interface AcpConfig extends DaemonConfig {
   /** The command that starts the agent in ACP mode, e.g. `dsh acp`. */
   agentCommand: string;
+  /** Registered agent type; absent in configs written before it was recorded. */
+  agentType?: string;
 }
 
 /**

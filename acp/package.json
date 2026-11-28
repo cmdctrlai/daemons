@@ -1,6 +1,6 @@
 {
   "name": "@cmdctrl/acp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CmdCtrl daemon for any agent that speaks the Agent Client Protocol (ACP) – DeepSeek Harness, Qwen Code, goose and others",
   "main": "./dist/index.js",
   "bin": {
