@@ -33,7 +33,7 @@ const instance = ['-i, --instance <name>', 'Run a separately registered agent (c
 program
   .command('register')
   .description('Register this device with a CmdCtrl server, or change the agent it runs')
-  .option('-a, --agent <command>', 'Command that starts the agent in ACP mode, e.g. "dsh acp"')
+  .option('-a, --agent <command>', 'Command that starts the agent in ACP mode, e.g. "dsh acp" (default: the one found on PATH)')
   .option('-s, --server <url>', 'CmdCtrl server URL', 'https://api.cmd-ctrl.ai')
   .option('-n, --name <name>', 'Device name (defaults to <hostname>-<agent>)')
   .option(...instance)

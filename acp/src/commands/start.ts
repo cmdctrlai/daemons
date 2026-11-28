@@ -8,7 +8,8 @@ import { DaemonClient } from '@cmdctrl/daemon-sdk';
 import type { AcpSessionInfo } from '../acp/types';
 import { AcpAgent } from '../agent';
 import { parseCommandLine } from '../command-line';
-import { AGENT_TYPE, BIN_NAME, DAEMON_VERSION, INSTANCE_ENV, PACKAGE_NAME, commandFor, configFor, readAcpConfig, startInstance } from '../context';
+import { BIN_NAME, DAEMON_VERSION, INSTANCE_ENV, PACKAGE_NAME, commandFor, configFor, readAcpConfig, startInstance } from '../context';
+import { GENERIC_AGENT_TYPE } from '../detect';
 import { continuedSession, projectDir, reportedSessions } from '../sessions';
 import { TranscriptStore } from '../transcript';
 import { TurnManager } from '../turns';
@@ -62,7 +63,7 @@ export async function start(options: StartOptions = {}): Promise<void> {
   const client = new DaemonClient({
     serverUrl: cfg.serverUrl,
     deviceId: cfg.deviceId,
-    agentType: AGENT_TYPE,
+    agentType: cfg.agentType ?? GENERIC_AGENT_TYPE,
     token: creds.refreshToken,
     version: DAEMON_VERSION,
     autoUpdate: true,
